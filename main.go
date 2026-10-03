@@ -840,6 +840,56 @@ func runFyne(url string, interval time.Duration) {
 	log.Printf("fyne: цикл приложения завершён")
 }
 
+var hideTaskbarOnce sync.Once
+
+// hideFromTaskbar снимает флаг WS_EX_APPWINDOW и добавляет WS_EX_TOOLWINDOW
+// нативному окну с заданным заголовком, чтобы у оверлея не было собственной
+// кнопки в панели задач — приложение должно быть представлено только иконкой
+// в трее. Fyne/GLFW создаёт нативный HWND лениво, только при первом Show(),
+// поэтому вызывать это нужно уже после него; делается один раз за всё время
+// работы процесса (стиль окна сохраняется между Show()/Hide()).
+func hideFromTaskbar(title string) {
+	hideTaskbarOnce.Do(func() {
+		user32 := syscall.NewLazyDLL("user32.dll")
+		findWindowW := user32.NewProc("FindWindowW")
+		getWindowLongPtrW := user32.NewProc("GetWindowLongPtrW")
+		setWindowLongPtrW := user32.NewProc("SetWindowLongPtrW")
+		showWindow := user32.NewProc("ShowWindow")
+
+		const (
+			wsExToolWindow   = 0x00000080
+			wsExAppWindow    = 0x00040000
+			swHide           = 0
+			swShowNoActivate = 4
+		)
+		// -20 переполняет uintptr как константа компиляции; через typed
+		// переменную Go делает корректное sign-extension в рантайме.
+		var gwlExStyle int32 = -20
+
+		titlePtr, err := syscall.UTF16PtrFromString(title)
+		if err != nil {
+			log.Printf("taskbar: не удалось подготовить заголовок: %v", err)
+			return
+		}
+		hwnd, _, _ := findWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+		if hwnd == 0 {
+			log.Printf("taskbar: окно %q не найдено, пропускаю", title)
+			return
+		}
+
+		exStyle, _, _ := getWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
+		newStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
+
+		// Чтобы Explorer пересчитал кнопку в панели задач, окно нужно на
+		// мгновение скрыть, поменять стиль и показать заново.
+		showWindow.Call(hwnd, uintptr(swHide))
+		setWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newStyle)
+		showWindow.Call(hwnd, uintptr(swShowNoActivate))
+
+		log.Printf("taskbar: кнопка панели задач для %q скрыта", title)
+	})
+}
+
 // toggleMPCWindow показывает окно, если оно скрыто, и прячет, если показано.
 func toggleMPCWindow() {
 	fyne.Do(func() {
@@ -855,6 +905,7 @@ func toggleMPCWindow() {
 			log.Printf("F5: окно скрыто")
 		} else {
 			mainWindow.Show()
+			hideFromTaskbar(windowTitle)
 			winVisible = true
 			log.Printf("F5: окно показано")
 		}

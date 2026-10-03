@@ -31,6 +31,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -717,11 +718,10 @@ var (
 	winMu      sync.Mutex
 	winVisible bool
 
-	fileLabel      *widget.Label
+	infoLabel      *widget.Label
 	elapsedLabel   *widget.Label
 	remainingLabel *widget.Label
 	progressBar    *widget.ProgressBar
-	statusLabel    *widget.Label
 )
 
 // runFyne запускает Fyne-приложение. Вызывается в отдельной горутине.
@@ -740,7 +740,7 @@ func runFyne(url string, interval time.Duration) {
 	if work, monitor := screenLayout(); work.Right > work.Left {
 		titleBar := titleBarHeight()
 		windowWidth = float32(work.Right - work.Left)
-		windowHeight = float32(monitor.Bottom-monitor.Top)*0.15 - float32(titleBar)
+		windowHeight = float32(monitor.Bottom-monitor.Top)*0.10 - float32(titleBar)
 		posX, posY = int(work.Left), int(work.Top)+int(titleBar)
 		log.Printf("fyne: монитор work=(%d,%d)-(%d,%d) monitor=(%d,%d)-(%d,%d) titleBar=%d",
 			work.Left, work.Top, work.Right, work.Bottom,
@@ -758,9 +758,12 @@ func runFyne(url string, interval time.Duration) {
 	}
 
 	// --- Виджеты ---
-	fileLabel = widget.NewLabel("Ожидание подключения к MPC-HC...")
-	fileLabel.Wrapping = fyne.TextWrapWord
-	fileLabel.Alignment = fyne.TextAlignCenter
+	// Имя файла и статус выводятся одной строкой (без переноса, с многоточием
+	// при нехватке места) — главный элемент оверлея это полоса прогресса.
+	infoLabel = widget.NewLabel("Ожидание подключения к MPC-HC...")
+	infoLabel.Alignment = fyne.TextAlignCenter
+	infoLabel.Wrapping = fyne.TextWrapOff
+	infoLabel.Truncation = fyne.TextTruncateEllipsis
 
 	elapsedLabel = widget.NewLabelWithStyle("00:00",
 		fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Monospace: true})
@@ -769,12 +772,10 @@ func runFyne(url string, interval time.Duration) {
 
 	progressBar = widget.NewProgressBar()
 
-	statusLabel = widget.NewLabelWithStyle("",
-		fyne.TextAlignCenter, fyne.TextStyle{})
-
 	progressRow := container.NewBorder(nil, nil, elapsedLabel, remainingLabel, progressBar)
-	content := container.NewVBox(fileLabel, statusLabel, progressRow)
-	mainWindow.SetContent(container.NewPadded(content))
+	content := container.NewVBox(infoLabel, progressRow)
+	pad := theme.Padding()
+	mainWindow.SetContent(container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), content))
 
 	// --- Цикл опроса MPC-HC в отдельной горутине ---
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -791,7 +792,7 @@ func runFyne(url string, interval time.Duration) {
 					lastErr = err.Error()
 				}
 				fyne.Do(func() {
-					statusLabel.SetText("⚠ Нет связи с MPC-HC: " + err.Error())
+					infoLabel.SetText("⚠ Нет связи с MPC-HC: " + err.Error())
 				})
 				continue
 			}
@@ -802,7 +803,7 @@ func runFyne(url string, interval time.Duration) {
 			stCopy := st
 			fyne.Do(func() {
 				if stCopy.Duration <= 0 {
-					statusLabel.SetText("Нет активного воспроизведения")
+					infoLabel.SetText("Нет активного воспроизведения")
 					progressBar.SetValue(0)
 					elapsedLabel.SetText("00:00")
 					remainingLabel.SetText("00:00")
@@ -825,9 +826,8 @@ func runFyne(url string, interval time.Duration) {
 
 				elapsedLabel.SetText(elapsed)
 				remainingLabel.SetText("-" + remaining)
-				statusLabel.SetText(fmt.Sprintf("%.1f%%   %s   (из %s)",
-					progress*100, stCopy.StateString, formatTime(stCopy.Duration)))
-				fileLabel.SetText(stCopy.File)
+				infoLabel.SetText(fmt.Sprintf("%s   —   %.1f%%  %s  (из %s)",
+					stCopy.File, progress*100, stCopy.StateString, formatTime(stCopy.Duration)))
 			})
 		}
 	}()

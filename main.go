@@ -840,27 +840,39 @@ func runFyne(url string, interval time.Duration) {
 	log.Printf("fyne: цикл приложения завершён")
 }
 
-var hideTaskbarOnce sync.Once
+var fixOverlayChromeOnce sync.Once
 
-// hideFromTaskbar снимает флаг WS_EX_APPWINDOW и добавляет WS_EX_TOOLWINDOW
-// нативному окну с заданным заголовком, чтобы у оверлея не было собственной
-// кнопки в панели задач — приложение должно быть представлено только иконкой
-// в трее. Fyne/GLFW создаёт нативный HWND лениво, только при первом Show(),
-// поэтому вызывать это нужно уже после него; делается один раз за всё время
-// работы процесса (стиль окна сохраняется между Show()/Hide()).
-func hideFromTaskbar(title string) {
-	hideTaskbarOnce.Do(func() {
+// fixOverlayWindowChrome снимает нативное окно с заданным заголовком с панели
+// задач (WS_EX_TOOLWINDOW — приложение представлено только иконкой в трее) и
+// перекрашивает его системный заголовок в тёмный через DWM, чтобы белая
+// полоса сверху не выбивалась из тёмной темы Fyne. Рамка/заголовок при этом
+// остаются — попытка убрать их совсем (GWL_STYLE) приводила к тому, что GLFW
+// пересчитывал размер окна по устаревшим метрикам бывшего заголовка и
+// раздувал окно заново при каждом изменении; DWM-атрибут такой проблемы не
+// создаёт, т.к. не трогает геометрию. Fyne/GLFW создаёт нативный HWND лениво,
+// только при первом Show(), поэтому вызывать это нужно уже после него;
+// делается один раз за всё время работы процесса.
+func fixOverlayWindowChrome(title string) {
+	fixOverlayChromeOnce.Do(func() {
 		user32 := syscall.NewLazyDLL("user32.dll")
 		findWindowW := user32.NewProc("FindWindowW")
 		getWindowLongPtrW := user32.NewProc("GetWindowLongPtrW")
 		setWindowLongPtrW := user32.NewProc("SetWindowLongPtrW")
-		showWindow := user32.NewProc("ShowWindow")
+		setWindowPos := user32.NewProc("SetWindowPos")
+
+		dwmapi := syscall.NewLazyDLL("dwmapi.dll")
+		dwmSetWindowAttribute := dwmapi.NewProc("DwmSetWindowAttribute")
 
 		const (
-			wsExToolWindow   = 0x00000080
-			wsExAppWindow    = 0x00040000
-			swHide           = 0
-			swShowNoActivate = 4
+			wsExToolWindow  = 0x00000080
+			wsExAppWindow   = 0x00040000
+			swpNoMove       = 0x0002
+			swpNoSize       = 0x0001
+			swpNoZOrder     = 0x0004
+			swpNoActivate   = 0x0010
+			swpFrameChanged = 0x0020
+
+			dwmwaUseImmersiveDarkMode = 20
 		)
 		// -20 переполняет uintptr как константа компиляции; через typed
 		// переменную Go делает корректное sign-extension в рантайме.
@@ -868,25 +880,30 @@ func hideFromTaskbar(title string) {
 
 		titlePtr, err := syscall.UTF16PtrFromString(title)
 		if err != nil {
-			log.Printf("taskbar: не удалось подготовить заголовок: %v", err)
+			log.Printf("overlay-chrome: не удалось подготовить заголовок: %v", err)
 			return
 		}
 		hwnd, _, _ := findWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
 		if hwnd == 0 {
-			log.Printf("taskbar: окно %q не найдено, пропускаю", title)
+			log.Printf("overlay-chrome: окно %q не найдено, пропускаю", title)
 			return
 		}
 
 		exStyle, _, _ := getWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
-		newStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
+		newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
+		setWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle)
 
-		// Чтобы Explorer пересчитал кнопку в панели задач, окно нужно на
-		// мгновение скрыть, поменять стиль и показать заново.
-		showWindow.Call(hwnd, uintptr(swHide))
-		setWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newStyle)
-		showWindow.Call(hwnd, uintptr(swShowNoActivate))
+		// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
+		// задач без скрытия/показа окна — в отличие от ShowWindow(HIDE)+
+		// ShowWindow(SHOW), это не ломает перерисовку содержимого GLFW/Fyne.
+		setWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
+			uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged))
 
-		log.Printf("taskbar: кнопка панели задач для %q скрыта", title)
+		darkMode := int32(1)
+		ret, _, _ := dwmSetWindowAttribute.Call(hwnd, uintptr(dwmwaUseImmersiveDarkMode),
+			uintptr(unsafe.Pointer(&darkMode)), unsafe.Sizeof(darkMode))
+
+		log.Printf("overlay-chrome: кнопка в панели задач для %q скрыта, тёмный заголовок: ok=%v", title, ret == 0)
 	})
 }
 
@@ -905,7 +922,7 @@ func toggleMPCWindow() {
 			log.Printf("F5: окно скрыто")
 		} else {
 			mainWindow.Show()
-			hideFromTaskbar(windowTitle)
+			fixOverlayWindowChrome(windowTitle)
 			winVisible = true
 			log.Printf("F5: окно показано")
 		}

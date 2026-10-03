@@ -16,6 +16,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -29,6 +31,7 @@ import (
 	"github.com/getlantern/systray"
 
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
@@ -165,6 +168,7 @@ var (
 	reDurationStr = regexp.MustCompile(`<p id="durationstring">([^<]*)</p>`)
 	reStateString = regexp.MustCompile(`<p id="statestring">([^<]*)</p>`)
 	reFile        = regexp.MustCompile(`<p id="file">([^<]*)</p>`)
+	reFilePath    = regexp.MustCompile(`<p id="filepath">([^<]*)</p>`)
 )
 
 type MPCState struct {
@@ -174,6 +178,7 @@ type MPCState struct {
 	DurationStr string
 	StateString string
 	File        string
+	FilePath    string
 }
 
 func extractInt(html string, re *regexp.Regexp) int64 {
@@ -213,6 +218,7 @@ func fetchState(url string, client *http.Client) (*MPCState, error) {
 		DurationStr: extractStr(html, reDurationStr),
 		StateString: extractStr(html, reStateString),
 		File:        extractStr(html, reFile),
+		FilePath:    extractStr(html, reFilePath),
 	}, nil
 }
 
@@ -738,7 +744,67 @@ var (
 	// progressText — текущий текст поверх полосы прогресса (имя файла и
 	// статус воспроизведения), читается из progressBar.TextFormatter.
 	progressText string
+
+	// currentFilePath — полный путь к текущему файлу MPC-HC (поле filepath
+	// из variables.html), используется по клику колесом для открытия папки.
+	currentFilePath string
 )
+
+// clickCatcher — прозрачный виджет на весь оверлей, который ловит клик
+// средней кнопкой мыши (колесом) и открывает папку с текущим файлом в
+// проводнике. Остальные клики (левая/правая кнопка) не перехватывает.
+type clickCatcher struct {
+	widget.BaseWidget
+}
+
+func newClickCatcher() *clickCatcher {
+	c := &clickCatcher{}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *clickCatcher) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(canvas.NewRectangle(color.Transparent))
+}
+
+func (c *clickCatcher) MouseDown(*desktop.MouseEvent) {}
+
+func (c *clickCatcher) MouseUp(ev *desktop.MouseEvent) {
+	if ev.Button != desktop.MouseButtonTertiary {
+		return
+	}
+	log.Printf("overlay: клик колесом, открываю папку с файлом")
+	openContainingFolder(currentFilePath)
+}
+
+// openContainingFolder открывает проводник с выделенным файлом (как
+// «Показать в папке»). Если путь ещё не известен (MPC-HC не опрошен или
+// ничего не загружено), ничего не делает.
+//
+// explorer.exe ожидает `/select,"путь"` — свитч БЕЗ кавычек, путь В кавычках
+// сразу после запятой, без пробела между ними. exec.Command так собрать
+// нельзя: если склеить "/select,"+path в один элемент Args, Go из-за пробелов
+// в пути оборачивает весь токен в кавычки целиком ("/select,E:\...\file.mkv"),
+// explorer не распознаёт свитч внутри такой строки и открывает папку по
+// умолчанию (Документы) вместо нужной. Поэтому командная строка собирается
+// вручную через SysProcAttr.CmdLine, в обход автоматического квотирования Go.
+func openContainingFolder(path string) {
+	if path == "" {
+		log.Printf("overlay: путь к файлу ещё неизвестен, пропускаю")
+		return
+	}
+	clean := filepath.Clean(path)
+	cmd := exec.Command("explorer")
+	// SysProcAttr.CmdLine заменяет ВЕСЬ GetCommandLineW() процесса, поэтому
+	// имя программы нужно указать в нём же самим — иначе explorer видит argv0
+	// как наш "/select,..." свитч и тоже не распознаёт его.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CmdLine: `explorer.exe /select,"` + clean + `"`,
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("overlay: не удалось открыть проводник: %v", err)
+	}
+}
 
 // runFyne запускает Fyne-приложение. Вызывается в отдельной горутине.
 // Блокируется до закрытия приложения (обычно — до systray.Quit()).
@@ -788,7 +854,8 @@ func runFyne(url string, interval time.Duration) {
 
 	progressRow := container.NewBorder(nil, nil, elapsedLabel, remainingLabel, progressBar)
 	pad := theme.Padding()
-	mainWindow.SetContent(container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow))
+	body := container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow)
+	mainWindow.SetContent(container.NewStack(body, newClickCatcher()))
 
 	// --- Цикл опроса MPC-HC в отдельной горутине ---
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -816,6 +883,7 @@ func runFyne(url string, interval time.Duration) {
 			}
 			stCopy := st
 			fyne.Do(func() {
+				currentFilePath = stCopy.FilePath
 				if stCopy.Duration <= 0 {
 					progressText = "Нет активного воспроизведения"
 					progressBar.SetValue(0)

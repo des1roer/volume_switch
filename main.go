@@ -97,6 +97,7 @@ func setupLogging(debug bool) {
 		log.Printf("=== volume_switch starting (debug mode) ===")
 		return
 	}
+	hideConsole()
 	f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.SetOutput(io.Discard)
@@ -104,6 +105,18 @@ func setupLogging(debug bool) {
 	}
 	log.SetOutput(io.MultiWriter(f))
 	log.Printf("=== volume_switch starting (log -> %s) ===", logFileName)
+}
+
+// hideConsole отвязывает процесс от унаследованной консоли и закрывает её
+// окно. Нужно для сборок без `-ldflags "-H=windowsgui"`: загрузчик Windows
+// подключает консоль по subsystem в PE-заголовке ещё до того, как этот код
+// успевает выполниться, независимо от флага -debug. FreeConsole() убирает
+// этот случайный флеш консоли; правильная же сборка с -H=windowsgui вообще
+// не создаёт консоль, и этот вызов там становится no-op.
+func hideConsole() {
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	freeConsole := kernel32.NewProc("FreeConsole")
+	freeConsole.Call()
 }
 
 // ---------------------------------------------------------------------------
@@ -942,12 +955,17 @@ var (
 	deviceByID map[string]int
 )
 
+// debugMode хранит значение флага -debug для использования вне main()
+// (см. onReady, где решается, нужно ли повторно показывать консоль).
+var debugMode bool
+
 func main() {
-	debug := flag.Bool("debug", true, "Показывать консоль с дебаг-логами")
+	debug := flag.Bool("debug", false, "Показывать консоль с дебаг-логами")
 	urlFlag := flag.String("url", "", "URL variables.html (перекрывает MPC_URL)")
 	intervalFlag := flag.Duration("interval", 0, "Интервал опроса (перекрывает MPC_INTERVAL)")
 	flag.Parse()
 
+	debugMode = *debug
 	setupLogging(*debug)
 
 	loadDotEnv(".env")
@@ -990,7 +1008,9 @@ func main() {
 
 func onReady() {
 	log.Printf("systray: onReady")
-	ensureConsole() // systray мог спрятать консоль повторно
+	if debugMode {
+		ensureConsole() // systray мог спрятать консоль повторно
+	}
 	systray.SetIcon(trayIconData)
 	systray.SetTitle("")
 	systray.SetTooltip("Volume Switch")

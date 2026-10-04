@@ -41,6 +41,7 @@ import (
 	"github.com/diegosz/go-wca/pkg/wca"
 	"github.com/go-ole/go-ole"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
@@ -1012,6 +1013,69 @@ func toggleMPCWindow() {
 }
 
 // ---------------------------------------------------------------------------
+// Автозапуск через реестр (HKCU\...\Run)
+// ---------------------------------------------------------------------------
+
+const (
+	autostartRegistryPath = `Software\Microsoft\Windows\CurrentVersion\Run`
+	autostartValueName    = "VolumeSwitch"
+)
+
+// autostartCommand возвращает командную строку для записи в Run: путь к
+// текущему exe в кавычках (без экранирования backslash — простое
+// оборачивание в кавычки, т.к. %q из fmt испортил бы пути с обратным слэшем).
+func autostartCommand() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return `"` + exe + `"`, nil
+}
+
+// isAutostartEnabled проверяет, что значение в HKCU\...\Run существует и
+// указывает именно на текущий exe (а не на устаревший путь).
+func isAutostartEnabled() bool {
+	cmd, err := autostartCommand()
+	if err != nil {
+		return false
+	}
+	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryPath, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	val, _, err := key.GetStringValue(autostartValueName)
+	if err != nil {
+		return false
+	}
+	return val == cmd
+}
+
+// setAutostart включает или выключает автозапуск, записывая/удаляя значение
+// в HKCU\...\Run.
+func setAutostart(enable bool) error {
+	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+
+	if !enable {
+		err := key.DeleteValue(autostartValueName)
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	cmd, err := autostartCommand()
+	if err != nil {
+		return err
+	}
+	return key.SetStringValue(autostartValueName, cmd)
+}
+
+// ---------------------------------------------------------------------------
 // systray + аудиоустройства
 // ---------------------------------------------------------------------------
 
@@ -1117,6 +1181,27 @@ func onReady() {
 		for range mShow.ClickedCh {
 			log.Printf("tray: пункт «Показать/скрыть MPC» нажат")
 			toggleMPCWindow()
+		}
+	}()
+
+	mAutostart := systray.AddMenuItemCheckbox(
+		"Запускать при входе в Windows",
+		"Добавить/убрать из автозагрузки Windows",
+		isAutostartEnabled(),
+	)
+	go func() {
+		for range mAutostart.ClickedCh {
+			enable := !mAutostart.Checked()
+			if err := setAutostart(enable); err != nil {
+				log.Printf("autostart: не удалось изменить: %v", err)
+				continue
+			}
+			if enable {
+				mAutostart.Check()
+			} else {
+				mAutostart.Uncheck()
+			}
+			log.Printf("autostart: включён=%v", enable)
 		}
 	}()
 

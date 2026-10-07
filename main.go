@@ -881,15 +881,23 @@ var (
 	volumeHideTimer *time.Timer
 )
 
-// clickCatcher — прозрачный виджет на весь оверлей, который ловит клик
-// средней кнопкой мыши (колесом) и открывает папку с текущим файлом в
-// проводнике. Остальные клики (левая/правая кнопка) не перехватывает.
+// clickCatcher — прозрачный виджет на весь оверлей, который ловит клики по
+// нему:
+//   - средняя кнопка (колесо) — открывает папку с текущим файлом в проводнике;
+//   - левая кнопка по полосе прогресса — ставит воспроизведение на паузу или
+//     возобновляет его (команда 889 «Play/Pause» web-интерфейса MPC-HC).
+//
+// Правая кнопка не перехватывается вовсе. URL variables.html передаётся в
+// конструктор, чтобы клик мог отправить команду в тот же web-интерфейс
+// MPC-HC, который опрашивает оверлей.
 type clickCatcher struct {
 	widget.BaseWidget
+
+	mpcURL string
 }
 
-func newClickCatcher() *clickCatcher {
-	c := &clickCatcher{}
+func newClickCatcher(mpcURL string) *clickCatcher {
+	c := &clickCatcher{mpcURL: mpcURL}
 	c.ExtendBaseWidget(c)
 	return c
 }
@@ -901,11 +909,83 @@ func (c *clickCatcher) CreateRenderer() fyne.WidgetRenderer {
 func (c *clickCatcher) MouseDown(*desktop.MouseEvent) {}
 
 func (c *clickCatcher) MouseUp(ev *desktop.MouseEvent) {
-	if ev.Button != desktop.MouseButtonTertiary {
+	switch ev.Button {
+	case desktop.MouseButtonTertiary:
+		log.Printf("overlay: клик колесом, открываю папку с файлом")
+		openContainingFolder(currentFilePath)
+	case desktop.MouseButtonPrimary:
+		if !pointInProgressBar(ev.Position) {
+			return
+		}
+		log.Printf("overlay: клик левой кнопкой по полосе прогресса — переключаю воспроизведение")
+		// Запрос уходит из отдельной горутины: если MPC-HC не отвечает,
+		// HTTP-клиент ждёт до своего таймаута, и держать на этом событийный
+		// цикл Fyne нельзя.
+		go toggleMPCPlayback(c.mpcURL)
+	}
+}
+
+// pointInProgressBar сообщает, попала ли точка клика (в координатах окна) в
+// границы полосы прогресса. Полоса занимает почти всю ширину оверлея, но
+// клик по подписям времени или по пустым полям окна воспроизведение не
+// переключает.
+func pointInProgressBar(p fyne.Position) bool {
+	if progressBar == nil || fyne.CurrentApp() == nil {
+		return false
+	}
+	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(progressBar)
+	size := progressBar.Size()
+	return p.X >= pos.X && p.X <= pos.X+size.Width &&
+		p.Y >= pos.Y && p.Y <= pos.Y+size.Height
+}
+
+// mpcPlayPauseCommand — WM_COMMAND ID пункта «Play/Pause» в MPC-HC
+// (ID_PLAY_PLAYPAUSE). Соседние команды: 887 Play, 888 Pause, 890 Stop — те
+// же номера принимает web-интерфейс в command.html.
+const mpcPlayPauseCommand = 889
+
+// mpcCommandURL строит URL команды web-интерфейса MPC-HC из URL
+// variables.html: берётся тот же каталог, файл заменяется на command.html, а
+// номер команды передаётся параметром wm_command.
+//
+//	http://localhost:7777/variables.html -> http://localhost:7777/command.html?wm_command=889
+func mpcCommandURL(variablesURL string, command int) string {
+	base := strings.TrimSpace(variablesURL)
+	if base == "" {
+		return ""
+	}
+	if i := strings.IndexAny(base, "?#"); i >= 0 {
+		base = base[:i]
+	}
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[:i+1]
+	} else {
+		base += "/"
+	}
+	return fmt.Sprintf("%scommand.html?wm_command=%d", base, command)
+}
+
+// toggleMPCPlayback отправляет в web-интерфейс MPC-HC команду «Play/Pause»,
+// то есть ставит воспроизведение на паузу либо возобновляет его — в
+// зависимости от текущего состояния плеера. Состояние заранее не
+// запрашивается: команда сама по себе переключающая, а лишний опрос добавил
+// бы только гонку между чтением состояния и его изменением.
+func toggleMPCPlayback(variablesURL string) {
+	cmdURL := mpcCommandURL(variablesURL, mpcPlayPauseCommand)
+	if cmdURL == "" {
+		log.Printf("mpc command: URL variables.html неизвестен, команда не отправлена")
 		return
 	}
-	log.Printf("overlay: клик колесом, открываю папку с файлом")
-	openContainingFolder(currentFilePath)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(cmdURL)
+	if err != nil {
+		log.Printf("mpc command: не удалось отправить %s: %v", cmdURL, err)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
 }
 
 // openContainingFolder открывает проводник с выделенным файлом (как
@@ -986,7 +1066,7 @@ func runFyne(url string, interval time.Duration) {
 	progressRow := container.NewBorder(nil, nil, elapsedLabel, remainingLabel, progressBar)
 	pad := theme.Padding()
 	body := container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow)
-	mainWindow.SetContent(container.NewStack(body, newClickCatcher()))
+	mainWindow.SetContent(container.NewStack(body, newClickCatcher(url)))
 
 	// --- Цикл опроса MPC-HC в отдельной горутине ---
 	client := &http.Client{Timeout: 2 * time.Second}

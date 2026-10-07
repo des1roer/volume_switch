@@ -107,23 +107,28 @@ func ensureConsole() {
 	showWindow.Call(hwnd, SW_SHOW)
 }
 
-// setupLogging настраивает вывод: в консоль (debug) или в файл.
-func setupLogging(debug bool) {
+// setupLogging настраивает вывод: в консоль (debug) или в файл. Возвращает
+// функцию, закрывающую лог-файл; вызывается из main при завершении.
+func setupLogging(debug bool) (closeLog func()) {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	if debug {
 		ensureConsole()
 		log.SetOutput(os.Stderr)
 		log.Printf("=== volume_switch starting (debug mode) ===")
-		return
+		return func() {}
 	}
 	hideConsole()
 	f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.SetOutput(io.Discard)
-		return
+		return func() {}
 	}
-	log.SetOutput(io.MultiWriter(f))
+	log.SetOutput(f)
 	log.Printf("=== volume_switch starting (log -> %s) ===", logFileName)
+	return func() {
+		log.SetOutput(io.Discard)
+		f.Close()
+	}
 }
 
 // hideConsole отвязывает процесс от унаследованной консоли и закрывает её
@@ -1515,7 +1520,8 @@ func main() {
 	flag.Parse()
 
 	debugMode = *debug
-	setupLogging(*debug)
+	closeLog := setupLogging(*debug)
+	defer closeLog()
 
 	loadDotEnv(".env")
 

@@ -539,24 +539,30 @@ func (s *Switcher) setDefaultLocked(id string) error {
 	return nil
 }
 
-// CurrentVolume возвращает текущий уровень громкости (0..1) и состояние mute
-// текущего default-устройства воспроизведения. Используется volumePoller
-// (см. ниже) для отслеживания изменений громкости.
-func (s *Switcher) CurrentVolume() (level float64, muted bool, err error) {
+// CurrentVolume возвращает текущий уровень громкости (0..1), состояние mute и
+// ID текущего default-устройства воспроизведения. ID нужен вызывающему
+// (volumePoller, см. ниже), чтобы отличить реальное изменение громкости от
+// переключения на другое устройство с другим сохранённым уровнем — это два
+// разных события, и поднимать оверлей на устройства нужно только для первого.
+func (s *Switcher) CurrentVolume() (level float64, muted bool, deviceID string, err error) {
 	err = s.exec(func() error {
-		l, m, e := s.currentVolumeLocked()
-		level, muted = l, m
+		l, m, id, e := s.currentVolumeLocked()
+		level, muted, deviceID = l, m, id
 		return e
 	})
 	return
 }
 
-func (s *Switcher) currentVolumeLocked() (level float64, muted bool, err error) {
+func (s *Switcher) currentVolumeLocked() (level float64, muted bool, deviceID string, err error) {
 	var dev *wca.IMMDevice
 	if err = s.mmde.GetDefaultAudioEndpoint(wca.ERender, wca.EConsole, &dev); err != nil {
 		return
 	}
 	defer dev.Release()
+
+	if err = dev.GetId(&deviceID); err != nil {
+		return
+	}
 
 	var aev *wca.IAudioEndpointVolume
 	if err = dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
@@ -619,31 +625,38 @@ const volumePollInterval = 120 * time.Millisecond
 
 // startVolumePoller периодически опрашивает switcher.CurrentVolume() и
 // вызывает onChange при изменении уровня (с точностью до процента) или
-// состояния mute. Первое измерение только запоминается как база для
-// сравнения — не вызывает onChange, чтобы оверлей не всплывал при старте
-// программы.
+// состояния mute НА ОДНОМ И ТОМ ЖЕ устройстве. Первое измерение, как и любое
+// измерение сразу после смены default-устройства (F7/F8, трей, панель задач
+// Windows), только запоминается как новая база для сравнения — onChange не
+// вызывается, иначе оверлей всплывал бы при каждом запуске и при каждом
+// переключении вывода (у устройств обычно разный сохранённый уровень
+// громкости, и это не то же самое, что пользователь покрутил громкость).
 func startVolumePoller(switcher *Switcher, onChange func(level float64, muted bool)) {
 	go func() {
 		ticker := time.NewTicker(volumePollInterval)
 		defer ticker.Stop()
 
-		lastPercent := -1
-		lastMuted := false
+		havePrev := false
+		var lastPercent int
+		var lastMuted bool
+		var lastDeviceID string
 		for range ticker.C {
-			level, muted, err := switcher.CurrentVolume()
+			level, muted, deviceID, err := switcher.CurrentVolume()
 			if err != nil {
 				continue
 			}
 			percent := int(math.Round(level * 100))
-			if lastPercent == -1 {
-				lastPercent, lastMuted = percent, muted
-				continue
+
+			switch {
+			case !havePrev:
+			case deviceID != lastDeviceID:
+				log.Printf("volume poller: устройство сменилось, громкость не показываю")
+			case percent != lastPercent || muted != lastMuted:
+				onChange(level, muted)
 			}
-			if percent == lastPercent && muted == lastMuted {
-				continue
-			}
-			lastPercent, lastMuted = percent, muted
-			onChange(level, muted)
+
+			havePrev = true
+			lastPercent, lastMuted, lastDeviceID = percent, muted, deviceID
 		}
 	}()
 }

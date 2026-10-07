@@ -71,8 +71,7 @@ var (
 // возвращаемым значением (обычно 0), поэтому вызывать win32Error нужно только
 // после такой проверки.
 func win32Error(name string, errno error) error {
-	var e syscall.Errno
-	if errors.As(errno, &e) && e == 0 {
+	if e, ok := errors.AsType[syscall.Errno](errno); ok && e == 0 {
 		return fmt.Errorf("%s: неизвестная ошибка", name)
 	}
 	return fmt.Errorf("%s: %w", name, errno)
@@ -1010,6 +1009,10 @@ func (c *clickCatcher) MouseUp(ev *desktop.MouseEvent) {
 		// HTTP-клиент ждёт до своего таймаута, и держать на этом событийный
 		// цикл Fyne нельзя.
 		go toggleMPCPlayback(c.mpcURL)
+	case desktop.MouseButtonSecondary:
+		// Правый клик оверлей не обрабатывает.
+	default:
+		// nothing
 	}
 }
 
@@ -2015,26 +2018,28 @@ func (l *hotkeyListener) clearActive() {
 	activeHKMu.Unlock()
 }
 
+// lParam хука WH_KEYBOARD_LL — указатель на KBDLLHOOKSTRUCT в памяти
+// Windows; syscall.NewCallback сразу отдаёт его типизированным указателем,
+// без небезопасного преобразования uintptr -> unsafe.Pointer.
+//
 // CallNextHookEx возвращает результат следующего хука в цепочке, а не
 // признак ошибки, поэтому третье значение Call здесь не нужно.
-func hookProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
+func hookProc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
 	if nCode < 0 {
-		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
 		return r
 	}
 	if wParam != wmKeyDown && wParam != wmSysKeyDown {
-		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
 		return r
 	}
-
-	kb := (*kbdllHookStruct)(unsafe.Pointer(lParam))
 
 	activeHKMu.Lock()
 	l := activeHK
 	activeHKMu.Unlock()
 
 	if l == nil {
-		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
 		return r
 	}
 
@@ -2056,6 +2061,6 @@ func hookProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return 1
 	}
 
-	r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+	r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
 	return r
 }

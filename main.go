@@ -1662,6 +1662,39 @@ var (
 // (см. onReady, где решается, нужно ли повторно показывать консоль).
 var debugMode bool
 
+// singleInstanceMutex — имя именованного мьютекса, по которому второй
+// экземпляр узнаёт, что программа уже запущена. Префикс Local\ ограничивает
+// проверку сеансом текущего пользователя: глобальные хоткеи и трей всё равно
+// работают только в своём сеансе.
+const singleInstanceMutex = `Local\volume_switch_single_instance`
+
+// acquireSingleInstance создаёт именованный мьютекс. Возвращает already=true,
+// если мьютекс уже существует, т.е. другой экземпляр программы запущен.
+// Возвращённую функцию release нужно вызвать при завершении; до этого
+// мьютекс держится открытым и блокирует повторный запуск. Windows закрывает
+// дескриптор и при аварийном завершении процесса, так что «зависшей»
+// блокировки после падения не остаётся.
+func acquireSingleInstance() (release func(), already bool, err error) {
+	name, err := windows.UTF16PtrFromString(singleInstanceMutex)
+	if err != nil {
+		return nil, false, fmt.Errorf("имя мьютекса: %w", err)
+	}
+	h, err := windows.CreateMutex(nil, false, name)
+	if h == 0 {
+		return nil, false, fmt.Errorf("CreateMutex: %w", err)
+	}
+	release = func() {
+		if err := windows.CloseHandle(h); err != nil {
+			log.Printf("single instance: закрытие мьютекса: %v", err)
+		}
+	}
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		release()
+		return nil, true, nil
+	}
+	return release, false, nil
+}
+
 func main() {
 	debug := flag.Bool("debug", false, "Показывать консоль с дебаг-логами")
 	urlFlag := flag.String("url", "", "URL variables.html (перекрывает MPC_URL)")
@@ -1671,6 +1704,18 @@ func main() {
 	debugMode = *debug
 	closeLog := setupLogging(*debug)
 	defer closeLog()
+
+	releaseInstance, already, err := acquireSingleInstance()
+	switch {
+	case err != nil:
+		// Проверку выполнить не удалось — лучше запуститься, чем не работать вовсе.
+		log.Printf("single instance: %v — запускаюсь без проверки", err)
+	case already:
+		log.Printf("single instance: программа уже запущена, выхожу")
+		return
+	default:
+		defer releaseInstance()
+	}
 
 	loadDotEnv(".env")
 

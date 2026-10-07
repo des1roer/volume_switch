@@ -127,7 +127,11 @@ func setupLogging(debug bool) (closeLog func()) {
 	log.Printf("=== volume_switch starting (log -> %s) ===", logFileName)
 	return func() {
 		log.SetOutput(io.Discard)
-		f.Close()
+		err := f.Close()
+		if err != nil {
+			log.SetOutput(io.Discard)
+			return
+		}
 	}
 }
 

@@ -66,6 +66,18 @@ var (
 	volumeLabelColor = color.NRGBA{R: 170, G: 170, B: 170, A: 255}
 )
 
+// win32Error оборачивает errno, который LazyProc.Call отдаёт третьим
+// значением. Он осмыслен только когда сама функция сообщила о неудаче своим
+// возвращаемым значением (обычно 0), поэтому вызывать win32Error нужно только
+// после такой проверки.
+func win32Error(name string, errno error) error {
+	var e syscall.Errno
+	if errors.As(errno, &e) && e == 0 {
+		return fmt.Errorf("%s: неизвестная ошибка", name)
+	}
+	return fmt.Errorf("%s: %w", name, errno)
+}
+
 // ---------------------------------------------------------------------------
 // Логирование
 // ---------------------------------------------------------------------------
@@ -76,7 +88,7 @@ var (
 //
 // systray при инициализации сам вызывает ShowWindow(SW_HIDE), поэтому
 // без этого трюка в консоль ничего не видно.
-func ensureConsole() {
+func ensureConsole() error {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 	user32 := syscall.NewLazyDLL("user32.dll")
 
@@ -86,51 +98,69 @@ func ensureConsole() {
 
 	const SW_SHOW = 5
 
+	// GetConsoleWindow не сообщает об ошибках: 0 означает «консоли нет».
 	hwnd, _, _ := getConsoleWindow.Call()
 	if hwnd == 0 {
-		if r, _, _ := allocConsole.Call(); r == 0 {
-			return
+		if r, _, errno := allocConsole.Call(); r == 0 {
+			return win32Error("AllocConsole", errno)
 		}
 		hwnd, _, _ = getConsoleWindow.Call()
 		if hwnd == 0 {
-			return
+			return errors.New("GetConsoleWindow: консоль создана, но окна у неё нет")
 		}
-		if f, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
-			os.Stdout = f
-			os.Stderr = f
-			log.SetOutput(f)
+		out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0)
+		if err != nil {
+			return fmt.Errorf("открытие CONOUT$: %w", err)
 		}
-		if f, err := os.OpenFile("CONIN$", os.O_RDONLY, 0); err == nil {
-			os.Stdin = f
+		os.Stdout = out
+		os.Stderr = out
+		log.SetOutput(out)
+		in, err := os.OpenFile("CONIN$", os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("открытие CONIN$: %w", err)
 		}
+		os.Stdin = in
 	}
-	showWindow.Call(hwnd, SW_SHOW)
+	// ShowWindow возвращает прежнюю видимость окна, а не признак ошибки.
+	_, _, _ = showWindow.Call(hwnd, SW_SHOW)
+	return nil
 }
 
 // setupLogging настраивает вывод: в консоль (debug) или в файл. Возвращает
 // функцию, закрывающую лог-файл; вызывается из main при завершении.
+//
+// Ошибки, возникшие до того, как у лога появился вывод (консоль, открытие
+// файла), пишутся в stderr — его видно при запуске из терминала.
 func setupLogging(debug bool) (closeLog func()) {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	if debug {
-		ensureConsole()
+		consoleErr := ensureConsole()
 		log.SetOutput(os.Stderr)
 		log.Printf("=== volume_switch starting (debug mode) ===")
+		if consoleErr != nil {
+			log.Printf("console: %v", consoleErr)
+		}
 		return func() {}
 	}
-	hideConsole()
+	consoleErr := hideConsole()
 	f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "volume_switch: не удалось открыть %s, лог отключён: %v\n", logFileName, err)
+		if consoleErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "volume_switch: console: %v\n", consoleErr)
+		}
 		log.SetOutput(io.Discard)
 		return func() {}
 	}
 	log.SetOutput(f)
 	log.Printf("=== volume_switch starting (log -> %s) ===", logFileName)
+	if consoleErr != nil {
+		log.Printf("console: %v", consoleErr)
+	}
 	return func() {
 		log.SetOutput(io.Discard)
-		err := f.Close()
-		if err != nil {
-			log.SetOutput(io.Discard)
-			return
+		if err := f.Close(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "volume_switch: закрытие %s: %v\n", logFileName, err)
 		}
 	}
 }
@@ -141,10 +171,16 @@ func setupLogging(debug bool) (closeLog func()) {
 // успевает выполниться, независимо от флага -debug. FreeConsole() убирает
 // этот случайный флеш консоли; правильная же сборка с -H=windowsgui вообще
 // не создаёт консоль, и этот вызов там становится no-op.
-func hideConsole() {
+func hideConsole() error {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 	freeConsole := kernel32.NewProc("FreeConsole")
-	freeConsole.Call()
+	r, _, errno := freeConsole.Call()
+	// Без консоли (сборка с -H=windowsgui) FreeConsole по документации
+	// завершается с ERROR_INVALID_PARAMETER — это штатный случай.
+	if r == 0 && !errors.Is(errno, windows.ERROR_INVALID_PARAMETER) {
+		return win32Error("FreeConsole", errno)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +208,10 @@ func loadDotEnv(path string) {
 		key = strings.TrimSpace(key)
 		value = strings.Trim(strings.TrimSpace(value), `"'`)
 		if _, exists := os.LookupEnv(key); !exists {
-			os.Setenv(key, value)
+			if err := os.Setenv(key, value); err != nil {
+				log.Printf(".env: не удалось задать %s: %v", key, err)
+				continue
+			}
 			loaded++
 			log.Printf(".env: %s=%s", key, value)
 		} else {
@@ -206,13 +245,14 @@ type MPCState struct {
 	FilePath    string
 }
 
-func extractInt(html string, re *regexp.Regexp) int64 {
+// extractInt возвращает 0, если поля в странице нет (MPC-HC без открытого
+// файла), и ошибку, если поле есть, но число в нём не разбирается.
+func extractInt(html string, re *regexp.Regexp) (int64, error) {
 	m := re.FindStringSubmatch(html)
 	if len(m) < 2 {
-		return 0
+		return 0, nil
 	}
-	v, _ := strconv.ParseInt(m[1], 10, 64)
-	return v
+	return strconv.ParseInt(m[1], 10, 64)
 }
 
 func extractStr(html string, re *regexp.Regexp) string {
@@ -223,12 +263,19 @@ func extractStr(html string, re *regexp.Regexp) string {
 	return m[1]
 }
 
-func fetchState(url string, client *http.Client) (*MPCState, error) {
+func fetchState(url string, client *http.Client) (_ *MPCState, err error) {
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("закрытие ответа: %w", cerr)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -236,9 +283,18 @@ func fetchState(url string, client *http.Client) (*MPCState, error) {
 	}
 	html := string(body)
 
+	position, err := extractInt(html, rePosition)
+	if err != nil {
+		return nil, fmt.Errorf("position: %w", err)
+	}
+	duration, err := extractInt(html, reDuration)
+	if err != nil {
+		return nil, fmt.Errorf("duration: %w", err)
+	}
+
 	return &MPCState{
-		Position:    extractInt(html, rePosition),
-		Duration:    extractInt(html, reDuration),
+		Position:    position,
+		Duration:    duration,
 		PositionStr: extractStr(html, rePositionStr),
 		DurationStr: extractStr(html, reDurationStr),
 		StateString: extractStr(html, reStateString),
@@ -282,7 +338,7 @@ type winMonitorInfo struct {
 
 // screenLayout возвращает рабочую область (без панели задач) и полные границы
 // монитора, на котором сейчас находится курсор мыши.
-func screenLayout() (work, monitor winRect) {
+func screenLayout() (work, monitor winRect, err error) {
 	user32 := syscall.NewLazyDLL("user32.dll")
 	getCursorPos := user32.NewProc("GetCursorPos")
 	monitorFromPoint := user32.NewProc("MonitorFromPoint")
@@ -291,16 +347,22 @@ func screenLayout() (work, monitor winRect) {
 	const monitorDefaultToNearest = 2
 
 	var pt winPoint
-	getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	if r, _, errno := getCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r == 0 {
+		return work, monitor, win32Error("GetCursorPos", errno)
+	}
 
 	ptPacked := uintptr(uint32(pt.X)) | uintptr(uint32(pt.Y))<<32
+	// С MONITOR_DEFAULTTONEAREST MonitorFromPoint всегда возвращает монитор
+	// и ошибок не сообщает.
 	hMonitor, _, _ := monitorFromPoint.Call(ptPacked, monitorDefaultToNearest)
 
 	var mi winMonitorInfo
 	mi.CbSize = uint32(unsafe.Sizeof(mi))
-	getMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi)))
+	if r, _, errno := getMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi))); r == 0 {
+		return work, monitor, win32Error("GetMonitorInfoW", errno)
+	}
 
-	return mi.RcWork, mi.RcMonitor
+	return mi.RcWork, mi.RcMonitor, nil
 }
 
 // titleBarHeight возвращает высоту заголовка окна Windows (вместе с рамкой).
@@ -314,6 +376,8 @@ func titleBarHeight() int32 {
 		smCxPaddedBorder = 92
 	)
 
+	// GetSystemMetrics не сообщает об ошибках (GetLastError не выставляет),
+	// при неудаче возвращает 0 — это даёт лишь чуть меньший отступ.
 	cyCaption, _, _ := getSystemMetrics.Call(smCyCaption)
 	cySizeFrame, _, _ := getSystemMetrics.Call(smCySizeFrame)
 	cxPaddedBorder, _, _ := getSystemMetrics.Call(smCxPaddedBorder)
@@ -730,8 +794,13 @@ var (
 // called before systray finished initializing, or after a dependency
 // upgrade changed the implementation details above).
 func showNotification(title, body string) {
-	hwnd := findOwnTrayWindow()
+	hwnd, err := findOwnTrayWindow()
+	if err != nil {
+		log.Printf("notification: поиск окна трея: %v", err)
+		return
+	}
 	if hwnd == 0 {
+		log.Printf("notification: окно трея %q не найдено, уведомление не показано", systrayClassName)
 		return
 	}
 
@@ -744,7 +813,9 @@ func showNotification(title, body string) {
 	copyUTF16(nid.szInfo[:], body)
 	copyUTF16(nid.szInfoTitle[:], title)
 
-	procShellNotifyIconW.Call(uintptr(nimModify), uintptr(unsafe.Pointer(&nid)))
+	if r, _, errno := procShellNotifyIconW.Call(uintptr(nimModify), uintptr(unsafe.Pointer(&nid))); r == 0 {
+		log.Printf("notification: %v", win32Error("Shell_NotifyIconW", errno))
+	}
 }
 
 func copyUTF16(dst []uint16, s string) {
@@ -764,13 +835,18 @@ func copyUTF16(dst []uint16, s string) {
 
 // findOwnTrayWindow enumerates top-level windows looking for the hidden
 // systray window that belongs to this process.
-func findOwnTrayWindow() windows.Handle {
+//
+// Ошибки по отдельным окнам (окно успело закрыться во время перебора и т.п.)
+// не прерывают поиск — такое окно просто пропускается.
+func findOwnTrayWindow() (windows.Handle, error) {
 	pid := windows.GetCurrentProcessId()
 	var found windows.Handle
 
 	cb := windows.NewCallback(func(hwnd windows.Handle, _ uintptr) uintptr {
 		var winPid uint32
-		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&winPid)))
+		if tid, _, _ := procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&winPid))); tid == 0 {
+			return 1 // окно уже недействительно — пропускаем
+		}
 		if winPid != pid {
 			return 1 // continue enumeration
 		}
@@ -778,7 +854,7 @@ func findOwnTrayWindow() windows.Handle {
 		var cls [64]uint16
 		n, _, _ := procGetClassNameW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&cls[0])), uintptr(len(cls)))
 		if n == 0 {
-			return 1
+			return 1 // имя класса не получено — пропускаем
 		}
 		if windows.UTF16ToString(cls[:n]) == systrayClassName {
 			found = hwnd
@@ -787,8 +863,12 @@ func findOwnTrayWindow() windows.Handle {
 		return 1
 	})
 
-	procEnumWindows.Call(cb, 0)
-	return found
+	// EnumWindows возвращает 0 и тогда, когда перебор остановил сам колбэк
+	// (окно найдено), поэтому ошибкой это считается только без находки.
+	if r, _, errno := procEnumWindows.Call(cb, 0); r == 0 && found == 0 {
+		return 0, win32Error("EnumWindows", errno)
+	}
+	return found, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -830,25 +910,23 @@ func renderTrayIcon() []byte {
 
 // wrapICO wraps a single PNG image into a minimal valid .ico container.
 func wrapICO(pngData []byte, w, h int) []byte {
-	var buf bytes.Buffer
+	const headerSize = 6 + 16
+	le := binary.LittleEndian
+	b := make([]byte, 0, headerSize+len(pngData))
 
 	// ICONDIR
-	binary.Write(&buf, binary.LittleEndian, uint16(0)) // reserved
-	binary.Write(&buf, binary.LittleEndian, uint16(1)) // type: icon
-	binary.Write(&buf, binary.LittleEndian, uint16(1)) // image count
+	b = le.AppendUint16(b, 0) // reserved
+	b = le.AppendUint16(b, 1) // type: icon
+	b = le.AppendUint16(b, 1) // image count
 
 	// ICONDIRENTRY (dimensions >=256 are encoded as 0 per spec; not needed here)
-	buf.WriteByte(byte(w))
-	buf.WriteByte(byte(h))
-	buf.WriteByte(0)                                              // color palette
-	buf.WriteByte(0)                                              // reserved
-	binary.Write(&buf, binary.LittleEndian, uint16(1))            // color planes
-	binary.Write(&buf, binary.LittleEndian, uint16(32))           // bits per pixel
-	binary.Write(&buf, binary.LittleEndian, uint32(len(pngData))) // size of image data
-	binary.Write(&buf, binary.LittleEndian, uint32(6+16))         // offset to image data
+	b = append(b, byte(w), byte(h), 0, 0)        // width, height, color palette, reserved
+	b = le.AppendUint16(b, 1)                    // color planes
+	b = le.AppendUint16(b, 32)                   // bits per pixel
+	b = le.AppendUint32(b, uint32(len(pngData))) // size of image data
+	b = le.AppendUint32(b, headerSize)           // offset to image data
 
-	buf.Write(pngData)
-	return buf.Bytes()
+	return append(b, pngData...)
 }
 
 // ---------------------------------------------------------------------------
@@ -994,8 +1072,18 @@ func toggleMPCPlayback(variablesURL string) {
 		launchMPC()
 		return
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("mpc command: закрытие ответа: %v", err)
+		}
+	}()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		log.Printf("mpc command: чтение ответа: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("mpc command: play/pause -> %s отклонена: %s", cmdURL, resp.Status)
+		return
+	}
 	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
 }
 
@@ -1008,18 +1096,33 @@ func mpcExePath() string {
 	if p := os.Getenv("MPC_EXE"); p != "" {
 		return p
 	}
-	if _, err := os.Stat(defaultMPCExe); err == nil {
+	_, err := os.Stat(defaultMPCExe)
+	if err == nil {
 		return defaultMPCExe
 	}
+	if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("mpc launch: проверка %s: %v", defaultMPCExe, err)
+	}
+
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\MPC-HC\MPC-HC`, registry.QUERY_VALUE)
 	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			log.Printf("mpc launch: открытие ключа реестра MPC-HC: %v", err)
+		}
 		return defaultMPCExe
 	}
-	defer key.Close()
-	if p, _, err := key.GetStringValue("ExePath"); err == nil && p != "" {
-		return p
+	defer logRegistryClose(key, "MPC-HC")
+	p, _, err := key.GetStringValue("ExePath")
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			log.Printf("mpc launch: чтение ExePath из реестра: %v", err)
+		}
+		return defaultMPCExe
 	}
-	return defaultMPCExe
+	if p == "" {
+		return defaultMPCExe
+	}
+	return p
 }
 
 // launchMPC запускает MPC-HC. Повторный запуск при уже открытом плеере
@@ -1037,8 +1140,10 @@ func launchMPC() {
 		log.Printf("mpc launch: не удалось запустить %s: %v", exe, err)
 		return
 	}
-	cmd.Process.Release()
 	log.Printf("mpc launch: запущен %s", exe)
+	if err := cmd.Process.Release(); err != nil {
+		log.Printf("mpc launch: освобождение дескриптора процесса: %v", err)
+	}
 }
 
 // openContainingFolder открывает проводник с выделенным файлом (как
@@ -1083,7 +1188,9 @@ func runFyne(url string, interval time.Duration) {
 	// --- Размер/позиция окна под монитор с курсором ---
 	windowWidth, windowHeight := float32(900), float32(170)
 	posX, posY := 0, 0
-	if work, monitor := screenLayout(); work.Right > work.Left {
+	if work, monitor, err := screenLayout(); err != nil {
+		log.Printf("fyne: не удалось определить монитор, размер по умолчанию: %v", err)
+	} else if work.Right > work.Left {
 		titleBar := titleBarHeight()
 		windowWidth = float32(work.Right - work.Left)
 		windowHeight = float32(monitor.Bottom-monitor.Top)*0.10 - float32(titleBar)
@@ -1215,7 +1322,9 @@ func runFyne(url string, interval time.Duration) {
 	// форсировать создание HWND, применить стиль, и лишь после этого окно
 	// хоть раз станет видимым пользователю.
 	volumeWindow.Show()
-	fixOverlayWindowChrome(volumeWindowTitle)
+	if err := fixOverlayWindowChrome(volumeWindowTitle); err != nil {
+		log.Printf("overlay-chrome: %v", err)
+	}
 	volumeWindow.Hide()
 
 	// Стартуем скрытыми — mainWindow покажем по F5, volumeWindow по событию
@@ -1253,7 +1362,7 @@ var (
 // цикла Hide()+Show() Explorer иногда всё равно возвращает кнопку в панель
 // задач. Сами вызовы дешёвые (несколько syscall), так что переприменять их
 // при каждом показе не проблема.
-func fixOverlayWindowChrome(title string) {
+func fixOverlayWindowChrome(title string) error {
 	const (
 		wsExToolWindow  = 0x00000080
 		wsExAppWindow   = 0x00040000
@@ -1271,28 +1380,38 @@ func fixOverlayWindowChrome(title string) {
 
 	titlePtr, err := syscall.UTF16PtrFromString(title)
 	if err != nil {
-		log.Printf("overlay-chrome: не удалось подготовить заголовок: %v", err)
-		return
+		return fmt.Errorf("заголовок %q: %w", title, err)
 	}
-	hwnd, _, _ := chromeFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+	hwnd, _, errno := chromeFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
 	if hwnd == 0 {
-		log.Printf("overlay-chrome: окно %q не найдено, пропускаю", title)
-		return
+		return fmt.Errorf("окно %q: %w", title, win32Error("FindWindowW", errno))
 	}
 
-	exStyle, _, _ := chromeGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
+	// У окна GLFW расширенный стиль никогда не нулевой, поэтому 0 от
+	// Get/SetWindowLongPtrW здесь однозначно означает ошибку.
+	exStyle, _, errno := chromeGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
+	if exStyle == 0 {
+		return win32Error("GetWindowLongPtrW", errno)
+	}
 	newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
-	chromeSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle)
+	if prev, _, errno := chromeSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle); prev == 0 {
+		return win32Error("SetWindowLongPtrW", errno)
+	}
 
 	// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
 	// задач без скрытия/показа окна — в отличие от ShowWindow(HIDE)+
 	// ShowWindow(SHOW), это не ломает перерисовку содержимого GLFW/Fyne.
-	chromeSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
-		uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged))
+	if r, _, errno := chromeSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
+		uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged)); r == 0 {
+		return win32Error("SetWindowPos", errno)
+	}
 
 	darkMode := int32(1)
-	chromeDwmSetWindowAttrib.Call(hwnd, uintptr(dwmwaUseImmersiveDarkMode),
-		uintptr(unsafe.Pointer(&darkMode)), unsafe.Sizeof(darkMode))
+	if hr, _, _ := chromeDwmSetWindowAttrib.Call(hwnd, uintptr(dwmwaUseImmersiveDarkMode),
+		uintptr(unsafe.Pointer(&darkMode)), unsafe.Sizeof(darkMode)); hr != 0 {
+		return fmt.Errorf("DwmSetWindowAttribute: HRESULT 0x%08X", uint32(hr))
+	}
+	return nil
 }
 
 // toggleMPCWindow показывает окно, если оно скрыто, и прячет, если показано.
@@ -1310,7 +1429,9 @@ func toggleMPCWindow() {
 			log.Printf("F5: окно скрыто")
 		} else {
 			mainWindow.Show()
-			fixOverlayWindowChrome(windowTitle)
+			if err := fixOverlayWindowChrome(windowTitle); err != nil {
+				log.Printf("overlay-chrome: %v", err)
+			}
 			winVisible = true
 			log.Printf("F5: окно показано")
 		}
@@ -1394,7 +1515,9 @@ func showVolumeOverlay(level float64, muted bool) {
 
 		width, height := volumeOverlayWidth, volumeOverlayHeight
 		x, y := 0, 0
-		if work, _ := screenLayout(); work.Right > work.Left {
+		if work, _, err := screenLayout(); err != nil {
+			log.Printf("volume overlay: не удалось определить монитор, размер по умолчанию: %v", err)
+		} else if work.Right > work.Left {
 			width = float32(work.Right-work.Left) / 2
 			height = float32(work.Bottom-work.Top) / 2
 			x = int(work.Left)
@@ -1413,7 +1536,9 @@ func showVolumeOverlay(level float64, muted bool) {
 			width, height, x, y, level*100, muted)
 
 		volumeWindow.Show()
-		fixOverlayWindowChrome(volumeWindowTitle)
+		if err := fixOverlayWindowChrome(volumeWindowTitle); err != nil {
+			log.Printf("overlay-chrome: %v", err)
+		}
 	})
 
 	volumeMu.Lock()
@@ -1457,20 +1582,33 @@ func autostartCommand() (string, error) {
 	return `"` + exe + `"`, nil
 }
 
+// logRegistryClose закрывает ключ реестра, открытый только на чтение, и
+// логирует ошибку закрытия; предназначена для defer.
+func logRegistryClose(key registry.Key, name string) {
+	if err := key.Close(); err != nil {
+		log.Printf("registry: закрытие ключа %s: %v", name, err)
+	}
+}
+
 // isAutostartEnabled проверяет, что значение в HKCU\...\Run существует и
 // указывает именно на текущий exe (а не на устаревший путь).
 func isAutostartEnabled() bool {
 	cmd, err := autostartCommand()
 	if err != nil {
+		log.Printf("autostart: путь к exe: %v", err)
 		return false
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryPath, registry.QUERY_VALUE)
 	if err != nil {
+		log.Printf("autostart: открытие ключа Run: %v", err)
 		return false
 	}
-	defer key.Close()
+	defer logRegistryClose(key, "Run")
 	val, _, err := key.GetStringValue(autostartValueName)
 	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			log.Printf("autostart: чтение %s: %v", autostartValueName, err)
+		}
 		return false
 	}
 	return val == cmd
@@ -1478,12 +1616,16 @@ func isAutostartEnabled() bool {
 
 // setAutostart включает или выключает автозапуск, записывая/удаляя значение
 // в HKCU\...\Run.
-func setAutostart(enable bool) error {
+func setAutostart(enable bool) (err error) {
 	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryPath, registry.SET_VALUE)
 	if err != nil {
 		return err
 	}
-	defer key.Close()
+	defer func() {
+		if cerr := key.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("закрытие ключа Run: %w", cerr))
+		}
+	}()
 
 	if !enable {
 		err := key.DeleteValue(autostartValueName)
@@ -1568,7 +1710,10 @@ func main() {
 func onReady() {
 	log.Printf("systray: onReady")
 	if debugMode {
-		ensureConsole() // systray мог спрятать консоль повторно
+		// systray мог спрятать консоль повторно
+		if err := ensureConsole(); err != nil {
+			log.Printf("console: %v", err)
+		}
 	}
 	systray.SetIcon(trayIconData)
 	systray.SetTitle("")
@@ -1655,8 +1800,11 @@ func onReady() {
 func onExit() {
 	log.Printf("onExit: остановка")
 	if hk != nil {
-		hk.Stop()
-		log.Printf("onExit: хук снят")
+		if err := hk.Stop(); err != nil {
+			log.Printf("onExit: не удалось снять хук: %v", err)
+		} else {
+			log.Printf("onExit: хук снят")
+		}
 	}
 	if fyneApp != nil {
 		fyneApp.Quit()
@@ -1790,7 +1938,11 @@ func (l *hotkeyListener) Start() error {
 	activeHK = l
 	activeHKMu.Unlock()
 
-	hInst, _, _ := pGetModuleHandleW.Call(0)
+	hInst, _, errno := pGetModuleHandleW.Call(0)
+	if hInst == 0 {
+		l.clearActive()
+		return win32Error("GetModuleHandleW", errno)
+	}
 
 	ready := make(chan error, 1)
 	go func() {
@@ -1806,7 +1958,8 @@ func (l *hotkeyListener) Start() error {
 			0,
 		)
 		if hook == 0 {
-			ready <- errno
+			l.clearActive()
+			ready <- win32Error("SetWindowsHookExW", errno)
 			return
 		}
 
@@ -1819,12 +1972,16 @@ func (l *hotkeyListener) Start() error {
 
 		var msg [48]byte
 		for {
-			ret, _, _ := pGetMessageW.Call(
+			ret, _, errno := pGetMessageW.Call(
 				uintptr(unsafe.Pointer(&msg[0])),
 				0, 0, 0,
 			)
-			if ret == 0 || ret == ^uintptr(0) {
-				log.Printf("hotkey: цикл сообщений завершён (ret=%d)", ret)
+			switch ret {
+			case 0:
+				log.Printf("hotkey: цикл сообщений завершён (WM_QUIT)")
+				return
+			case ^uintptr(0): // GetMessage возвращает -1 при ошибке
+				log.Printf("hotkey: цикл сообщений прерван: %v", win32Error("GetMessageW", errno))
 				return
 			}
 		}
@@ -1834,16 +1991,23 @@ func (l *hotkeyListener) Start() error {
 }
 
 // Stop снимает хук.
-func (l *hotkeyListener) Stop() {
+func (l *hotkeyListener) Stop() error {
 	l.mu.Lock()
 	hook := l.hook
 	l.hook = 0
 	l.mu.Unlock()
 
-	if hook != 0 {
-		pUnhookWindowsHookEx.Call(hook)
-	}
+	l.clearActive()
 
+	if hook != 0 {
+		if r, _, errno := pUnhookWindowsHookEx.Call(hook); r == 0 {
+			return win32Error("UnhookWindowsHookEx", errno)
+		}
+	}
+	return nil
+}
+
+func (l *hotkeyListener) clearActive() {
 	activeHKMu.Lock()
 	if activeHK == l {
 		activeHK = nil
@@ -1851,6 +2015,8 @@ func (l *hotkeyListener) Stop() {
 	activeHKMu.Unlock()
 }
 
+// CallNextHookEx возвращает результат следующего хука в цепочке, а не
+// признак ошибки, поэтому третье значение Call здесь не нужно.
 func hookProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	if nCode < 0 {
 		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)

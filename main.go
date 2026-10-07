@@ -1058,6 +1058,20 @@ func runFyne(url string, interval time.Duration) {
 	}
 	volumeWindow.SetContent(container.NewWithoutLayout(overlayObjects...))
 
+	// Нативный HWND у Fyne/GLFW создаётся лениво, только при первом Show().
+	// Если применить WS_EX_TOOLWINDOW уже ПОСЛЕ того, как окно хотя бы раз
+	// показалось с обычным стилем, Explorer иногда всё равно продолжает
+	// держать кнопку в панели задач (подтверждено на практике: однократный
+	// fixOverlayWindowChrome после первого Show() отрабатывал успешно, но
+	// кнопка оставалась) — похоже, таскбар кеширует факт появления окна с
+	// «обычным» стилем. Поэтому здесь окно показывается и сразу прячется
+	// один раз вхолостую ещё до первого реального показа — только чтобы
+	// форсировать создание HWND, применить стиль, и лишь после этого окно
+	// хоть раз станет видимым пользователю.
+	volumeWindow.Show()
+	fixOverlayWindowChrome(volumeWindowTitle)
+	volumeWindow.Hide()
+
 	// Стартуем скрытыми — mainWindow покажем по F5, volumeWindow по событию
 	// от volumeMonitor.
 	mainWindow.Hide()
@@ -1069,8 +1083,13 @@ func runFyne(url string, interval time.Duration) {
 }
 
 var (
-	fixOverlayChromeOnce       sync.Once
-	fixVolumeOverlayChromeOnce sync.Once
+	chromeUser32             = syscall.NewLazyDLL("user32.dll")
+	chromeFindWindowW        = chromeUser32.NewProc("FindWindowW")
+	chromeGetWindowLongPtrW  = chromeUser32.NewProc("GetWindowLongPtrW")
+	chromeSetWindowLongPtrW  = chromeUser32.NewProc("SetWindowLongPtrW")
+	chromeSetWindowPos       = chromeUser32.NewProc("SetWindowPos")
+	chromeDwmapi             = syscall.NewLazyDLL("dwmapi.dll")
+	chromeDwmSetWindowAttrib = chromeDwmapi.NewProc("DwmSetWindowAttribute")
 )
 
 // fixOverlayWindowChrome снимает нативное окно с заданным заголовком с панели
@@ -1080,63 +1099,54 @@ var (
 // остаются — попытка убрать их совсем (GWL_STYLE) приводила к тому, что GLFW
 // пересчитывал размер окна по устаревшим метрикам бывшего заголовка и
 // раздувал окно заново при каждом изменении; DWM-атрибут такой проблемы не
-// создаёт, т.к. не трогает геометрию. Fyne/GLFW создаёт нативный HWND лениво,
-// только при первом Show(), поэтому вызывать это нужно уже после него;
-// делается один раз за всё время работы процесса — но отдельно для каждого
-// окна (каждый вызывающий передаёт свой собственный *sync.Once).
-func fixOverlayWindowChrome(title string, once *sync.Once) {
-	once.Do(func() {
-		user32 := syscall.NewLazyDLL("user32.dll")
-		findWindowW := user32.NewProc("FindWindowW")
-		getWindowLongPtrW := user32.NewProc("GetWindowLongPtrW")
-		setWindowLongPtrW := user32.NewProc("SetWindowLongPtrW")
-		setWindowPos := user32.NewProc("SetWindowPos")
+// создаёт, т.к. не трогает геометрию.
+//
+// Применяется при КАЖДОМ показе окна, а не один раз за процесс: для
+// volumeWindow, которое показывается/прячется очень часто (на каждое
+// изменение громкости), один разовый фикс не держится — после очередного
+// цикла Hide()+Show() Explorer иногда всё равно возвращает кнопку в панель
+// задач. Сами вызовы дешёвые (несколько syscall), так что переприменять их
+// при каждом показе не проблема.
+func fixOverlayWindowChrome(title string) {
+	const (
+		wsExToolWindow  = 0x00000080
+		wsExAppWindow   = 0x00040000
+		swpNoMove       = 0x0002
+		swpNoSize       = 0x0001
+		swpNoZOrder     = 0x0004
+		swpNoActivate   = 0x0010
+		swpFrameChanged = 0x0020
 
-		dwmapi := syscall.NewLazyDLL("dwmapi.dll")
-		dwmSetWindowAttribute := dwmapi.NewProc("DwmSetWindowAttribute")
+		dwmwaUseImmersiveDarkMode = 20
+	)
+	// -20 переполняет uintptr как константа компиляции; через typed
+	// переменную Go делает корректное sign-extension в рантайме.
+	var gwlExStyle int32 = -20
 
-		const (
-			wsExToolWindow  = 0x00000080
-			wsExAppWindow   = 0x00040000
-			swpNoMove       = 0x0002
-			swpNoSize       = 0x0001
-			swpNoZOrder     = 0x0004
-			swpNoActivate   = 0x0010
-			swpFrameChanged = 0x0020
+	titlePtr, err := syscall.UTF16PtrFromString(title)
+	if err != nil {
+		log.Printf("overlay-chrome: не удалось подготовить заголовок: %v", err)
+		return
+	}
+	hwnd, _, _ := chromeFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+	if hwnd == 0 {
+		log.Printf("overlay-chrome: окно %q не найдено, пропускаю", title)
+		return
+	}
 
-			dwmwaUseImmersiveDarkMode = 20
-		)
-		// -20 переполняет uintptr как константа компиляции; через typed
-		// переменную Go делает корректное sign-extension в рантайме.
-		var gwlExStyle int32 = -20
+	exStyle, _, _ := chromeGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
+	newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
+	chromeSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle)
 
-		titlePtr, err := syscall.UTF16PtrFromString(title)
-		if err != nil {
-			log.Printf("overlay-chrome: не удалось подготовить заголовок: %v", err)
-			return
-		}
-		hwnd, _, _ := findWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
-		if hwnd == 0 {
-			log.Printf("overlay-chrome: окно %q не найдено, пропускаю", title)
-			return
-		}
+	// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
+	// задач без скрытия/показа окна — в отличие от ShowWindow(HIDE)+
+	// ShowWindow(SHOW), это не ломает перерисовку содержимого GLFW/Fyne.
+	chromeSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
+		uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged))
 
-		exStyle, _, _ := getWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
-		newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
-		setWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle)
-
-		// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
-		// задач без скрытия/показа окна — в отличие от ShowWindow(HIDE)+
-		// ShowWindow(SHOW), это не ломает перерисовку содержимого GLFW/Fyne.
-		setWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
-			uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged))
-
-		darkMode := int32(1)
-		ret, _, _ := dwmSetWindowAttribute.Call(hwnd, uintptr(dwmwaUseImmersiveDarkMode),
-			uintptr(unsafe.Pointer(&darkMode)), unsafe.Sizeof(darkMode))
-
-		log.Printf("overlay-chrome: кнопка в панели задач для %q скрыта, тёмный заголовок: ok=%v", title, ret == 0)
-	})
+	darkMode := int32(1)
+	chromeDwmSetWindowAttrib.Call(hwnd, uintptr(dwmwaUseImmersiveDarkMode),
+		uintptr(unsafe.Pointer(&darkMode)), unsafe.Sizeof(darkMode))
 }
 
 // toggleMPCWindow показывает окно, если оно скрыто, и прячет, если показано.
@@ -1154,7 +1164,7 @@ func toggleMPCWindow() {
 			log.Printf("F5: окно скрыто")
 		} else {
 			mainWindow.Show()
-			fixOverlayWindowChrome(windowTitle, &fixOverlayChromeOnce)
+			fixOverlayWindowChrome(windowTitle)
 			winVisible = true
 			log.Printf("F5: окно показано")
 		}
@@ -1257,7 +1267,7 @@ func showVolumeOverlay(level float64, muted bool) {
 			width, height, x, y, level*100, muted)
 
 		volumeWindow.Show()
-		fixOverlayWindowChrome(volumeWindowTitle, &fixVolumeOverlayChromeOnce)
+		fixOverlayWindowChrome(volumeWindowTitle)
 	})
 
 	volumeMu.Lock()

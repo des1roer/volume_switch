@@ -885,7 +885,8 @@ var (
 // нему:
 //   - средняя кнопка (колесо) — открывает папку с текущим файлом в проводнике;
 //   - левая кнопка по полосе прогресса — ставит воспроизведение на паузу или
-//     возобновляет его (команда 889 «Play/Pause» web-интерфейса MPC-HC).
+//     возобновляет его (команда 889 «Play/Pause» web-интерфейса MPC-HC); если
+//     web-интерфейс недоступен (MPC-HC не запущен) — запускает MPC-HC.
 //
 // Правая кнопка не перехватывается вовсе. URL variables.html передаётся в
 // конструктор, чтобы клик мог отправить команду в тот же web-интерфейс
@@ -980,12 +981,55 @@ func toggleMPCPlayback(variablesURL string) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(cmdURL)
 	if err != nil {
-		log.Printf("mpc command: не удалось отправить %s: %v", cmdURL, err)
+		log.Printf("mpc command: не удалось отправить %s: %v — запускаю MPC-HC", cmdURL, err)
+		launchMPC()
 		return
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
+}
+
+const defaultMPCExe = `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`
+
+// mpcExePath возвращает путь к MPC-HC: MPC_EXE из окружения/.env; иначе
+// defaultMPCExe, если такой файл есть; иначе путь, который MPC-HC сам пишет в
+// реестр при каждом запуске (HKCU\Software\MPC-HC\MPC-HC\ExePath).
+func mpcExePath() string {
+	if p := os.Getenv("MPC_EXE"); p != "" {
+		return p
+	}
+	if _, err := os.Stat(defaultMPCExe); err == nil {
+		return defaultMPCExe
+	}
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\MPC-HC\MPC-HC`, registry.QUERY_VALUE)
+	if err != nil {
+		return defaultMPCExe
+	}
+	defer key.Close()
+	if p, _, err := key.GetStringValue("ExePath"); err == nil && p != "" {
+		return p
+	}
+	return defaultMPCExe
+}
+
+// launchMPC запускает MPC-HC. Повторный запуск при уже открытом плеере
+// безвреден: MPC-HC по умолчанию работает в режиме одного экземпляра и просто
+// выводит своё окно на передний план.
+func launchMPC() {
+	exe := mpcExePath()
+	if exe == "" {
+		log.Printf("mpc launch: путь к MPC-HC неизвестен (задайте MPC_EXE)")
+		return
+	}
+	cmd := exec.Command(exe)
+	cmd.Dir = filepath.Dir(exe)
+	if err := cmd.Start(); err != nil {
+		log.Printf("mpc launch: не удалось запустить %s: %v", exe, err)
+		return
+	}
+	cmd.Process.Release()
+	log.Printf("mpc launch: запущен %s", exe)
 }
 
 // openContainingFolder открывает проводник с выделенным файлом (как

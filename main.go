@@ -14,6 +14,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -49,6 +50,20 @@ const (
 	defaultInterval = 500 * time.Millisecond
 	windowTitle     = "MPC-HC Progress"
 	logFileName     = "volume_switch.log"
+
+	volumeWindowTitle     = "Volume Overlay"
+	volumeOverlayDuration = 1200 * time.Millisecond
+	volumeOverlayWidth    = float32(260)
+	volumeOverlayHeight   = float32(160)
+	volumeTickCount       = 10 // ползунок размечен от 0 до 100 с шагом 10 (11 отметок)
+)
+
+var (
+	volumeFillColor  = color.NRGBA{R: 90, G: 200, B: 250, A: 255}
+	volumeMuteColor  = color.NRGBA{R: 220, G: 70, B: 70, A: 255}
+	volumeTrackColor = color.NRGBA{R: 60, G: 60, B: 66, A: 255}
+	volumeTickColor  = color.NRGBA{R: 150, G: 150, B: 150, A: 255}
+	volumeLabelColor = color.NRGBA{R: 170, G: 170, B: 170, A: 255}
 )
 
 // ---------------------------------------------------------------------------
@@ -524,6 +539,43 @@ func (s *Switcher) setDefaultLocked(id string) error {
 	return nil
 }
 
+// CurrentVolume возвращает текущий уровень громкости (0..1) и состояние mute
+// текущего default-устройства воспроизведения. Используется volumePoller
+// (см. ниже) для отслеживания изменений громкости.
+func (s *Switcher) CurrentVolume() (level float64, muted bool, err error) {
+	err = s.exec(func() error {
+		l, m, e := s.currentVolumeLocked()
+		level, muted = l, m
+		return e
+	})
+	return
+}
+
+func (s *Switcher) currentVolumeLocked() (level float64, muted bool, err error) {
+	var dev *wca.IMMDevice
+	if err = s.mmde.GetDefaultAudioEndpoint(wca.ERender, wca.EConsole, &dev); err != nil {
+		return
+	}
+	defer dev.Release()
+
+	var aev *wca.IAudioEndpointVolume
+	if err = dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+		return
+	}
+	defer aev.Release()
+
+	var scalar float32
+	if err = aev.GetMasterVolumeLevelScalar(&scalar); err != nil {
+		return
+	}
+	var isMuted bool
+	if err = aev.GetMute(&isMuted); err != nil {
+		return
+	}
+	level, muted = float64(scalar), isMuted
+	return
+}
+
 func deviceID(dev *wca.IMMDevice) (string, error) {
 	var id string
 	if err := dev.GetId(&id); err != nil {
@@ -544,6 +596,56 @@ func deviceName(dev *wca.IMMDevice) (string, error) {
 		return "", err
 	}
 	return pv.String(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Монитор глобальной громкости (поллинг через Switcher)
+//
+// Изначально громкость отслеживалась через push-уведомления WASAPI
+// (IAudioEndpointVolume::RegisterControlChangeNotify + самодельный
+// IAudioEndpointVolumeCallback, по аналогии с IMMNotificationClient из
+// github.com/diegosz/go-wca). Регистрация проходила успешно (Windows вызывал
+// AddRef на наш колбэк), но сам OnNotify ни разу не сработал — даже после
+// того как в цикл сообщений STA-потока добавили TranslateMessage/
+// DispatchMessageW. Разбираться дальше в недрах доставки COM-уведомлений для
+// конкретного драйвера/окружения оказалось не ценой задачи — вместо этого
+// громкость просто периодически опрашивается через Switcher.CurrentVolume().
+// Это не так элегантно, как push-модель, зато гарантированно работает
+// независимо от драйвера и не требует отдельного потока/COM-квартиры/
+// самодельного vtable.
+// ---------------------------------------------------------------------------
+
+const volumePollInterval = 120 * time.Millisecond
+
+// startVolumePoller периодически опрашивает switcher.CurrentVolume() и
+// вызывает onChange при изменении уровня (с точностью до процента) или
+// состояния mute. Первое измерение только запоминается как база для
+// сравнения — не вызывает onChange, чтобы оверлей не всплывал при старте
+// программы.
+func startVolumePoller(switcher *Switcher, onChange func(level float64, muted bool)) {
+	go func() {
+		ticker := time.NewTicker(volumePollInterval)
+		defer ticker.Stop()
+
+		lastPercent := -1
+		lastMuted := false
+		for range ticker.C {
+			level, muted, err := switcher.CurrentVolume()
+			if err != nil {
+				continue
+			}
+			percent := int(math.Round(level * 100))
+			if lastPercent == -1 {
+				lastPercent, lastMuted = percent, muted
+				continue
+			}
+			if percent == lastPercent && muted == lastMuted {
+				continue
+			}
+			lastPercent, lastMuted = percent, muted
+			onChange(level, muted)
+		}
+	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +851,21 @@ var (
 	// currentFilePath — полный путь к текущему файлу MPC-HC (поле filepath
 	// из variables.html), используется по клику колесом для открытия папки.
 	currentFilePath string
+
+	// volumeWindow и компоненты ниже — оверлей-ползунок уровня громкости,
+	// показывается по событиям volumeMonitor (см. showVolumeOverlay). Все
+	// позиции/размеры примитивов выставляются вручную в layoutVolumeOverlay
+	// при каждом показе (окно без автоматического layout-менеджера, т.к.
+	// размер оверлея каждый раз пересчитывается под монитор курсора).
+	volumeWindow     fyne.Window
+	volumePercent    *canvas.Text
+	volumeBarTrack   *canvas.Rectangle
+	volumeBarFill    *canvas.Rectangle
+	volumeTicks      []*canvas.Line
+	volumeTickLabels []*canvas.Text
+
+	volumeMu        sync.Mutex
+	volumeHideTimer *time.Timer
 )
 
 // clickCatcher — прозрачный виджет на весь оверлей, который ловит клик
@@ -915,15 +1032,46 @@ func runFyne(url string, interval time.Duration) {
 		}
 	}()
 
-	// Стартуем скрытым — покажем по F5.
+	// --- Оверлей уровня громкости: большой ползунок с градацией 0..100,
+	// см. volumeMonitor. Размер и позиция пересчитываются под монитор
+	// курсора при каждом показе (layoutVolumeOverlay), поэтому все примитивы
+	// собраны в контейнер без автоматического layout-менеджера.
+	volumeWindow = fyneApp.NewWindow(volumeWindowTitle)
+
+	volumePercent = canvas.NewText("", color.White)
+	volumePercent.Alignment = fyne.TextAlignCenter
+	volumePercent.TextStyle = fyne.TextStyle{Bold: true}
+
+	volumeBarTrack = canvas.NewRectangle(volumeTrackColor)
+	volumeBarFill = canvas.NewRectangle(volumeFillColor)
+
+	overlayObjects := []fyne.CanvasObject{volumeBarTrack, volumeBarFill, volumePercent}
+	volumeTicks = make([]*canvas.Line, volumeTickCount+1)
+	volumeTickLabels = make([]*canvas.Text, volumeTickCount+1)
+	for i := range volumeTicks {
+		line := canvas.NewLine(volumeTickColor)
+		label := canvas.NewText(strconv.Itoa(i*100/volumeTickCount), volumeLabelColor)
+		label.Alignment = fyne.TextAlignCenter
+		volumeTicks[i] = line
+		volumeTickLabels[i] = label
+		overlayObjects = append(overlayObjects, line, label)
+	}
+	volumeWindow.SetContent(container.NewWithoutLayout(overlayObjects...))
+
+	// Стартуем скрытыми — mainWindow покажем по F5, volumeWindow по событию
+	// от volumeMonitor.
 	mainWindow.Hide()
+	volumeWindow.Hide()
 	log.Printf("fyne: окно создано, стартует скрытым")
 
 	fyneApp.Run()
 	log.Printf("fyne: цикл приложения завершён")
 }
 
-var fixOverlayChromeOnce sync.Once
+var (
+	fixOverlayChromeOnce       sync.Once
+	fixVolumeOverlayChromeOnce sync.Once
+)
 
 // fixOverlayWindowChrome снимает нативное окно с заданным заголовком с панели
 // задач (WS_EX_TOOLWINDOW — приложение представлено только иконкой в трее) и
@@ -934,9 +1082,10 @@ var fixOverlayChromeOnce sync.Once
 // раздувал окно заново при каждом изменении; DWM-атрибут такой проблемы не
 // создаёт, т.к. не трогает геометрию. Fyne/GLFW создаёт нативный HWND лениво,
 // только при первом Show(), поэтому вызывать это нужно уже после него;
-// делается один раз за всё время работы процесса.
-func fixOverlayWindowChrome(title string) {
-	fixOverlayChromeOnce.Do(func() {
+// делается один раз за всё время работы процесса — но отдельно для каждого
+// окна (каждый вызывающий передаёт свой собственный *sync.Once).
+func fixOverlayWindowChrome(title string, once *sync.Once) {
+	once.Do(func() {
 		user32 := syscall.NewLazyDLL("user32.dll")
 		findWindowW := user32.NewProc("FindWindowW")
 		getWindowLongPtrW := user32.NewProc("GetWindowLongPtrW")
@@ -1005,11 +1154,131 @@ func toggleMPCWindow() {
 			log.Printf("F5: окно скрыто")
 		} else {
 			mainWindow.Show()
-			fixOverlayWindowChrome(windowTitle)
+			fixOverlayWindowChrome(windowTitle, &fixOverlayChromeOnce)
 			winVisible = true
 			log.Printf("F5: окно показано")
 		}
 	})
+}
+
+// layoutVolumeOverlay расставляет все примитивы ползунка (трек, заливку,
+// текст процента, отметки и подписи градации 0..100) под уже вычисленный
+// размер окна width x height. Окно создано через container.NewWithoutLayout,
+// поэтому автоматической раскладки нет — координаты считаются вручную и
+// пересчитываются при каждом показе, т.к. размер каждый раз подгоняется под
+// монитор курсора.
+func layoutVolumeOverlay(width, height float32, level float64, muted bool) {
+	pad := width * 0.06
+	barX := pad
+	barWidth := width - 2*pad
+	barHeight := height * 0.22
+	barY := height * 0.5
+	radius := barHeight / 2
+
+	volumeBarTrack.CornerRadius = radius
+	volumeBarTrack.Resize(fyne.NewSize(barWidth, barHeight))
+	volumeBarTrack.Move(fyne.NewPos(barX, barY))
+	volumeBarTrack.Refresh()
+
+	clamped := level
+	if clamped < 0 {
+		clamped = 0
+	} else if clamped > 1 {
+		clamped = 1
+	}
+	volumeBarFill.FillColor = volumeFillColor
+	if muted {
+		volumeBarFill.FillColor = volumeMuteColor
+	}
+	volumeBarFill.CornerRadius = radius
+	volumeBarFill.Resize(fyne.NewSize(barWidth*float32(clamped), barHeight))
+	volumeBarFill.Move(fyne.NewPos(barX, barY))
+	volumeBarFill.Refresh()
+
+	text := fmt.Sprintf("%d%%", int(math.Round(level*100)))
+	if muted {
+		text = "MUTE"
+	}
+	volumePercent.Text = text
+	volumePercent.TextSize = height * 0.26
+	volumePercent.Resize(fyne.NewSize(width, height*0.4))
+	volumePercent.Move(fyne.NewPos(0, height*0.05))
+	volumePercent.Refresh()
+
+	tickY := barY + barHeight + 6
+	labelSize := height * 0.06
+	const labelWidth = float32(48)
+	for i, line := range volumeTicks {
+		x := barX + barWidth*float32(i)/float32(volumeTickCount)
+		line.Position1 = fyne.NewPos(x, tickY)
+		line.Position2 = fyne.NewPos(x, tickY+10)
+		line.StrokeWidth = 2
+		line.Refresh()
+
+		label := volumeTickLabels[i]
+		label.TextSize = labelSize
+		label.Resize(fyne.NewSize(labelWidth, labelSize+4))
+		label.Move(fyne.NewPos(x-labelWidth/2, tickY+12))
+		label.Refresh()
+	}
+}
+
+// showVolumeOverlay показывает оверлей-ползунок уровня громкости (0..100,
+// с градацией через каждые 10) в четверть экрана (половина ширины и половина
+// высоты рабочей области монитора под курсором мыши), прижатый к левому
+// нижнему углу, и прячет его через volumeOverlayDuration после последнего
+// вызова. Таймер скрытия каждый раз перезапускается (debounce), чтобы при
+// быстрой серии событий — например, при удержании клавиши громкости —
+// оверлей не мигал, а гас один раз после того, как изменения прекратились.
+func showVolumeOverlay(level float64, muted bool) {
+	fyne.Do(func() {
+		if volumeWindow == nil {
+			return
+		}
+
+		width, height := volumeOverlayWidth, volumeOverlayHeight
+		x, y := 0, 0
+		if work, _ := screenLayout(); work.Right > work.Left {
+			width = float32(work.Right-work.Left) / 2
+			height = float32(work.Bottom-work.Top) / 2
+			x = int(work.Left)
+			y = int(work.Bottom) - int(height)
+			if x == 0 && y == 0 {
+				x = 1
+			}
+		}
+
+		layoutVolumeOverlay(width, height, level, muted)
+		volumeWindow.Resize(fyne.NewSize(width, height))
+		if dw, ok := volumeWindow.(desktop.Window); ok {
+			dw.RequestPosition(x, y)
+		}
+		log.Printf("volume overlay: показываю размер=%.0fx%.0f позиция=(%d,%d) level=%.0f%% muted=%v",
+			width, height, x, y, level*100, muted)
+
+		volumeWindow.Show()
+		fixOverlayWindowChrome(volumeWindowTitle, &fixVolumeOverlayChromeOnce)
+	})
+
+	volumeMu.Lock()
+	defer volumeMu.Unlock()
+	if volumeHideTimer != nil {
+		volumeHideTimer.Stop()
+	}
+	volumeHideTimer = time.AfterFunc(volumeOverlayDuration, func() {
+		fyne.Do(func() {
+			if volumeWindow != nil {
+				volumeWindow.Hide()
+			}
+		})
+	})
+}
+
+// onVolumeChanged — коллбэк volumeMonitor; вызывается с его собственного
+// потока, поэтому вся работа с UI внутри showVolumeOverlay идёт через
+// fyne.Do.
+func onVolumeChanged(level float64, muted bool) {
+	showVolumeOverlay(level, muted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1491,8 @@ func onReady() {
 	} else {
 		log.Printf("hotkey: хук установлен (F5/F7/F8)")
 	}
+
+	startVolumePoller(switcher, onVolumeChanged)
 }
 
 func onExit() {

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,6 +78,34 @@ func win32Error(name string, errno error) error {
 	return fmt.Errorf("%s: %w", name, errno)
 }
 
+// Win32-функции, которых нет готовыми в golang.org/x/sys/windows.
+var (
+	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
+	user32   = windows.NewLazySystemDLL("user32.dll")
+	shell32  = windows.NewLazySystemDLL("shell32.dll")
+
+	procAllocConsole     = kernel32.NewProc("AllocConsole")
+	procFreeConsole      = kernel32.NewProc("FreeConsole")
+	procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
+	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
+
+	procShowWindow          = user32.NewProc("ShowWindow")
+	procGetCursorPos        = user32.NewProc("GetCursorPos")
+	procMonitorFromPoint    = user32.NewProc("MonitorFromPoint")
+	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
+	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	procFindWindowW         = user32.NewProc("FindWindowW")
+	procGetWindowLongPtrW   = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtrW   = user32.NewProc("SetWindowLongPtrW")
+	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
+	procGetMessageW         = user32.NewProc("GetMessageW")
+
+	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
+)
+
 // ---------------------------------------------------------------------------
 // Логирование
 // ---------------------------------------------------------------------------
@@ -88,22 +117,15 @@ func win32Error(name string, errno error) error {
 // systray при инициализации сам вызывает ShowWindow(SW_HIDE), поэтому
 // без этого трюка в консоль ничего не видно.
 func ensureConsole() error {
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	user32 := syscall.NewLazyDLL("user32.dll")
-
-	getConsoleWindow := kernel32.NewProc("GetConsoleWindow")
-	allocConsole := kernel32.NewProc("AllocConsole")
-	showWindow := user32.NewProc("ShowWindow")
-
-	const SW_SHOW = 5
+	const swShow = 5
 
 	// GetConsoleWindow не сообщает об ошибках: 0 означает «консоли нет».
-	hwnd, _, _ := getConsoleWindow.Call()
+	hwnd, _, _ := procGetConsoleWindow.Call()
 	if hwnd == 0 {
-		if r, _, errno := allocConsole.Call(); r == 0 {
+		if r, _, errno := procAllocConsole.Call(); r == 0 {
 			return win32Error("AllocConsole", errno)
 		}
-		hwnd, _, _ = getConsoleWindow.Call()
+		hwnd, _, _ = procGetConsoleWindow.Call()
 		if hwnd == 0 {
 			return errors.New("GetConsoleWindow: консоль создана, но окна у неё нет")
 		}
@@ -121,7 +143,7 @@ func ensureConsole() error {
 		os.Stdin = in
 	}
 	// ShowWindow возвращает прежнюю видимость окна, а не признак ошибки.
-	_, _, _ = showWindow.Call(hwnd, SW_SHOW)
+	_, _, _ = procShowWindow.Call(hwnd, swShow)
 	return nil
 }
 
@@ -171,9 +193,7 @@ func setupLogging(debug bool) (closeLog func()) {
 // этот случайный флеш консоли; правильная же сборка с -H=windowsgui вообще
 // не создаёт консоль, и этот вызов там становится no-op.
 func hideConsole() error {
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	freeConsole := kernel32.NewProc("FreeConsole")
-	r, _, errno := freeConsole.Call()
+	r, _, errno := procFreeConsole.Call()
 	// Без консоли (сборка с -H=windowsgui) FreeConsole по документации
 	// завершается с ERROR_INVALID_PARAMETER — это штатный случай.
 	if r == 0 && !errors.Is(errno, windows.ERROR_INVALID_PARAMETER) {
@@ -224,14 +244,19 @@ func loadDotEnv(path string) {
 // Разбор variables.html MPC-HC
 // ---------------------------------------------------------------------------
 
+// mpcField собирает регулярку для поля <p id="...">значение</p> страницы.
+func mpcField(id string) *regexp.Regexp {
+	return regexp.MustCompile(`<p id="` + id + `">([^<]*)</p>`)
+}
+
 var (
-	rePosition    = regexp.MustCompile(`<p id="position">(-?\d+)</p>`)
-	reDuration    = regexp.MustCompile(`<p id="duration">(-?\d+)</p>`)
-	rePositionStr = regexp.MustCompile(`<p id="positionstring">([^<]*)</p>`)
-	reDurationStr = regexp.MustCompile(`<p id="durationstring">([^<]*)</p>`)
-	reStateString = regexp.MustCompile(`<p id="statestring">([^<]*)</p>`)
-	reFile        = regexp.MustCompile(`<p id="file">([^<]*)</p>`)
-	reFilePath    = regexp.MustCompile(`<p id="filepath">([^<]*)</p>`)
+	rePosition    = mpcField("position")
+	reDuration    = mpcField("duration")
+	rePositionStr = mpcField("positionstring")
+	reDurationStr = mpcField("durationstring")
+	reStateString = mpcField("statestring")
+	reFile        = mpcField("file")
+	reFilePath    = mpcField("filepath")
 )
 
 type MPCState struct {
@@ -244,14 +269,14 @@ type MPCState struct {
 	FilePath    string
 }
 
-// extractInt возвращает 0, если поля в странице нет (MPC-HC без открытого
-// файла), и ошибку, если поле есть, но число в нём не разбирается.
+// extractInt возвращает 0, если поля в странице нет или оно пустое (MPC-HC
+// без открытого файла), и ошибку, если число в поле не разбирается.
 func extractInt(html string, re *regexp.Regexp) (int64, error) {
-	m := re.FindStringSubmatch(html)
-	if len(m) < 2 {
+	s := strings.TrimSpace(extractStr(html, re))
+	if s == "" {
 		return 0, nil
 	}
-	return strconv.ParseInt(m[1], 10, 64)
+	return strconv.ParseInt(s, 10, 64)
 }
 
 func extractStr(html string, re *regexp.Regexp) string {
@@ -338,26 +363,21 @@ type winMonitorInfo struct {
 // screenLayout возвращает рабочую область (без панели задач) и полные границы
 // монитора, на котором сейчас находится курсор мыши.
 func screenLayout() (work, monitor winRect, err error) {
-	user32 := syscall.NewLazyDLL("user32.dll")
-	getCursorPos := user32.NewProc("GetCursorPos")
-	monitorFromPoint := user32.NewProc("MonitorFromPoint")
-	getMonitorInfoW := user32.NewProc("GetMonitorInfoW")
-
 	const monitorDefaultToNearest = 2
 
 	var pt winPoint
-	if r, _, errno := getCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r == 0 {
+	if r, _, errno := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r == 0 {
 		return work, monitor, win32Error("GetCursorPos", errno)
 	}
 
 	ptPacked := uintptr(uint32(pt.X)) | uintptr(uint32(pt.Y))<<32
 	// С MONITOR_DEFAULTTONEAREST MonitorFromPoint всегда возвращает монитор
 	// и ошибок не сообщает.
-	hMonitor, _, _ := monitorFromPoint.Call(ptPacked, monitorDefaultToNearest)
+	hMonitor, _, _ := procMonitorFromPoint.Call(ptPacked, monitorDefaultToNearest)
 
 	var mi winMonitorInfo
 	mi.CbSize = uint32(unsafe.Sizeof(mi))
-	if r, _, errno := getMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi))); r == 0 {
+	if r, _, errno := procGetMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi))); r == 0 {
 		return work, monitor, win32Error("GetMonitorInfoW", errno)
 	}
 
@@ -366,9 +386,6 @@ func screenLayout() (work, monitor winRect, err error) {
 
 // titleBarHeight возвращает высоту заголовка окна Windows (вместе с рамкой).
 func titleBarHeight() int32 {
-	user32 := syscall.NewLazyDLL("user32.dll")
-	getSystemMetrics := user32.NewProc("GetSystemMetrics")
-
 	const (
 		smCyCaption      = 4
 		smCySizeFrame    = 33
@@ -377,11 +394,12 @@ func titleBarHeight() int32 {
 
 	// GetSystemMetrics не сообщает об ошибках (GetLastError не выставляет),
 	// при неудаче возвращает 0 — это даёт лишь чуть меньший отступ.
-	cyCaption, _, _ := getSystemMetrics.Call(smCyCaption)
-	cySizeFrame, _, _ := getSystemMetrics.Call(smCySizeFrame)
-	cxPaddedBorder, _, _ := getSystemMetrics.Call(smCxPaddedBorder)
-
-	return int32(cyCaption) + int32(cySizeFrame) + int32(cxPaddedBorder)
+	var total int32
+	for _, metric := range []uintptr{smCyCaption, smCySizeFrame, smCxPaddedBorder} {
+		v, _, _ := procGetSystemMetrics.Call(metric)
+		total += int32(v)
+	}
+	return total
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +494,17 @@ func (s *Switcher) exec(f func() error) error {
 	return <-done
 }
 
+// execValue is exec for operations that return a value.
+func execValue[T any](s *Switcher, f func() (T, error)) (T, error) {
+	var v T
+	err := s.exec(func() error {
+		var err error
+		v, err = f()
+		return err
+	})
+	return v, err
+}
+
 // Close stops the worker goroutine and releases every COM object.
 func (s *Switcher) Close() {
 	close(s.quit)
@@ -483,25 +512,13 @@ func (s *Switcher) Close() {
 
 // ListActiveDevices returns every active playback endpoint.
 func (s *Switcher) ListActiveDevices() ([]Device, error) {
-	var devices []Device
-	err := s.exec(func() error {
-		var err error
-		devices, err = s.listActiveDevicesLocked()
-		return err
-	})
-	return devices, err
+	return execValue(s, s.listActiveDevicesLocked)
 }
 
 // DefaultDeviceID returns the ID of the current default playback endpoint
 // (console role).
 func (s *Switcher) DefaultDeviceID() (string, error) {
-	var id string
-	err := s.exec(func() error {
-		var err error
-		id, err = s.defaultDeviceIDLocked()
-		return err
-	})
-	return id, err
+	return execValue(s, s.defaultDeviceIDLocked)
 }
 
 // SetDefault makes the device with the given ID the default endpoint for
@@ -519,37 +536,26 @@ func (s *Switcher) SetDefault(id string) error {
 // operation on the worker goroutine so it cannot race with a concurrent
 // menu click or hotkey press.
 func (s *Switcher) Cycle(direction int) (Device, error) {
-	var result Device
-	err := s.exec(func() error {
+	return execValue(s, func() (Device, error) {
 		devices, err := s.listActiveDevicesLocked()
 		if err != nil {
-			return err
+			return Device{}, err
 		}
 		if len(devices) == 0 {
-			return errors.New("no active playback devices")
+			return Device{}, errors.New("no active playback devices")
 		}
 
 		currentID, err := s.defaultDeviceIDLocked()
 		if err != nil {
-			return err
+			return Device{}, err
 		}
 
-		idx := 0
-		for i, d := range devices {
-			if d.ID == currentID {
-				idx = i
-				break
-			}
-		}
-
-		next := ((idx+direction)%len(devices) + len(devices)) % len(devices)
-		if err := s.setDefaultLocked(devices[next].ID); err != nil {
-			return err
-		}
-		result = devices[next]
-		return nil
+		// Если текущего устройства нет в списке (IndexFunc вернул -1),
+		// отсчёт идёт от первого.
+		idx := max(slices.IndexFunc(devices, func(d Device) bool { return d.ID == currentID }), 0)
+		next := devices[((idx+direction)%len(devices)+len(devices))%len(devices)]
+		return next, s.setDefaultLocked(next.ID)
 	})
-	return result, err
 }
 
 // --- internal helpers; must only be called from the worker goroutine ---
@@ -594,12 +600,7 @@ func (s *Switcher) defaultDeviceIDLocked() (string, error) {
 		return "", err
 	}
 	defer dev.Release()
-
-	var id string
-	if err := dev.GetId(&id); err != nil {
-		return "", err
-	}
-	return id, nil
+	return deviceID(dev)
 }
 
 func (s *Switcher) setDefaultLocked(id string) error {
@@ -778,16 +779,6 @@ type notifyIconDataW struct {
 	hBalloonIcon      windows.Handle
 }
 
-var (
-	user32N  = windows.NewLazySystemDLL("user32.dll")
-	shell32N = windows.NewLazySystemDLL("shell32.dll")
-
-	procEnumWindows              = user32N.NewProc("EnumWindows")
-	procGetClassNameW            = user32N.NewProc("GetClassNameW")
-	procGetWindowThreadProcessId = user32N.NewProc("GetWindowThreadProcessId")
-	procShellNotifyIconW         = shell32N.NewProc("Shell_NotifyIconW")
-)
-
 // showNotification displays a balloon notification with the given title and
 // body. It is a no-op if this process's tray window cannot be found (e.g.
 // called before systray finished initializing, or after a dependency
@@ -817,19 +808,14 @@ func showNotification(title, body string) {
 	}
 }
 
+// copyUTF16 копирует s в нулевой буфер dst, при необходимости обрезая;
+// последний элемент dst не трогается и остаётся завершающим нулём.
 func copyUTF16(dst []uint16, s string) {
 	src, err := windows.UTF16FromString(s)
 	if err != nil {
 		return
 	}
-	n := len(src)
-	if n > len(dst) {
-		n = len(dst)
-	}
-	copy(dst, src[:n])
-	if n == len(dst) {
-		dst[n-1] = 0
-	}
+	copy(dst[:len(dst)-1], src)
 }
 
 // findOwnTrayWindow enumerates top-level windows looking for the hidden
@@ -841,31 +827,28 @@ func findOwnTrayWindow() (windows.Handle, error) {
 	pid := windows.GetCurrentProcessId()
 	var found windows.Handle
 
-	cb := windows.NewCallback(func(hwnd windows.Handle, _ uintptr) uintptr {
+	cb := windows.NewCallback(func(hwnd windows.HWND, _ uintptr) uintptr {
 		var winPid uint32
-		if tid, _, _ := procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&winPid))); tid == 0 {
-			return 1 // окно уже недействительно — пропускаем
-		}
-		if winPid != pid {
-			return 1 // continue enumeration
+		if _, err := windows.GetWindowThreadProcessId(hwnd, &winPid); err != nil || winPid != pid {
+			return 1 // окно чужое или уже недействительно — продолжаем перебор
 		}
 
 		var cls [64]uint16
-		n, _, _ := procGetClassNameW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&cls[0])), uintptr(len(cls)))
-		if n == 0 {
+		n, err := windows.GetClassName(hwnd, &cls[0], int32(len(cls)))
+		if err != nil {
 			return 1 // имя класса не получено — пропускаем
 		}
 		if windows.UTF16ToString(cls[:n]) == systrayClassName {
-			found = hwnd
+			found = windows.Handle(hwnd)
 			return 0 // stop enumeration
 		}
 		return 1
 	})
 
-	// EnumWindows возвращает 0 и тогда, когда перебор остановил сам колбэк
-	// (окно найдено), поэтому ошибкой это считается только без находки.
-	if r, _, errno := procEnumWindows.Call(cb, 0); r == 0 && found == 0 {
-		return 0, win32Error("EnumWindows", errno)
+	// EnumWindows сообщает об ошибке и тогда, когда перебор остановил сам
+	// колбэк (окно найдено), поэтому ошибкой это считается только без находки.
+	if err := windows.EnumWindows(cb, nil); err != nil && found == 0 {
+		return 0, fmt.Errorf("EnumWindows: %w", err)
 	}
 	return found, nil
 }
@@ -936,7 +919,8 @@ var (
 	fyneApp    fyne.App
 	mainWindow fyne.Window
 
-	winMu      sync.Mutex
+	// winVisible читается и меняется только внутри fyne.Do, т.е. всегда в
+	// одном UI-потоке, поэтому мьютекс не нужен.
 	winVisible bool
 
 	elapsedLabel   *widget.Label
@@ -1009,10 +993,6 @@ func (c *clickCatcher) MouseUp(ev *desktop.MouseEvent) {
 		// HTTP-клиент ждёт до своего таймаута, и держать на этом событийный
 		// цикл Fyne нельзя.
 		go toggleMPCPlayback(c.mpcURL)
-	case desktop.MouseButtonSecondary:
-		// Правый клик оверлей не обрабатывает.
-	default:
-		// nothing
 	}
 }
 
@@ -1106,24 +1086,26 @@ func mpcExePath() string {
 	if !errors.Is(err, os.ErrNotExist) {
 		log.Printf("mpc launch: проверка %s: %v", defaultMPCExe, err)
 	}
+	if p := mpcExeFromRegistry(); p != "" {
+		return p
+	}
+	return defaultMPCExe
+}
 
+// mpcExeFromRegistry читает HKCU\Software\MPC-HC\MPC-HC\ExePath; "" — если
+// значения нет или его не удалось прочитать.
+func mpcExeFromRegistry() string {
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\MPC-HC\MPC-HC`, registry.QUERY_VALUE)
 	if err != nil {
 		if !errors.Is(err, registry.ErrNotExist) {
 			log.Printf("mpc launch: открытие ключа реестра MPC-HC: %v", err)
 		}
-		return defaultMPCExe
+		return ""
 	}
 	defer logRegistryClose(key, "MPC-HC")
 	p, _, err := key.GetStringValue("ExePath")
-	if err != nil {
-		if !errors.Is(err, registry.ErrNotExist) {
-			log.Printf("mpc launch: чтение ExePath из реестра: %v", err)
-		}
-		return defaultMPCExe
-	}
-	if p == "" {
-		return defaultMPCExe
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		log.Printf("mpc launch: чтение ExePath из реестра: %v", err)
 	}
 	return p
 }
@@ -1133,10 +1115,6 @@ func mpcExePath() string {
 // выводит своё окно на передний план.
 func launchMPC() {
 	exe := mpcExePath()
-	if exe == "" {
-		log.Printf("mpc launch: путь к MPC-HC неизвестен (задайте MPC_EXE)")
-		return
-	}
 	cmd := exec.Command(exe)
 	cmd.Dir = filepath.Dir(exe)
 	if err := cmd.Start(); err != nil {
@@ -1205,13 +1183,7 @@ func runFyne(url string, interval time.Duration) {
 	log.Printf("fyne: окно %0.fx%0.f @ (%d,%d)", windowWidth, windowHeight, posX, posY)
 
 	mainWindow.Resize(fyne.NewSize(windowWidth, windowHeight))
-	if dw, ok := mainWindow.(desktop.Window); ok {
-		// Fyne игнорирует RequestPosition(0, 0), считая это «позиция не задана».
-		if posX == 0 && posY == 0 {
-			posX = 1
-		}
-		dw.RequestPosition(posX, posY)
-	}
+	requestPosition(mainWindow, posX, posY)
 
 	// --- Виджеты ---
 	// Имя файла и статус выводятся прямо на полосе прогресса (через
@@ -1231,62 +1203,7 @@ func runFyne(url string, interval time.Duration) {
 	body := container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow)
 	mainWindow.SetContent(container.NewStack(body, newClickCatcher(url)))
 
-	// --- Цикл опроса MPC-HC в отдельной горутине ---
-	client := &http.Client{Timeout: 2 * time.Second}
-	go func() {
-		log.Printf("mpc poll: старт цикла (interval=%s)", interval)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		var lastErr string
-		for range ticker.C {
-			st, err := fetchState(url, client)
-			if err != nil {
-				if err.Error() != lastErr {
-					log.Printf("mpc poll: ошибка: %v", err)
-					lastErr = err.Error()
-				}
-				fyne.Do(func() {
-					progressText = "⚠ Нет связи с MPC-HC: " + err.Error()
-					progressBar.Refresh()
-				})
-				continue
-			}
-			if lastErr != "" {
-				log.Printf("mpc poll: связь восстановлена")
-				lastErr = ""
-			}
-			stCopy := st
-			fyne.Do(func() {
-				currentFilePath = stCopy.FilePath
-				if stCopy.Duration <= 0 {
-					progressText = "Нет активного воспроизведения"
-					progressBar.SetValue(0)
-					elapsedLabel.SetText("00:00")
-					remainingLabel.SetText("00:00")
-					return
-				}
-				progress := float64(stCopy.Position) / float64(stCopy.Duration)
-				if progress < 0 {
-					progress = 0
-				}
-				if progress > 1 {
-					progress = 1
-				}
-
-				elapsed := stCopy.PositionStr
-				if elapsed == "" {
-					elapsed = formatTime(stCopy.Position)
-				}
-				remaining := formatTime(stCopy.Duration - stCopy.Position)
-
-				elapsedLabel.SetText(elapsed)
-				remainingLabel.SetText("-" + remaining)
-				progressText = fmt.Sprintf("%s   —   %.1f%%  %s  (из %s)",
-					stCopy.File, progress*100, stCopy.StateString, formatTime(stCopy.Duration))
-				progressBar.SetValue(progress)
-			})
-		}
-	}()
+	go pollMPC(url, interval)
 
 	// --- Оверлей уровня громкости: большой ползунок с градацией 0..100,
 	// см. volumeMonitor. Размер и позиция пересчитываются под монитор
@@ -1325,39 +1242,93 @@ func runFyne(url string, interval time.Duration) {
 	// форсировать создание HWND, применить стиль, и лишь после этого окно
 	// хоть раз станет видимым пользователю. Касается обоих окон: mainWindow
 	// без этого оставалось в панели задач после первого показа по F5.
-	for _, w := range []struct {
-		win   fyne.Window
-		title string
-	}{
-		{mainWindow, windowTitle},
-		{volumeWindow, volumeWindowTitle},
-	} {
-		w.win.Show()
-		if err := fixOverlayWindowChrome(w.title); err != nil {
-			log.Printf("overlay-chrome: %v", err)
-		}
-		w.win.Hide()
+	//
+	// После этого оба окна стартуют скрытыми: mainWindow покажем по F5,
+	// volumeWindow — по событию от volume poller.
+	for _, w := range []fyne.Window{mainWindow, volumeWindow} {
+		showOverlay(w)
+		w.Hide()
 	}
-
-	// Стартуем скрытыми — mainWindow покажем по F5, volumeWindow по событию
-	// от volumeMonitor.
-	mainWindow.Hide()
-	volumeWindow.Hide()
 	log.Printf("fyne: окно создано, стартует скрытым")
 
 	fyneApp.Run()
 	log.Printf("fyne: цикл приложения завершён")
 }
 
-var (
-	chromeUser32             = syscall.NewLazyDLL("user32.dll")
-	chromeFindWindowW        = chromeUser32.NewProc("FindWindowW")
-	chromeGetWindowLongPtrW  = chromeUser32.NewProc("GetWindowLongPtrW")
-	chromeSetWindowLongPtrW  = chromeUser32.NewProc("SetWindowLongPtrW")
-	chromeSetWindowPos       = chromeUser32.NewProc("SetWindowPos")
-	chromeDwmapi             = syscall.NewLazyDLL("dwmapi.dll")
-	chromeDwmSetWindowAttrib = chromeDwmapi.NewProc("DwmSetWindowAttribute")
-)
+// pollMPC раз в interval опрашивает web-интерфейс MPC-HC и обновляет
+// оверлей прогресса. Работает до завершения процесса.
+func pollMPC(url string, interval time.Duration) {
+	log.Printf("mpc poll: старт цикла (interval=%s)", interval)
+	client := &http.Client{Timeout: 2 * time.Second}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var lastErr string
+	for range ticker.C {
+		st, err := fetchState(url, client)
+		if err != nil {
+			if err.Error() != lastErr {
+				log.Printf("mpc poll: ошибка: %v", err)
+				lastErr = err.Error()
+			}
+			fyne.Do(func() {
+				progressText = "⚠ Нет связи с MPC-HC: " + err.Error()
+				progressBar.Refresh()
+			})
+			continue
+		}
+		if lastErr != "" {
+			log.Printf("mpc poll: связь восстановлена")
+			lastErr = ""
+		}
+		fyne.Do(func() { showProgress(st) })
+	}
+}
+
+// showProgress выводит состояние MPC-HC на оверлей. Вызывается только из
+// UI-потока (через fyne.Do).
+func showProgress(st *MPCState) {
+	currentFilePath = st.FilePath
+	if st.Duration <= 0 {
+		progressText = "Нет активного воспроизведения"
+		progressBar.SetValue(0)
+		elapsedLabel.SetText("00:00")
+		remainingLabel.SetText("00:00")
+		return
+	}
+	progress := min(max(float64(st.Position)/float64(st.Duration), 0), 1)
+
+	elapsed := st.PositionStr
+	if elapsed == "" {
+		elapsed = formatTime(st.Position)
+	}
+	elapsedLabel.SetText(elapsed)
+	remainingLabel.SetText("-" + formatTime(st.Duration-st.Position))
+	progressText = fmt.Sprintf("%s   —   %.1f%%  %s  (из %s)",
+		st.File, progress*100, st.StateString, formatTime(st.Duration))
+	progressBar.SetValue(progress)
+}
+
+// requestPosition ставит окно в точку (x, y) экрана.
+func requestPosition(w fyne.Window, x, y int) {
+	dw, ok := w.(desktop.Window)
+	if !ok {
+		return
+	}
+	// Fyne игнорирует RequestPosition(0, 0), считая это «позиция не задана».
+	if x == 0 && y == 0 {
+		x = 1
+	}
+	dw.RequestPosition(x, y)
+}
+
+// showOverlay показывает окно и сразу снимает его с панели задач (см.
+// fixOverlayWindowChrome).
+func showOverlay(w fyne.Window) {
+	w.Show()
+	if err := fixOverlayWindowChrome(w.Title()); err != nil {
+		log.Printf("overlay-chrome: %v", err)
+	}
+}
 
 // fixOverlayWindowChrome снимает нативное окно с заданным заголовком с панели
 // задач (WS_EX_TOOLWINDOW — приложение представлено только иконкой в трее) и
@@ -1394,34 +1365,34 @@ func fixOverlayWindowChrome(title string) error {
 	if err != nil {
 		return fmt.Errorf("заголовок %q: %w", title, err)
 	}
-	hwnd, _, errno := chromeFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+	hwnd, _, errno := procFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
 	if hwnd == 0 {
 		return fmt.Errorf("окно %q: %w", title, win32Error("FindWindowW", errno))
 	}
 
 	// У окна GLFW расширенный стиль никогда не нулевой, поэтому 0 от
 	// Get/SetWindowLongPtrW здесь однозначно означает ошибку.
-	exStyle, _, errno := chromeGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
+	exStyle, _, errno := procGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
 	if exStyle == 0 {
 		return win32Error("GetWindowLongPtrW", errno)
 	}
 	newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
-	if prev, _, errno := chromeSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle); prev == 0 {
+	if prev, _, errno := procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle); prev == 0 {
 		return win32Error("SetWindowLongPtrW", errno)
 	}
 
 	// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
 	// задач без скрытия/показа окна — в отличие от ShowWindow(HIDE)+
 	// ShowWindow(SHOW), это не ломает перерисовку содержимого GLFW/Fyne.
-	if r, _, errno := chromeSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
+	if r, _, errno := procSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
 		uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged)); r == 0 {
 		return win32Error("SetWindowPos", errno)
 	}
 
 	darkMode := int32(1)
-	if hr, _, _ := chromeDwmSetWindowAttrib.Call(hwnd, uintptr(dwmwaUseImmersiveDarkMode),
-		uintptr(unsafe.Pointer(&darkMode)), unsafe.Sizeof(darkMode)); hr != 0 {
-		return fmt.Errorf("DwmSetWindowAttribute: HRESULT 0x%08X", uint32(hr))
+	if err := windows.DwmSetWindowAttribute(windows.HWND(hwnd), dwmwaUseImmersiveDarkMode,
+		unsafe.Pointer(&darkMode), uint32(unsafe.Sizeof(darkMode))); err != nil {
+		return fmt.Errorf("DwmSetWindowAttribute: %w", err)
 	}
 	return nil
 }
@@ -1433,20 +1404,14 @@ func toggleMPCWindow() {
 			log.Printf("F5: окно ещё не создано")
 			return
 		}
-		winMu.Lock()
-		defer winMu.Unlock()
 		if winVisible {
 			mainWindow.Hide()
-			winVisible = false
 			log.Printf("F5: окно скрыто")
 		} else {
-			mainWindow.Show()
-			if err := fixOverlayWindowChrome(windowTitle); err != nil {
-				log.Printf("overlay-chrome: %v", err)
-			}
-			winVisible = true
+			showOverlay(mainWindow)
 			log.Printf("F5: окно показано")
 		}
+		winVisible = !winVisible
 	})
 }
 
@@ -1469,12 +1434,7 @@ func layoutVolumeOverlay(width, height float32, level float64, muted bool) {
 	volumeBarTrack.Move(fyne.NewPos(barX, barY))
 	volumeBarTrack.Refresh()
 
-	clamped := level
-	if clamped < 0 {
-		clamped = 0
-	} else if clamped > 1 {
-		clamped = 1
-	}
+	clamped := min(max(level, 0), 1)
 	volumeBarFill.FillColor = volumeFillColor
 	if muted {
 		volumeBarFill.FillColor = volumeMuteColor
@@ -1534,23 +1494,15 @@ func showVolumeOverlay(level float64, muted bool) {
 			height = float32(work.Bottom-work.Top) / 2
 			x = int(work.Left)
 			y = int(work.Bottom) - int(height)
-			if x == 0 && y == 0 {
-				x = 1
-			}
 		}
 
 		layoutVolumeOverlay(width, height, level, muted)
 		volumeWindow.Resize(fyne.NewSize(width, height))
-		if dw, ok := volumeWindow.(desktop.Window); ok {
-			dw.RequestPosition(x, y)
-		}
+		requestPosition(volumeWindow, x, y)
 		log.Printf("volume overlay: показываю размер=%.0fx%.0f позиция=(%d,%d) level=%.0f%% muted=%v",
 			width, height, x, y, level*100, muted)
 
-		volumeWindow.Show()
-		if err := fixOverlayWindowChrome(volumeWindowTitle); err != nil {
-			log.Printf("overlay-chrome: %v", err)
-		}
+		showOverlay(volumeWindow)
 	})
 
 	volumeMu.Lock()
@@ -1565,13 +1517,6 @@ func showVolumeOverlay(level float64, muted bool) {
 			}
 		})
 	})
-}
-
-// onVolumeChanged — коллбэк volumeMonitor; вызывается с его собственного
-// потока, поэтому вся работа с UI внутри showVolumeOverlay идёт через
-// fyne.Do.
-func onVolumeChanged(level float64, muted bool) {
-	showVolumeOverlay(level, muted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,7 +1796,9 @@ func onReady() {
 		log.Printf("hotkey: хук установлен (F5/F7/F8)")
 	}
 
-	startVolumePoller(switcher, onVolumeChanged)
+	// Колбэк вызывается из горутины поллера; вся работа с UI внутри
+	// showVolumeOverlay идёт через fyne.Do.
+	startVolumePoller(switcher, showVolumeOverlay)
 }
 
 func onExit() {
@@ -1886,11 +1833,10 @@ func buildDeviceMenu(devices []Device, currentID string) {
 		menuItems[i] = item
 		deviceByID[dev.ID] = i
 
-		idx := i
 		go func() {
 			for range item.ClickedCh {
-				log.Printf("tray: выбран %q", devices[idx].Name)
-				selectDevice(devices[idx])
+				log.Printf("tray: выбран %q", dev.Name)
+				selectDevice(dev)
 			}
 		}()
 	}
@@ -1969,18 +1915,6 @@ type hotkeyListener struct {
 }
 
 var (
-	user32HK   = syscall.NewLazyDLL("user32.dll")
-	kernel32HK = syscall.NewLazyDLL("kernel32.dll")
-
-	pSetWindowsHookEx    = user32HK.NewProc("SetWindowsHookExW")
-	pUnhookWindowsHookEx = user32HK.NewProc("UnhookWindowsHookEx")
-	pCallNextHookEx      = user32HK.NewProc("CallNextHookEx")
-	pGetMessageW         = user32HK.NewProc("GetMessageW")
-
-	pGetModuleHandleW = kernel32HK.NewProc("GetModuleHandleW")
-)
-
-var (
 	activeHKMu sync.Mutex
 	activeHK   *hotkeyListener
 )
@@ -1995,7 +1929,7 @@ func (l *hotkeyListener) Start() error {
 	activeHK = l
 	activeHKMu.Unlock()
 
-	hInst, _, errno := pGetModuleHandleW.Call(0)
+	hInst, _, errno := procGetModuleHandleW.Call(0)
 	if hInst == 0 {
 		l.clearActive()
 		return win32Error("GetModuleHandleW", errno)
@@ -2008,12 +1942,7 @@ func (l *hotkeyListener) Start() error {
 
 		cb := syscall.NewCallback(hookProc)
 
-		hook, _, errno := pSetWindowsHookEx.Call(
-			uintptr(whKeyboardLL),
-			cb,
-			hInst,
-			0,
-		)
+		hook, _, errno := procSetWindowsHookExW.Call(whKeyboardLL, cb, hInst, 0)
 		if hook == 0 {
 			l.clearActive()
 			ready <- win32Error("SetWindowsHookExW", errno)
@@ -2029,10 +1958,7 @@ func (l *hotkeyListener) Start() error {
 
 		var msg [48]byte
 		for {
-			ret, _, errno := pGetMessageW.Call(
-				uintptr(unsafe.Pointer(&msg[0])),
-				0, 0, 0,
-			)
+			ret, _, errno := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0)
 			switch ret {
 			case 0:
 				log.Printf("hotkey: цикл сообщений завершён (WM_QUIT)")
@@ -2057,7 +1983,7 @@ func (l *hotkeyListener) Stop() error {
 	l.clearActive()
 
 	if hook != 0 {
-		if r, _, errno := pUnhookWindowsHookEx.Call(hook); r == 0 {
+		if r, _, errno := procUnhookWindowsHookEx.Call(hook); r == 0 {
 			return win32Error("UnhookWindowsHookEx", errno)
 		}
 	}
@@ -2079,42 +2005,32 @@ func (l *hotkeyListener) clearActive() {
 // CallNextHookEx возвращает результат следующего хука в цепочке, а не
 // признак ошибки, поэтому третье значение Call здесь не нужно.
 func hookProc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
-	if nCode < 0 {
-		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
-		return r
+	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
+		if handler := activeHotkeyHandler(kb.VkCode); handler != nil {
+			go handler()
+			return 1 // клавиша обработана — дальше по цепочке хуков её не пускаем
+		}
 	}
-	if wParam != wmKeyDown && wParam != wmSysKeyDown {
-		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
-		return r
-	}
+	r, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
+	return r
+}
 
+// activeHotkeyHandler возвращает обработчик клавиши vk у активного
+// слушателя или nil, если слушателя нет или клавиша не наша.
+func activeHotkeyHandler(vk uint32) func() {
 	activeHKMu.Lock()
 	l := activeHK
 	activeHKMu.Unlock()
-
 	if l == nil {
-		r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
-		return r
+		return nil
 	}
-
-	switch kb.VkCode {
+	switch vk {
 	case vkF5:
-		if l.OnF5 != nil {
-			go l.OnF5()
-		}
-		return 1
+		return l.OnF5
 	case vkF7:
-		if l.OnF7 != nil {
-			go l.OnF7()
-		}
-		return 1
+		return l.OnF7
 	case vkF8:
-		if l.OnF8 != nil {
-			go l.OnF8()
-		}
-		return 1
+		return l.OnF8
 	}
-
-	r, _, _ := pCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
-	return r
+	return nil
 }

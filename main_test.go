@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image/png"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -362,14 +363,17 @@ func TestMPCExePathFromEnv(t *testing.T) {
 
 func TestHookProc(t *testing.T) {
 	called := make(chan uint32, 1)
-	prev := hotkeys
-	hotkeys = map[uint32]func(){
+	setVar(t, &hotkeys, map[uint32]func(){
+		vkF4: func() { called <- vkF4 },
 		vkF5: func() { called <- vkF5 },
 		vkF8: func() { called <- vkF8 },
-	}
-	t.Cleanup(func() { hotkeys = prev })
+	})
+	// Настоящее состояние клавиатуры в тесте не задать: зажатые клавиши
+	// подменяются набором held.
+	held := map[uintptr]bool{}
+	setVar(t, &keyHeld, func(vk uintptr) bool { return held[vk] })
 
-	for _, vk := range []uint32{vkF5, vkF8} {
+	for _, vk := range []uint32{vkF4, vkF5, vkF8} {
 		if r := hookProc(0, wmKeyDown, &kbdllHookStruct{VkCode: vk}); r != 1 {
 			t.Errorf("vk=%#x: hookProc = %d, want 1 (клавиша съедена)", vk, r)
 		}
@@ -383,20 +387,30 @@ func TestHookProc(t *testing.T) {
 		}
 	}
 
-	// Чужая клавиша, отпускание нашей клавиши и nCode < 0 уходят дальше по
-	// цепочке хуков (CallNextHookEx без хуков возвращает 0) и обработчики не
-	// вызывают.
+	// Чужая клавиша, отпускание нашей клавиши, nCode < 0 и наши клавиши с
+	// модификаторами (Alt+F4 должен закрывать окно!) уходят дальше по цепочке
+	// хуков (CallNextHookEx без хуков возвращает 0) и обработчики не вызывают.
 	for _, tc := range []struct {
 		name   string
 		nCode  int
 		wParam uintptr
 		vk     uint32
+		flags  uint32
+		held   uintptr
 	}{
-		{"чужая клавиша", 0, wmKeyDown, 0x41},
-		{"отпускание F5", 0, 0x0101, vkF5}, // WM_KEYUP
-		{"nCode < 0", -1, wmKeyDown, vkF5},
+		{name: "чужая клавиша", wParam: wmKeyDown, vk: 0x41},
+		{name: "отпускание F5", wParam: 0x0101, vk: vkF5}, // WM_KEYUP
+		{name: "nCode < 0", nCode: -1, wParam: wmKeyDown, vk: vkF5},
+		{name: "Alt+F4", wParam: wmSysKeyDown, vk: vkF4, flags: llkhfAltDown},
+		{name: "Ctrl+F4", wParam: wmKeyDown, vk: vkF4, held: vkControl},
+		{name: "Shift+F5", wParam: wmKeyDown, vk: vkF5, held: vkShift},
+		{name: "Win+F8", wParam: wmKeyDown, vk: vkF8, held: vkRWin},
 	} {
-		if r := hookProc(tc.nCode, tc.wParam, &kbdllHookStruct{VkCode: tc.vk}); r != 0 {
+		clear(held)
+		if tc.held != 0 {
+			held[tc.held] = true
+		}
+		if r := hookProc(tc.nCode, tc.wParam, &kbdllHookStruct{VkCode: tc.vk, Flags: tc.flags}); r != 0 {
 			t.Errorf("%s: hookProc = %d, want 0", tc.name, r)
 		}
 	}
@@ -1235,6 +1249,59 @@ func TestSwitcher(t *testing.T) {
 	if err != nil || dev.ID != current {
 		t.Errorf("Cycle(0) = %+v, %v; want текущее устройство %q", dev, err, current)
 	}
+
+	// StepVolume(0) округляет уровень до целого процента (сдвиг меньше 0.5%,
+	// на слух незаметен) и снимает mute; точный исходный уровень сразу
+	// возвращается. Снятие mute было бы слышно — при выключенном звуке
+	// пропускаем.
+	if vol.Muted {
+		t.Skip("звук выключен — StepVolume не проверяю")
+	}
+	var original float32
+	if err := s.exec(func() error {
+		_, aev, err := s.endpointVolumeLocked()
+		if err != nil {
+			return err
+		}
+		defer aev.Release()
+		return aev.GetMasterVolumeLevelScalar(&original)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// defer, а не t.Cleanup: Cleanup выполнился бы уже после s.Close(), и
+	// exec на закрытом Switcher завис бы.
+	defer func() {
+		if err := s.exec(func() error {
+			_, aev, err := s.endpointVolumeLocked()
+			if err != nil {
+				return err
+			}
+			defer aev.Release()
+			if err := aev.SetMasterVolumeLevelScalar(original, nil); err != nil {
+				return err
+			}
+			var restored float32
+			if err := aev.GetMasterVolumeLevelScalar(&restored); err != nil {
+				return err
+			}
+			if restored != original {
+				return fmt.Errorf("уровень %v после восстановления", restored)
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("не удалось вернуть громкость %v: %v", original, err)
+		}
+	}()
+
+	if err := s.StepVolume(0); err != nil {
+		t.Fatalf("StepVolume(0): %v", err)
+	}
+	// Устройство может округлять уровень до своих аппаратных шагов (у
+	// некоторых — 1/512), поэтому сравнение с точностью до процента.
+	after, err := s.CurrentVolume()
+	if want := stepLevel(float64(original), 0); err != nil || math.Abs(after.Level-want) >= 0.01 || after.Muted {
+		t.Errorf("после StepVolume(0): %+v, %v; want уровень %v без mute", after, err, want)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,10 +1381,17 @@ type fakeSwitcher struct {
 	setErr   error
 	cycleDev Device
 	cycleErr error
+	stepErr  error
 
 	setIDs []string
 	cycles []int
+	steps  []float64
 	closed bool
+}
+
+func (s *fakeSwitcher) StepVolume(delta float64) error {
+	s.steps = append(s.steps, delta)
+	return s.stepErr
 }
 
 func (s *fakeSwitcher) SetDefault(id string) error {
@@ -1510,5 +1584,52 @@ func TestToggleMPCPlaybackTruncatedBody(t *testing.T) {
 	toggleMPCPlayback(srv.URL + "/variables.html") // ошибка чтения только в лог
 	if len(*started) != 0 {
 		t.Error("ответ получен — MPC-HC запускать не нужно")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Громкость по F3/F4
+// ---------------------------------------------------------------------------
+
+func TestStepLevel(t *testing.T) {
+	tests := []struct {
+		level, delta, want float64
+	}{
+		{0.50, +volumeKeyStep, 0.52},
+		{0.50, -volumeKeyStep, 0.48},
+		{0.37, +volumeKeyStep, 0.39},
+		{0.99, +volumeKeyStep, 1}, // не выше 100%
+		{0.01, -volumeKeyStep, 0}, // не ниже 0
+		{1, +volumeKeyStep, 1},
+		{0, -volumeKeyStep, 0},
+		{float64(float32(0.3)), +volumeKeyStep, 0.32}, // погрешность float32 не копится
+	}
+	for _, tt := range tests {
+		if got := stepLevel(tt.level, tt.delta); got != tt.want {
+			t.Errorf("stepLevel(%v, %+v) = %v, want %v", tt.level, tt.delta, got, tt.want)
+		}
+	}
+}
+
+func TestOnVolumeKey(t *testing.T) {
+	sw := &fakeSwitcher{}
+	setVar(t, &switcher, deviceSwitcher(sw))
+
+	onVolumeKey(-volumeKeyStep)
+	onVolumeKey(volumeKeyStep)
+	if fmt.Sprint(sw.steps) != "[-0.02 0.02]" {
+		t.Errorf("StepVolume вызван с %v", sw.steps)
+	}
+
+	sw.stepErr = errors.New("COM")
+	onVolumeKey(volumeKeyStep) // ошибка только в лог
+}
+
+func TestKeyHeld(t *testing.T) {
+	// Настоящий GetAsyncKeyState: результат зависит от клавиатуры, поэтому
+	// проверяется только вызов. Клавишу F24 физически почти никто не жмёт.
+	const vkF24 = 0x87
+	if keyHeld(vkF24) {
+		t.Error("F24 считается зажатой")
 	}
 }

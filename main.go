@@ -253,7 +253,6 @@ var (
 	rePosition    = mpcField("position")
 	reDuration    = mpcField("duration")
 	rePositionStr = mpcField("positionstring")
-	reDurationStr = mpcField("durationstring")
 	reStateString = mpcField("statestring")
 	reFile        = mpcField("file")
 	reFilePath    = mpcField("filepath")
@@ -263,7 +262,6 @@ type MPCState struct {
 	Position    int64
 	Duration    int64
 	PositionStr string
-	DurationStr string
 	StateString string
 	File        string
 	FilePath    string
@@ -320,7 +318,6 @@ func fetchState(url string, client *http.Client) (_ *MPCState, err error) {
 		Position:    position,
 		Duration:    duration,
 		PositionStr: extractStr(html, rePositionStr),
-		DurationStr: extractStr(html, reDurationStr),
 		StateString: extractStr(html, reStateString),
 		File:        extractStr(html, reFile),
 		FilePath:    extractStr(html, reFilePath),
@@ -345,27 +342,19 @@ func formatTime(ms int64) string {
 // Win32-хелперы: монитор под курсором и высота заголовка окна
 // ---------------------------------------------------------------------------
 
-type winRect struct {
-	Left, Top, Right, Bottom int32
-}
-
-type winPoint struct {
-	X, Y int32
-}
-
 type winMonitorInfo struct {
 	CbSize    uint32
-	RcMonitor winRect
-	RcWork    winRect
+	RcMonitor windows.Rect
+	RcWork    windows.Rect
 	DwFlags   uint32
 }
 
 // screenLayout возвращает рабочую область (без панели задач) и полные границы
 // монитора, на котором сейчас находится курсор мыши.
-func screenLayout() (work, monitor winRect, err error) {
+func screenLayout() (work, monitor windows.Rect, err error) {
 	const monitorDefaultToNearest = 2
 
-	var pt winPoint
+	var pt struct{ X, Y int32 } // POINT
 	if r, _, errno := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r == 0 {
 		return work, monitor, win32Error("GetCursorPos", errno)
 	}
@@ -618,47 +607,49 @@ func (s *Switcher) setDefaultLocked(id string) error {
 	return nil
 }
 
-// CurrentVolume возвращает текущий уровень громкости (0..1), состояние mute и
-// ID текущего default-устройства воспроизведения. ID нужен вызывающему
-// (volumePoller, см. ниже), чтобы отличить реальное изменение громкости от
-// переключения на другое устройство с другим сохранённым уровнем — это два
-// разных события, и поднимать оверлей на устройства нужно только для первого.
-func (s *Switcher) CurrentVolume() (level float64, muted bool, deviceID string, err error) {
-	err = s.exec(func() error {
-		l, m, id, e := s.currentVolumeLocked()
-		level, muted, deviceID = l, m, id
-		return e
-	})
-	return
+// volumeReading — громкость текущего default-устройства воспроизведения.
+// DeviceID нужен поллеру (см. volumeChanged), чтобы отличить реальное
+// изменение громкости от переключения на другое устройство с другим
+// сохранённым уровнем — это два разных события, и оверлей поднимается только
+// для первого.
+type volumeReading struct {
+	Level    float64 // 0..1
+	Muted    bool
+	DeviceID string
 }
 
-func (s *Switcher) currentVolumeLocked() (level float64, muted bool, deviceID string, err error) {
+// CurrentVolume возвращает громкость текущего default-устройства.
+func (s *Switcher) CurrentVolume() (volumeReading, error) {
+	return execValue(s, s.currentVolumeLocked)
+}
+
+func (s *Switcher) currentVolumeLocked() (volumeReading, error) {
 	var dev *wca.IMMDevice
-	if err = s.mmde.GetDefaultAudioEndpoint(wca.ERender, wca.EConsole, &dev); err != nil {
-		return
+	if err := s.mmde.GetDefaultAudioEndpoint(wca.ERender, wca.EConsole, &dev); err != nil {
+		return volumeReading{}, err
 	}
 	defer dev.Release()
 
-	if err = dev.GetId(&deviceID); err != nil {
-		return
+	id, err := deviceID(dev)
+	if err != nil {
+		return volumeReading{}, err
 	}
 
 	var aev *wca.IAudioEndpointVolume
-	if err = dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
-		return
+	if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+		return volumeReading{}, err
 	}
 	defer aev.Release()
 
 	var scalar float32
-	if err = aev.GetMasterVolumeLevelScalar(&scalar); err != nil {
-		return
+	if err := aev.GetMasterVolumeLevelScalar(&scalar); err != nil {
+		return volumeReading{}, err
 	}
-	var isMuted bool
-	if err = aev.GetMute(&isMuted); err != nil {
-		return
+	var muted bool
+	if err := aev.GetMute(&muted); err != nil {
+		return volumeReading{}, err
 	}
-	level, muted = float64(scalar), isMuted
-	return
+	return volumeReading{Level: float64(scalar), Muted: muted, DeviceID: id}, nil
 }
 
 func deviceID(dev *wca.IMMDevice) (string, error) {
@@ -703,41 +694,39 @@ func deviceName(dev *wca.IMMDevice) (string, error) {
 const volumePollInterval = 120 * time.Millisecond
 
 // startVolumePoller периодически опрашивает switcher.CurrentVolume() и
-// вызывает onChange при изменении уровня (с точностью до процента) или
-// состояния mute НА ОДНОМ И ТОМ ЖЕ устройстве. Первое измерение, как и любое
-// измерение сразу после смены default-устройства (F7/F8, трей, панель задач
-// Windows), только запоминается как новая база для сравнения — onChange не
-// вызывается, иначе оверлей всплывал бы при каждом запуске и при каждом
-// переключении вывода (у устройств обычно разный сохранённый уровень
-// громкости, и это не то же самое, что пользователь покрутил громкость).
+// вызывает onChange, когда громкость изменилась (см. volumeChanged).
 func startVolumePoller(switcher *Switcher, onChange func(level float64, muted bool)) {
 	go func() {
 		ticker := time.NewTicker(volumePollInterval)
 		defer ticker.Stop()
 
-		havePrev := false
-		var lastPercent int
-		var lastMuted bool
-		var lastDeviceID string
+		var prev volumeReading
 		for range ticker.C {
-			level, muted, deviceID, err := switcher.CurrentVolume()
+			cur, err := switcher.CurrentVolume()
 			if err != nil {
 				continue
 			}
-			percent := int(math.Round(level * 100))
-
-			switch {
-			case !havePrev:
-			case deviceID != lastDeviceID:
+			if volumeChanged(prev, cur) {
+				onChange(cur.Level, cur.Muted)
+			} else if prev.DeviceID != "" && prev.DeviceID != cur.DeviceID {
 				log.Printf("volume poller: устройство сменилось, громкость не показываю")
-			case percent != lastPercent || muted != lastMuted:
-				onChange(level, muted)
 			}
-
-			havePrev = true
-			lastPercent, lastMuted, lastDeviceID = percent, muted, deviceID
+			prev = cur
 		}
 	}()
+}
+
+// volumeChanged сообщает, что между двумя замерами на ОДНОМ И ТОМ ЖЕ
+// устройстве изменился уровень (с точностью до процента) или mute. Первый
+// замер (prev пустой — у реального устройства ID не бывает пустым), как и
+// замер сразу после смены default-устройства (F7/F8, трей, панель задач
+// Windows), изменением не считается: иначе оверлей всплывал бы при каждом
+// запуске и при каждом переключении вывода (у устройств обычно разный
+// сохранённый уровень громкости, и это не то же самое, что пользователь
+// покрутил громкость).
+func volumeChanged(prev, cur volumeReading) bool {
+	return prev.DeviceID != "" && prev.DeviceID == cur.DeviceID &&
+		(math.Round(prev.Level*100) != math.Round(cur.Level*100) || prev.Muted != cur.Muted)
 }
 
 // ---------------------------------------------------------------------------
@@ -877,8 +866,8 @@ func renderTrayIcon() []byte {
 	fg := color.RGBA{R: 90, G: 200, B: 250, A: 255}
 
 	cx, cy, r := size/2, size/2, size/2-4
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
+	for y := range size {
+		for x := range size {
 			dx, dy := x-cx, y-cy
 			if dx*dx+dy*dy <= r*r {
 				img.Set(x, y, fg)
@@ -1625,17 +1614,12 @@ func setAutostart(enable bool) (err error) {
 // ---------------------------------------------------------------------------
 
 var (
-	switcher *Switcher
-	hk       *hotkeyListener
+	switcher    *Switcher
+	stopHotkeys func() error
 
-	menuMu     sync.Mutex
-	menuItems  []*systray.MenuItem
-	deviceByID map[string]int
+	menuMu      sync.Mutex
+	deviceItems map[string]*systray.MenuItem // пункты меню по ID устройства
 )
-
-// debugMode хранит значение флага -debug для использования вне main()
-// (см. onReady, где решается, нужно ли повторно показывать консоль).
-var debugMode bool
 
 // singleInstanceMutex — имя именованного мьютекса, по которому второй
 // экземпляр узнаёт, что программа уже запущена. Префикс Local\ ограничивает
@@ -1676,7 +1660,6 @@ func main() {
 	intervalFlag := flag.Duration("interval", 0, "Интервал опроса (перекрывает MPC_INTERVAL)")
 	flag.Parse()
 
-	debugMode = *debug
 	closeLog := setupLogging(*debug)
 	defer closeLog()
 
@@ -1723,16 +1706,16 @@ func main() {
 	go func() {
 		runtime.LockOSThread()
 		log.Printf("systray: запуск")
-		systray.Run(onReady, onExit)
+		systray.Run(func() { onReady(*debug) }, onExit)
 		log.Printf("systray: завершён, выход")
 	}()
 
 	runFyne(url, interval)
 }
 
-func onReady() {
+func onReady(debug bool) {
 	log.Printf("systray: onReady")
-	if debugMode {
+	if debug {
 		// systray мог спрятать консоль повторно
 		if err := ensureConsole(); err != nil {
 			log.Printf("console: %v", err)
@@ -1806,12 +1789,12 @@ func onReady() {
 		systray.Quit()
 	}()
 
-	hk = &hotkeyListener{
-		OnF5: func() { log.Printf("hotkey: F5"); toggleMPCWindow() },
-		OnF7: func() { log.Printf("hotkey: F7"); onCycle(-1) },
-		OnF8: func() { log.Printf("hotkey: F8"); onCycle(1) },
-	}
-	if err := hk.Start(); err != nil {
+	stopHotkeys, err = startHotkeys(map[uint32]func(){
+		vkF5: func() { log.Printf("hotkey: F5"); toggleMPCWindow() },
+		vkF7: func() { log.Printf("hotkey: F7"); onCycle(-1) },
+		vkF8: func() { log.Printf("hotkey: F8"); onCycle(1) },
+	})
+	if err != nil {
 		log.Printf("hotkey: не удалось установить хук: %v", err)
 	} else {
 		log.Printf("hotkey: хук установлен (F5/F7/F8)")
@@ -1824,8 +1807,8 @@ func onReady() {
 
 func onExit() {
 	log.Printf("onExit: остановка")
-	if hk != nil {
-		if err := hk.Stop(); err != nil {
+	if stopHotkeys != nil {
+		if err := stopHotkeys(); err != nil {
 			log.Printf("onExit: не удалось снять хук: %v", err)
 		} else {
 			log.Printf("onExit: хук снят")
@@ -1846,13 +1829,10 @@ func buildDeviceMenu(devices []Device, currentID string) {
 	menuMu.Lock()
 	defer menuMu.Unlock()
 
-	deviceByID = make(map[string]int, len(devices))
-	menuItems = make([]*systray.MenuItem, len(devices))
-
-	for i, dev := range devices {
+	deviceItems = make(map[string]*systray.MenuItem, len(devices))
+	for _, dev := range devices {
 		item := systray.AddMenuItemCheckbox(dev.Name, "Сделать устройством по умолчанию", dev.ID == currentID)
-		menuItems[i] = item
-		deviceByID[dev.ID] = i
+		deviceItems[dev.ID] = item
 
 		go func() {
 			for range item.ClickedCh {
@@ -1891,15 +1871,16 @@ func announceSwitch(dev Device) {
 	showNotification("Аудиовыход переключён", dev.Name)
 }
 
-func setChecked(id string) {
+func setChecked(checkedID string) {
 	menuMu.Lock()
 	defer menuMu.Unlock()
 
-	for _, item := range menuItems {
-		item.Uncheck()
-	}
-	if idx, ok := deviceByID[id]; ok {
-		menuItems[idx].Check()
+	for id, item := range deviceItems {
+		if id == checkedID {
+			item.Check()
+		} else {
+			item.Uncheck()
+		}
 	}
 }
 
@@ -1925,57 +1906,40 @@ type kbdllHookStruct struct {
 	DwExtraInfo uintptr
 }
 
-type hotkeyListener struct {
-	OnF5 func()
-	OnF7 func()
-	OnF8 func()
+// hotkeys — обработчики перехватываемых клавиш по virtual-key коду.
+// Заполняется в startHotkeys до установки хука и дальше не меняется, поэтому
+// hookProc читает её без блокировок.
+var hotkeys map[uint32]func()
 
-	mu   sync.Mutex
-	hook uintptr
-	proc uintptr // держим ссылку на callback, иначе GC его выкинет
-}
-
-var (
-	activeHKMu sync.Mutex
-	activeHK   *hotkeyListener
-)
-
-// Start устанавливает хук и запускает цикл сообщений.
-func (l *hotkeyListener) Start() error {
-	activeHKMu.Lock()
-	if activeHK != nil {
-		activeHKMu.Unlock()
-		return errors.New("hotkey: listener already running")
-	}
-	activeHK = l
-	activeHKMu.Unlock()
-
+// startHotkeys устанавливает глобальный хук клавиатуры WH_KEYBOARD_LL и
+// возвращает функцию, которая его снимает. Хук живёт в отдельном закреплённом
+// OS-потоке со своим циклом сообщений: без цикла сообщений в потоке, который
+// поставил хук, Windows не вызывает hookProc.
+func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 	hInst, _, errno := procGetModuleHandleW.Call(0)
 	if hInst == 0 {
-		l.clearActive()
-		return win32Error("GetModuleHandleW", errno)
+		return nil, win32Error("GetModuleHandleW", errno)
 	}
+	hotkeys = handlers
 
-	ready := make(chan error, 1)
+	type result struct {
+		hook uintptr
+		err  error
+	}
+	ready := make(chan result, 1)
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
+		// Колбэки syscall.NewCallback никогда не освобождаются, так что
+		// хранить ссылку на cb, чтобы его не собрал GC, не нужно.
 		cb := syscall.NewCallback(hookProc)
-
 		hook, _, errno := procSetWindowsHookExW.Call(whKeyboardLL, cb, hInst, 0)
 		if hook == 0 {
-			l.clearActive()
-			ready <- win32Error("SetWindowsHookExW", errno)
+			ready <- result{err: win32Error("SetWindowsHookExW", errno)}
 			return
 		}
-
-		l.mu.Lock()
-		l.hook = hook
-		l.proc = cb
-		l.mu.Unlock()
-
-		ready <- nil
+		ready <- result{hook: hook}
 
 		var msg [48]byte
 		for {
@@ -1991,67 +1955,35 @@ func (l *hotkeyListener) Start() error {
 		}
 	}()
 
-	return <-ready
-}
-
-// Stop снимает хук.
-func (l *hotkeyListener) Stop() error {
-	l.mu.Lock()
-	hook := l.hook
-	l.hook = 0
-	l.mu.Unlock()
-
-	l.clearActive()
-
-	if hook != 0 {
-		if r, _, errno := procUnhookWindowsHookEx.Call(hook); r == 0 {
+	res := <-ready
+	if res.err != nil {
+		return nil, res.err
+	}
+	return func() error {
+		if r, _, errno := procUnhookWindowsHookEx.Call(res.hook); r == 0 {
 			return win32Error("UnhookWindowsHookEx", errno)
 		}
-	}
-	return nil
+		return nil
+	}, nil
 }
 
-func (l *hotkeyListener) clearActive() {
-	activeHKMu.Lock()
-	if activeHK == l {
-		activeHK = nil
-	}
-	activeHKMu.Unlock()
-}
-
-// lParam хука WH_KEYBOARD_LL — указатель на KBDLLHOOKSTRUCT в памяти
-// Windows; syscall.NewCallback сразу отдаёт его типизированным указателем,
-// без небезопасного преобразования uintptr -> unsafe.Pointer.
+// hookProc — процедура хука WH_KEYBOARD_LL. Наши клавиши «съедаются»
+// (возврат 1), обработчик запускается в отдельной горутине, чтобы хук
+// возвращался быстро; остальные передаются дальше по цепочке хуков.
+//
+// lParam хука — указатель на KBDLLHOOKSTRUCT в памяти Windows;
+// syscall.NewCallback сразу отдаёт его типизированным указателем, без
+// небезопасного преобразования uintptr -> unsafe.Pointer.
 //
 // CallNextHookEx возвращает результат следующего хука в цепочке, а не
 // признак ошибки, поэтому третье значение Call здесь не нужно.
 func hookProc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
 	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
-		if handler := activeHotkeyHandler(kb.VkCode); handler != nil {
+		if handler := hotkeys[kb.VkCode]; handler != nil {
 			go handler()
-			return 1 // клавиша обработана — дальше по цепочке хуков её не пускаем
+			return 1
 		}
 	}
 	r, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
 	return r
-}
-
-// activeHotkeyHandler возвращает обработчик клавиши vk у активного
-// слушателя или nil, если слушателя нет или клавиша не наша.
-func activeHotkeyHandler(vk uint32) func() {
-	activeHKMu.Lock()
-	l := activeHK
-	activeHKMu.Unlock()
-	if l == nil {
-		return nil
-	}
-	switch vk {
-	case vkF5:
-		return l.OnF5
-	case vkF7:
-		return l.OnF7
-	case vkF8:
-		return l.OnF8
-	}
-	return nil
 }

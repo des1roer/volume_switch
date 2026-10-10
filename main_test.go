@@ -78,7 +78,6 @@ func TestFetchState(t *testing.T) {
 		Position:    61000,
 		Duration:    3600000,
 		PositionStr: "00:01:01",
-		DurationStr: "01:00:00",
 		StateString: "Воспроизведение",
 		File:        "movie.mkv",
 		FilePath:    `E:\movies\movie.mkv`,
@@ -346,35 +345,71 @@ func TestMPCExePathFromEnv(t *testing.T) {
 	}
 }
 
-func TestActiveHotkeyHandler(t *testing.T) {
-	var called string
-	l := &hotkeyListener{
-		OnF5: func() { called = "F5" },
-		OnF7: func() { called = "F7" },
-		OnF8: func() { called = "F8" },
+func TestHookProc(t *testing.T) {
+	called := make(chan uint32, 1)
+	prev := hotkeys
+	hotkeys = map[uint32]func(){
+		vkF5: func() { called <- vkF5 },
+		vkF8: func() { called <- vkF8 },
 	}
+	t.Cleanup(func() { hotkeys = prev })
 
-	if h := activeHotkeyHandler(vkF5); h != nil {
-		t.Fatal("без активного слушателя обработчика быть не должно")
-	}
-
-	activeHKMu.Lock()
-	activeHK = l
-	activeHKMu.Unlock()
-	t.Cleanup(l.clearActive)
-
-	for vk, want := range map[uint32]string{vkF5: "F5", vkF7: "F7", vkF8: "F8"} {
-		h := activeHotkeyHandler(vk)
-		if h == nil {
-			t.Fatalf("нет обработчика для %s", want)
+	for _, vk := range []uint32{vkF5, vkF8} {
+		if r := hookProc(0, wmKeyDown, &kbdllHookStruct{VkCode: vk}); r != 1 {
+			t.Errorf("vk=%#x: hookProc = %d, want 1 (клавиша съедена)", vk, r)
 		}
-		h()
-		if called != want {
-			t.Errorf("вызван %q, want %q", called, want)
+		select {
+		case got := <-called:
+			if got != vk {
+				t.Errorf("вызван обработчик %#x, want %#x", got, vk)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("обработчик %#x не вызван", vk)
 		}
 	}
-	if h := activeHotkeyHandler(0x41); h != nil { // 'A'
-		t.Error("для чужой клавиши обработчика быть не должно")
+
+	// Чужая клавиша, отпускание нашей клавиши и nCode < 0 уходят дальше по
+	// цепочке хуков (CallNextHookEx без хуков возвращает 0) и обработчики не
+	// вызывают.
+	for _, tc := range []struct {
+		name   string
+		nCode  int
+		wParam uintptr
+		vk     uint32
+	}{
+		{"чужая клавиша", 0, wmKeyDown, 0x41},
+		{"отпускание F5", 0, 0x0101, vkF5}, // WM_KEYUP
+		{"nCode < 0", -1, wmKeyDown, vkF5},
+	} {
+		if r := hookProc(tc.nCode, tc.wParam, &kbdllHookStruct{VkCode: tc.vk}); r != 0 {
+			t.Errorf("%s: hookProc = %d, want 0", tc.name, r)
+		}
+	}
+	select {
+	case got := <-called:
+		t.Errorf("лишний вызов обработчика %#x", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestVolumeChanged(t *testing.T) {
+	base := volumeReading{Level: 0.50, DeviceID: "dev1"}
+	tests := []struct {
+		name      string
+		prev, cur volumeReading
+		want      bool
+	}{
+		{"первый замер", volumeReading{}, base, false},
+		{"без изменений", base, base, false},
+		{"меньше процента", base, volumeReading{Level: 0.502, DeviceID: "dev1"}, false},
+		{"громкость изменилась", base, volumeReading{Level: 0.60, DeviceID: "dev1"}, true},
+		{"mute", base, volumeReading{Level: 0.50, Muted: true, DeviceID: "dev1"}, true},
+		{"сменилось устройство", base, volumeReading{Level: 0.80, DeviceID: "dev2"}, false},
+	}
+	for _, tt := range tests {
+		if got := volumeChanged(tt.prev, tt.cur); got != tt.want {
+			t.Errorf("%s: got %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 

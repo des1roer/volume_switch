@@ -49,14 +49,21 @@ import (
 const (
 	defaultURL      = "http://localhost:7777/variables.html"
 	defaultInterval = 500 * time.Millisecond
-	windowTitle     = "MPC-HC Progress"
 	logFileName     = "volume_switch.log"
 
-	volumeWindowTitle     = "Volume Overlay"
 	volumeOverlayDuration = 1200 * time.Millisecond
 	volumeOverlayWidth    = float32(260)
 	volumeOverlayHeight   = float32(160)
 	volumeTickCount       = 10 // ползунок размечен от 0 до 100 с шагом 10 (11 отметок)
+)
+
+// Заголовки окон-оверлеев. По ним fixOverlayWindowChrome находит нативные
+// окна (FindWindowW), поэтому они должны быть уникальны в системе. Это
+// переменные, а не константы, только ради тестов: там заголовки подменяются,
+// чтобы тест не задел окна запущенной копии программы.
+var (
+	windowTitle       = "MPC-HC Progress"
+	volumeWindowTitle = "Volume Overlay"
 )
 
 var (
@@ -693,27 +700,22 @@ func deviceName(dev *wca.IMMDevice) (string, error) {
 
 const volumePollInterval = 120 * time.Millisecond
 
-// startVolumePoller периодически опрашивает switcher.CurrentVolume() и
-// вызывает onChange, когда громкость изменилась (см. volumeChanged).
-func startVolumePoller(switcher *Switcher, onChange func(level float64, muted bool)) {
-	go func() {
-		ticker := time.NewTicker(volumePollInterval)
-		defer ticker.Stop()
-
-		var prev volumeReading
-		for range ticker.C {
-			cur, err := switcher.CurrentVolume()
-			if err != nil {
-				continue
-			}
-			if volumeChanged(prev, cur) {
-				onChange(cur.Level, cur.Muted)
-			} else if prev.DeviceID != "" && prev.DeviceID != cur.DeviceID {
-				log.Printf("volume poller: устройство сменилось, громкость не показываю")
-			}
-			prev = cur
+// pollVolume на каждый тик читает громкость через read и вызывает onChange,
+// когда она изменилась (см. volumeChanged). Работает, пока не закрыт ticks.
+func pollVolume(read func() (volumeReading, error), onChange func(level float64, muted bool), ticks <-chan time.Time) {
+	var prev volumeReading
+	for range ticks {
+		cur, err := read()
+		if err != nil {
+			continue
 		}
-	}()
+		if volumeChanged(prev, cur) {
+			onChange(cur.Level, cur.Muted)
+		} else if prev.DeviceID != "" && prev.DeviceID != cur.DeviceID {
+			log.Printf("volume poller: устройство сменилось, громкость не показываю")
+		}
+		prev = cur
+	}
 }
 
 // volumeChanged сообщает, что между двумя замерами на ОДНОМ И ТОМ ЖЕ
@@ -752,9 +754,11 @@ const (
 	niifInfo             = 0x00000001
 	niifRespectQuietTime = 0x00000080
 
-	systrayClassName = "SystrayClass"
-	trayIconID       = 100
+	trayIconID = 100
 )
+
+// systrayClassName — класс скрытого окна трея; переменная только ради тестов.
+var systrayClassName = "SystrayClass"
 
 type notifyIconDataW struct {
 	cbSize            uint32
@@ -1065,7 +1069,12 @@ func toggleMPCPlayback(variablesURL string) {
 	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
 }
 
-const defaultMPCExe = `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`
+// Где искать MPC-HC (см. mpcExePath). Переменные, а не константы, только ради
+// тестов.
+var (
+	defaultMPCExe   = `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`
+	mpcRegistryPath = `Software\MPC-HC\MPC-HC`
+)
 
 // mpcExePath возвращает путь к MPC-HC: MPC_EXE из окружения/.env; иначе
 // defaultMPCExe, если такой файл есть; иначе путь, который MPC-HC сам пишет в
@@ -1090,7 +1099,7 @@ func mpcExePath() string {
 // mpcExeFromRegistry читает HKCU\Software\MPC-HC\MPC-HC\ExePath; "" — если
 // значения нет или его не удалось прочитать.
 func mpcExeFromRegistry() string {
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\MPC-HC\MPC-HC`, registry.QUERY_VALUE)
+	key, err := registry.OpenKey(registry.CURRENT_USER, mpcRegistryPath, registry.QUERY_VALUE)
 	if err != nil {
 		if !errors.Is(err, registry.ErrNotExist) {
 			log.Printf("mpc launch: открытие ключа реестра MPC-HC: %v", err)
@@ -1112,14 +1121,21 @@ func launchMPC() {
 	exe := mpcExePath()
 	cmd := exec.Command(exe)
 	cmd.Dir = filepath.Dir(exe)
-	if err := cmd.Start(); err != nil {
+	if err := startDetached(cmd); err != nil {
 		log.Printf("mpc launch: не удалось запустить %s: %v", exe, err)
 		return
 	}
 	log.Printf("mpc launch: запущен %s", exe)
-	if err := cmd.Process.Release(); err != nil {
-		log.Printf("mpc launch: освобождение дескриптора процесса: %v", err)
+}
+
+// startDetached запускает процесс и не ждёт его завершения: дескриптор
+// процесса сразу освобождается. Переменная, чтобы тесты не запускали
+// настоящие explorer и MPC-HC.
+var startDetached = func(cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
 	}
+	return cmd.Process.Release()
 }
 
 // openContainingFolder открывает проводник с выделенным файлом (как
@@ -1146,7 +1162,7 @@ func openContainingFolder(path string) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CmdLine: `explorer.exe /select,"` + clean + `"`,
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startDetached(cmd); err != nil {
 		log.Printf("overlay: не удалось открыть проводник: %v", err)
 	}
 }
@@ -1158,6 +1174,16 @@ func runFyne(url string, interval time.Duration) {
 	log.Printf("fyne: инициализация (url=%s, interval=%s)", url, interval)
 
 	fyneApp = app.New()
+	buildUI(url)
+	go pollMPC(url, time.Tick(interval))
+
+	fyneApp.Run()
+	log.Printf("fyne: цикл приложения завершён")
+}
+
+// buildUI создаёт в fyneApp оба окна-оверлея — прогресс MPC-HC (mainWindow)
+// и ползунок громкости (volumeWindow) — и оставляет их скрытыми.
+func buildUI(url string) {
 	fyneApp.Settings().SetTheme(theme.DarkTheme())
 	mainWindow = fyneApp.NewWindow(windowTitle)
 
@@ -1197,8 +1223,6 @@ func runFyne(url string, interval time.Duration) {
 	pad := theme.Padding()
 	body := container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow)
 	mainWindow.SetContent(container.NewStack(body, newClickCatcher(url)))
-
-	go pollMPC(url, interval)
 
 	// --- Оверлей уровня громкости: большой ползунок с градацией 0..100,
 	// см. volumeMonitor. Размер и позиция пересчитываются под монитор
@@ -1245,20 +1269,14 @@ func runFyne(url string, interval time.Duration) {
 		w.Hide()
 	}
 	log.Printf("fyne: окно создано, стартует скрытым")
-
-	fyneApp.Run()
-	log.Printf("fyne: цикл приложения завершён")
 }
 
-// pollMPC раз в interval опрашивает web-интерфейс MPC-HC и обновляет
-// оверлей прогресса. Работает до завершения процесса.
-func pollMPC(url string, interval time.Duration) {
-	log.Printf("mpc poll: старт цикла (interval=%s)", interval)
+// pollMPC на каждый тик опрашивает web-интерфейс MPC-HC и обновляет оверлей
+// прогресса. Работает, пока не закрыт ticks.
+func pollMPC(url string, ticks <-chan time.Time) {
 	client := &http.Client{Timeout: 2 * time.Second}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	var lastErr string
-	for range ticker.C {
+	for range ticks {
 		st, err := fetchState(url, client)
 		if err != nil {
 			if err.Error() != lastErr {
@@ -1533,10 +1551,11 @@ func showVolumeOverlay(level float64, muted bool) {
 // Автозапуск через реестр (HKCU\...\Run)
 // ---------------------------------------------------------------------------
 
-const (
-	autostartRegistryPath = `Software\Microsoft\Windows\CurrentVersion\Run`
-	autostartValueName    = "VolumeSwitch"
-)
+const autostartValueName = "VolumeSwitch"
+
+// autostartRegistryPath — ключ автозапуска в HKCU; переменная только ради
+// тестов, чтобы они не трогали настоящий Run.
+var autostartRegistryPath = `Software\Microsoft\Windows\CurrentVersion\Run`
 
 // autostartCommand возвращает командную строку для записи в Run: путь к
 // текущему exe в кавычках (без экранирования backslash — простое
@@ -1618,14 +1637,21 @@ var (
 	stopHotkeys func() error
 
 	menuMu      sync.Mutex
-	deviceItems map[string]*systray.MenuItem // пункты меню по ID устройства
+	deviceItems map[string]checkbox // пункты меню по ID устройства
 )
+
+// checkbox — пункт меню с галочкой (*systray.MenuItem); интерфейс нужен,
+// чтобы setChecked можно было проверить без настоящего трея.
+type checkbox interface {
+	Check()
+	Uncheck()
+}
 
 // singleInstanceMutex — имя именованного мьютекса, по которому второй
 // экземпляр узнаёт, что программа уже запущена. Префикс Local\ ограничивает
 // проверку сеансом текущего пользователя: глобальные хоткеи и трей всё равно
-// работают только в своём сеансе.
-const singleInstanceMutex = `Local\volume_switch_single_instance`
+// работают только в своём сеансе. Переменная только ради тестов.
+var singleInstanceMutex = `Local\volume_switch_single_instance`
 
 // acquireSingleInstance создаёт именованный мьютекс. Возвращает already=true,
 // если мьютекс уже существует, т.е. другой экземпляр программы запущен.
@@ -1802,7 +1828,7 @@ func onReady(debug bool) {
 
 	// Колбэк вызывается из горутины поллера; вся работа с UI внутри
 	// showVolumeOverlay идёт через fyne.Do.
-	startVolumePoller(switcher, showVolumeOverlay)
+	go pollVolume(switcher.CurrentVolume, showVolumeOverlay, time.Tick(volumePollInterval))
 }
 
 func onExit() {
@@ -1829,7 +1855,7 @@ func buildDeviceMenu(devices []Device, currentID string) {
 	menuMu.Lock()
 	defer menuMu.Unlock()
 
-	deviceItems = make(map[string]*systray.MenuItem, len(devices))
+	deviceItems = make(map[string]checkbox, len(devices))
 	for _, dev := range devices {
 		item := systray.AddMenuItemCheckbox(dev.Name, "Сделать устройством по умолчанию", dev.ID == currentID)
 		deviceItems[dev.ID] = item

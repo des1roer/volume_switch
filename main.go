@@ -1252,7 +1252,7 @@ func runFyne(url string, interval time.Duration) {
 	// После этого оба окна стартуют скрытыми: mainWindow покажем по F5,
 	// volumeWindow — по событию от volume poller.
 	for _, w := range []fyne.Window{mainWindow, volumeWindow} {
-		showOverlay(w)
+		showOverlay(w, w == mainWindow)
 		w.Hide()
 	}
 	log.Printf("fyne: окно создано, стартует скрытым")
@@ -1328,10 +1328,10 @@ func requestPosition(w fyne.Window, x, y int) {
 }
 
 // showOverlay показывает окно и сразу снимает его с панели задач (см.
-// fixOverlayWindowChrome).
-func showOverlay(w fyne.Window) {
+// fixOverlayWindowChrome). С topmost окно ещё и поднимается поверх всех окон.
+func showOverlay(w fyne.Window, topmost bool) {
 	w.Show()
-	if err := fixOverlayWindowChrome(w.Title()); err != nil {
+	if err := fixOverlayWindowChrome(w.Title(), topmost); err != nil {
 		log.Printf("overlay-chrome: %v", err)
 	}
 }
@@ -1351,7 +1351,13 @@ func showOverlay(w fyne.Window) {
 // цикла Hide()+Show() Explorer иногда всё равно возвращает кнопку в панель
 // задач. Сами вызовы дешёвые (несколько syscall), так что переприменять их
 // при каждом показе не проблема.
-func fixOverlayWindowChrome(title string) error {
+//
+// С topmost окно становится «поверх всех» (HWND_TOPMOST) и поднимается на
+// самый верх среди таких окон. Это тоже делается при каждом показе, а не
+// один раз через RequestAlwaysOnTop Fyne: иначе окно, ставшее «поверх
+// всех» позже (например, MPC-HC в режиме «Поверх всех окон»), осталось бы
+// над оверлеем.
+func fixOverlayWindowChrome(title string, topmost bool) error {
 	const (
 		wsExToolWindow  = 0x00000080
 		wsExAppWindow   = 0x00040000
@@ -1362,6 +1368,8 @@ func fixOverlayWindowChrome(title string) error {
 		swpFrameChanged = 0x0020
 
 		dwmwaUseImmersiveDarkMode = 20
+
+		hwndTopmost = ^uintptr(0) // HWND_TOPMOST = (HWND)-1
 	)
 	// -20 переполняет uintptr как константа компиляции; через typed
 	// переменную Go делает корректное sign-extension в рантайме.
@@ -1390,8 +1398,15 @@ func fixOverlayWindowChrome(title string) error {
 	// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
 	// задач без скрытия/показа окна — в отличие от ShowWindow(HIDE)+
 	// ShowWindow(SHOW), это не ломает перерисовку содержимого GLFW/Fyne.
-	if r, _, errno := procSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
-		uintptr(swpNoMove|swpNoSize|swpNoZOrder|swpNoActivate|swpFrameChanged)); r == 0 {
+	// Z-порядок меняется только для topmost, фокус окно не забирает.
+	var insertAfter uintptr
+	flags := uintptr(swpNoMove | swpNoSize | swpNoActivate | swpFrameChanged)
+	if topmost {
+		insertAfter = hwndTopmost
+	} else {
+		flags |= swpNoZOrder
+	}
+	if r, _, errno := procSetWindowPos.Call(hwnd, insertAfter, 0, 0, 0, 0, flags); r == 0 {
 		return win32Error("SetWindowPos", errno)
 	}
 
@@ -1414,8 +1429,8 @@ func toggleMPCWindow() {
 			mainWindow.Hide()
 			log.Printf("F5: окно скрыто")
 		} else {
-			showOverlay(mainWindow)
-			log.Printf("F5: окно показано")
+			showOverlay(mainWindow, true)
+			log.Printf("F5: окно показано поверх всех окон")
 		}
 		winVisible = !winVisible
 	})
@@ -1508,7 +1523,7 @@ func showVolumeOverlay(level float64, muted bool) {
 		log.Printf("volume overlay: показываю размер=%.0fx%.0f позиция=(%d,%d) level=%.0f%% muted=%v",
 			width, height, x, y, level*100, muted)
 
-		showOverlay(volumeWindow)
+		showOverlay(volumeWindow, false)
 	})
 
 	volumeMu.Lock()

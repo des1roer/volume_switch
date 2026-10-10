@@ -1323,12 +1323,21 @@ func runFyne(url string, interval time.Duration) {
 	// «обычным» стилем. Поэтому здесь окно показывается и сразу прячется
 	// один раз вхолостую ещё до первого реального показа — только чтобы
 	// форсировать создание HWND, применить стиль, и лишь после этого окно
-	// хоть раз станет видимым пользователю.
-	volumeWindow.Show()
-	if err := fixOverlayWindowChrome(volumeWindowTitle); err != nil {
-		log.Printf("overlay-chrome: %v", err)
+	// хоть раз станет видимым пользователю. Касается обоих окон: mainWindow
+	// без этого оставалось в панели задач после первого показа по F5.
+	for _, w := range []struct {
+		win   fyne.Window
+		title string
+	}{
+		{mainWindow, windowTitle},
+		{volumeWindow, volumeWindowTitle},
+	} {
+		w.win.Show()
+		if err := fixOverlayWindowChrome(w.title); err != nil {
+			log.Printf("overlay-chrome: %v", err)
+		}
+		w.win.Hide()
 	}
-	volumeWindow.Hide()
 
 	// Стартуем скрытыми — mainWindow покажем по F5, volumeWindow по событию
 	// от volumeMonitor.

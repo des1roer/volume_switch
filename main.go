@@ -553,9 +553,15 @@ func (s *Switcher) Cycle(direction int) (Device, error) {
 		// Если текущего устройства нет в списке (IndexFunc вернул -1),
 		// отсчёт идёт от первого.
 		idx := max(slices.IndexFunc(devices, func(d Device) bool { return d.ID == currentID }), 0)
-		next := devices[((idx+direction)%len(devices)+len(devices))%len(devices)]
+		next := devices[wrapIndex(idx+direction, len(devices))]
 		return next, s.setDefaultLocked(next.ID)
 	})
+}
+
+// wrapIndex приводит i к диапазону [0, n) по кругу, в том числе для
+// отрицательных i (оператор % в Go сохраняет знак делимого).
+func wrapIndex(i, n int) int {
+	return (i%n + n) % n
 }
 
 // --- internal helpers; must only be called from the worker goroutine ---

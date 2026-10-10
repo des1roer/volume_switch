@@ -47,7 +47,7 @@ gofmt -l .                                                # должно быт�
 
 ## Тесты
 
-Покрытие ~77% (`go test -cover ./...`). Не покрыты намеренно: `main`, `onReady`, `runFyne` (настоящий цикл Fyne), всё, что вызывает API `systray` (`buildDeviceMenu`, `selectDevice`, `onCycle`, `announceSwitch` — без запущенного трея падают), `ensureConsole` (`AllocConsole` открыл бы окно консоли) и ветки ошибок Win32/COM, которые нельзя вызвать штатно. Не гнаться за 100% ценой подмены каждого syscall.
+Покрытие ~80% (`go test -cover ./...`). Не покрыты намеренно: `main`, `onReady` (настоящий трей, COM и глобальный хук с боевыми F5/F7/F8), `runFyne` (настоящий цикл Fyne), `ensureConsole` и `setupLogging(true)` (`AllocConsole` открыл бы окно консоли) и ветки ошибок Win32/COM, которые нельзя вызвать штатно. Не гнаться за 100% ценой подмены каждого syscall.
 
 **Главное правило: тесты не меняют систему пользователя и не задевают запущенную копию программы.** Для этого в коде есть точки подмены — переменные вместо констант (используй `setVar(t, &x, v)`, он сам вернёт значение):
 
@@ -55,6 +55,8 @@ gofmt -l .                                                # должно быт�
 - `autostartRegistryPath`, `mpcRegistryPath` — только временные ключи из `tempRegistryKey(t)` (удаляются после теста). Настоящий `...\Run` не трогать.
 - `windowTitle`, `volumeWindowTitle` — `setupUI` ставит уникальные заголовки, иначе `fixOverlayWindowChrome` найдёт по заголовку окна запущенной у пользователя программы.
 - `singleInstanceMutex`, `systrayClassName` — уникальные значения в тестах.
+- `setTrayTooltip`, `addTrayCheckbox` — вызовы systray вне `onReady`: без запущенного трея настоящий systray падает (nil внутри `SetTooltip`). `fakeTooltip(t)` заодно служит точкой синхронизации с горутинами меню: `announceSwitch` выставляет подсказку последней.
+- `switcher` — интерфейс `deviceSwitcher`; в тестах `fakeSwitcher`. В `onReady` в него присваивается только успешно созданный `*Switcher` — nil-указатель в интерфейсе прошёл бы проверку `switcher != nil` в `onExit`.
 - Окна Fyne — только через тестовый драйвер (`setupUI` → `test.NewTempApp` + `buildUI`); там `fyne.Do` выполняется синхронно в вызывающей горутине.
 - Нативные Win32-окна — `newNativeWindow(t, title)` (класс STATIC, скрытое, уничтожается после теста).
 - Аудио (`TestSwitcher`) — только чтение; `SetDefault`/`Cycle(0)` вызываются лишь когда текущее устройство и так default во всех трёх ролях и есть в списке активных, т.е. реально ничего не переключается. Без звуковых устройств (CI) тест пропускается.

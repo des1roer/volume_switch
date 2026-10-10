@@ -109,6 +109,8 @@ var (
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procGetMessageW         = user32.NewProc("GetMessageW")
+	procPeekMessageW        = user32.NewProc("PeekMessageW")
+	procPostThreadMessageW  = user32.NewProc("PostThreadMessageW")
 
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 )
@@ -1633,19 +1635,37 @@ func setAutostart(enable bool) (err error) {
 // ---------------------------------------------------------------------------
 
 var (
-	switcher    *Switcher
+	switcher    deviceSwitcher
 	stopHotkeys func() error
 
 	menuMu      sync.Mutex
 	deviceItems map[string]checkbox // пункты меню по ID устройства
 )
 
+// deviceSwitcher — то, что меню трея и хоткеи используют от *Switcher;
+// интерфейс нужен, чтобы их можно было проверить без COM и аудиоустройств.
+type deviceSwitcher interface {
+	SetDefault(id string) error
+	Cycle(direction int) (Device, error)
+	Close()
+}
+
 // checkbox — пункт меню с галочкой (*systray.MenuItem); интерфейс нужен,
-// чтобы setChecked можно было проверить без настоящего трея.
+// чтобы меню можно было проверить без настоящего трея.
 type checkbox interface {
 	Check()
 	Uncheck()
 }
+
+// Вызовы systray, нужные вне onReady. Переменные только ради тестов: без
+// запущенного трея systray падает (nil-указатель внутри SetTooltip).
+var (
+	setTrayTooltip  = systray.SetTooltip
+	addTrayCheckbox = func(title, tooltip string, checked bool) (checkbox, <-chan struct{}) {
+		item := systray.AddMenuItemCheckbox(title, tooltip, checked)
+		return item, item.ClickedCh
+	}
+)
 
 // singleInstanceMutex — имя именованного мьютекса, по которому второй
 // экземпляр узнаёт, что программа уже запущена. Префикс Local\ ограничивает
@@ -1751,16 +1771,18 @@ func onReady(debug bool) {
 	systray.SetTitle("")
 	systray.SetTooltip("Volume Switch")
 
-	var err error
-	switcher, err = NewSwitcher()
+	// В глобальный switcher (интерфейс) попадает только успешно созданный
+	// *Switcher: nil-указатель в интерфейсе прошёл бы проверку на nil в onExit.
+	sw, err := NewSwitcher()
 	if err != nil {
 		log.Printf("audio: ошибка инициализации: %v", err)
 		systray.SetTooltip("Volume Switch: audio init failed")
 		return
 	}
+	switcher = sw
 	log.Printf("audio: switcher создан")
 
-	devices, err := switcher.ListActiveDevices()
+	devices, err := sw.ListActiveDevices()
 	if err != nil {
 		log.Printf("audio: не удалось получить список устройств: %v", err)
 	}
@@ -1769,7 +1791,7 @@ func onReady(debug bool) {
 		log.Printf("  [%d] id=%s name=%q", i, d.ID, d.Name)
 	}
 
-	currentID, err := switcher.DefaultDeviceID()
+	currentID, err := sw.DefaultDeviceID()
 	if err != nil {
 		log.Printf("audio: не удалось получить устройство по умолчанию: %v", err)
 	} else {
@@ -1828,7 +1850,7 @@ func onReady(debug bool) {
 
 	// Колбэк вызывается из горутины поллера; вся работа с UI внутри
 	// showVolumeOverlay идёт через fyne.Do.
-	go pollVolume(switcher.CurrentVolume, showVolumeOverlay, time.Tick(volumePollInterval))
+	go pollVolume(sw.CurrentVolume, showVolumeOverlay, time.Tick(volumePollInterval))
 }
 
 func onExit() {
@@ -1857,11 +1879,11 @@ func buildDeviceMenu(devices []Device, currentID string) {
 
 	deviceItems = make(map[string]checkbox, len(devices))
 	for _, dev := range devices {
-		item := systray.AddMenuItemCheckbox(dev.Name, "Сделать устройством по умолчанию", dev.ID == currentID)
+		item, clicked := addTrayCheckbox(dev.Name, "Сделать устройством по умолчанию", dev.ID == currentID)
 		deviceItems[dev.ID] = item
 
 		go func() {
-			for range item.ClickedCh {
+			for range clicked {
 				log.Printf("tray: выбран %q", dev.Name)
 				selectDevice(dev)
 			}
@@ -1893,7 +1915,7 @@ func onCycle(direction int) {
 }
 
 func announceSwitch(dev Device) {
-	systray.SetTooltip("Volume Switch: " + dev.Name)
+	setTrayTooltip("Volume Switch: " + dev.Name)
 	showNotification("Аудиовыход переключён", dev.Name)
 }
 
@@ -1949,13 +1971,21 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 	hotkeys = handlers
 
 	type result struct {
-		hook uintptr
-		err  error
+		hook     uintptr
+		threadID uint32
+		err      error
 	}
 	ready := make(chan result, 1)
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+
+		// PeekMessage создаёт очередь сообщений потока заранее: иначе stop,
+		// вызванный сразу после установки хука, не смог бы отправить ей
+		// WM_QUIT (PostThreadMessage требует существующей очереди).
+		const pmNoRemove = 0
+		var msg [48]byte
+		procPeekMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0, pmNoRemove)
 
 		// Колбэки syscall.NewCallback никогда не освобождаются, так что
 		// хранить ссылку на cb, чтобы его не собрал GC, не нужно.
@@ -1965,9 +1995,8 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 			ready <- result{err: win32Error("SetWindowsHookExW", errno)}
 			return
 		}
-		ready <- result{hook: hook}
+		ready <- result{hook: hook, threadID: windows.GetCurrentThreadId()}
 
-		var msg [48]byte
 		for {
 			ret, _, errno := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0)
 			switch ret {
@@ -1985,9 +2014,14 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 	if res.err != nil {
 		return nil, res.err
 	}
+	// stop снимает хук и завершает цикл сообщений его потока.
 	return func() error {
+		const wmQuit = 0x0012
 		if r, _, errno := procUnhookWindowsHookEx.Call(res.hook); r == 0 {
 			return win32Error("UnhookWindowsHookEx", errno)
+		}
+		if r, _, errno := procPostThreadMessageW.Call(uintptr(res.threadID), wmQuit, 0, 0); r == 0 {
+			return win32Error("PostThreadMessageW", errno)
 		}
 		return nil
 	}, nil

@@ -507,22 +507,19 @@ var (
 )
 
 // newNativeWindow создаёт скрытое окно стандартного класса STATIC с заданным
-// заголовком (класс STATIC не нужно регистрировать) и уничтожает его после
-// теста. Окно принадлежит потоку теста, поэтому поток закрепляется.
-func newNativeWindow(t *testing.T, title string) uintptr {
+// заголовком и расширенным стилем (класс STATIC не нужно регистрировать) и
+// уничтожает его после теста. Окно принадлежит потоку теста, поэтому поток
+// закрепляется. Окна GLFW создаются с WS_EX_APPWINDOW (wsExAppWindow) —
+// fixOverlayWindowChrome должна его снять.
+func newNativeWindow(t *testing.T, title string, ex uintptr) uintptr {
 	t.Helper()
 	runtime.LockOSThread()
 	t.Cleanup(runtime.UnlockOSThread)
 
-	// WS_EX_APPWINDOW — как у окон GLFW: ненулевой расширенный стиль, который
-	// fixOverlayWindowChrome должна снять.
-	const (
-		wsPopup       = 0x80000000
-		wsExAppWindow = 0x00040000
-	)
+	const wsPopup = 0x80000000
 	cls, _ := windows.UTF16PtrFromString("STATIC")
 	ttl, _ := windows.UTF16PtrFromString(title)
-	hwnd, _, errno := procCreateWindowExW.Call(wsExAppWindow, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(ttl)),
+	hwnd, _, errno := procCreateWindowExW.Call(ex, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(ttl)),
 		wsPopup, 0, 0, 10, 10, 0, 0, 0, 0)
 	if hwnd == 0 {
 		t.Fatalf("CreateWindowExW: %v", errno)
@@ -530,6 +527,9 @@ func newNativeWindow(t *testing.T, title string) uintptr {
 	t.Cleanup(func() { procDestroyWindow.Call(hwnd) })
 	return hwnd
 }
+
+// wsExAppWindow — WS_EX_APPWINDOW, с которым GLFW создаёт свои окна.
+const wsExAppWindow = 0x00040000
 
 func exStyle(hwnd uintptr) uintptr {
 	var gwlExStyle int32 = -20
@@ -593,10 +593,9 @@ func TestFixOverlayWindowChrome(t *testing.T) {
 	const (
 		wsExToolWindow = 0x80
 		wsExTopmost    = 0x8
-		wsExAppWindow  = 0x00040000
 	)
 	title := uniqueTitle(t, "chrome")
-	hwnd := newNativeWindow(t, title)
+	hwnd := newNativeWindow(t, title, wsExAppWindow)
 
 	if err := fixOverlayWindowChrome(title, false); err != nil {
 		t.Fatalf("topmost=false: %v", err)
@@ -630,7 +629,7 @@ func TestFindOwnTrayWindowAndNotification(t *testing.T) {
 	showNotification("t", "окна трея нет — только запись в лог")
 
 	// Окно класса STATIC нашего процесса изображает окно systray.
-	hwnd := newNativeWindow(t, uniqueTitle(t, "tray"))
+	hwnd := newNativeWindow(t, uniqueTitle(t, "tray"), 0)
 	systrayClassName = "Static"
 	got, err := findOwnTrayWindow()
 	if err != nil || got != windows.Handle(hwnd) {
@@ -1287,7 +1286,7 @@ func TestOnExit(t *testing.T) {
 	})
 	setVar(t, &fyneApp, test.NewTempApp(t))
 	sw := &Switcher{quit: make(chan struct{})}
-	setVar(t, &switcher, sw)
+	setVar(t, &switcher, deviceSwitcher(sw))
 
 	onExit()
 	if stopped != 1 {
@@ -1303,4 +1302,213 @@ func TestOnExit(t *testing.T) {
 	// ничего не падает.
 	switcher, fyneApp = nil, nil
 	onExit()
+}
+
+// ---------------------------------------------------------------------------
+// Меню трея и переключение устройств (с подменёнными systray и Switcher)
+// ---------------------------------------------------------------------------
+
+// fakeSwitcher — deviceSwitcher без COM: записывает вызовы и возвращает
+// заданные результаты.
+type fakeSwitcher struct {
+	setErr   error
+	cycleDev Device
+	cycleErr error
+
+	setIDs []string
+	cycles []int
+	closed bool
+}
+
+func (s *fakeSwitcher) SetDefault(id string) error {
+	s.setIDs = append(s.setIDs, id)
+	return s.setErr
+}
+
+func (s *fakeSwitcher) Cycle(direction int) (Device, error) {
+	s.cycles = append(s.cycles, direction)
+	return s.cycleDev, s.cycleErr
+}
+
+func (s *fakeSwitcher) Close() { s.closed = true }
+
+// fakeTooltip подменяет подсказку трея и возвращает канал, в который
+// приходит каждая выставленная подсказка. announceSwitch выставляет её
+// последней (после неё — только showNotification, которая не трогает
+// подменяемые в тестах переменные), поэтому канал годится и для
+// синхронизации с горутинами меню.
+func fakeTooltip(t *testing.T) <-chan string {
+	t.Helper()
+	tips := make(chan string, 10)
+	setVar(t, &setTrayTooltip, func(s string) { tips <- s })
+	return tips
+}
+
+func TestSelectDevice(t *testing.T) {
+	a, b := &fakeCheckbox{checked: true}, &fakeCheckbox{}
+	setVar(t, &deviceItems, map[string]checkbox{"a": a, "b": b})
+	sw := &fakeSwitcher{}
+	setVar(t, &switcher, deviceSwitcher(sw))
+	tips := fakeTooltip(t)
+
+	selectDevice(Device{ID: "b", Name: "Наушники"})
+	if fmt.Sprint(sw.setIDs) != "[b]" {
+		t.Errorf("SetDefault вызван с %v", sw.setIDs)
+	}
+	if a.checked || !b.checked {
+		t.Errorf("галочки: a=%v b=%v", a.checked, b.checked)
+	}
+	if tip := <-tips; tip != "Volume Switch: Наушники" {
+		t.Errorf("подсказка %q", tip)
+	}
+
+	// Ошибка переключения: ни галочки, ни подсказка не меняются.
+	sw.setErr = errors.New("COM")
+	selectDevice(Device{ID: "a", Name: "Колонки"})
+	if a.checked || !b.checked || len(tips) != 0 {
+		t.Errorf("после ошибки: a=%v b=%v, подсказок %d", a.checked, b.checked, len(tips))
+	}
+}
+
+func TestOnCycle(t *testing.T) {
+	a, b := &fakeCheckbox{checked: true}, &fakeCheckbox{}
+	setVar(t, &deviceItems, map[string]checkbox{"a": a, "b": b})
+	sw := &fakeSwitcher{cycleDev: Device{ID: "b", Name: "Наушники"}}
+	setVar(t, &switcher, deviceSwitcher(sw))
+	tips := fakeTooltip(t)
+
+	onCycle(1)
+	if fmt.Sprint(sw.cycles) != "[1]" || a.checked || !b.checked {
+		t.Errorf("cycles=%v a=%v b=%v", sw.cycles, a.checked, b.checked)
+	}
+	if tip := <-tips; tip != "Volume Switch: Наушники" {
+		t.Errorf("подсказка %q", tip)
+	}
+
+	sw.cycleErr = errors.New("нет устройств")
+	onCycle(-1)
+	if fmt.Sprint(sw.cycles) != "[1 -1]" || !b.checked || len(tips) != 0 {
+		t.Errorf("после ошибки: cycles=%v b=%v, подсказок %d", sw.cycles, b.checked, len(tips))
+	}
+}
+
+func TestBuildDeviceMenu(t *testing.T) {
+	setVar(t, &deviceItems, nil)
+	sw := &fakeSwitcher{}
+	setVar(t, &switcher, deviceSwitcher(sw))
+	tips := fakeTooltip(t)
+
+	type fakeItem struct {
+		title, tooltip string
+		box            *fakeCheckbox
+		clicks         chan struct{}
+	}
+	var items []*fakeItem
+	setVar(t, &addTrayCheckbox, func(title, tooltip string, checked bool) (checkbox, <-chan struct{}) {
+		it := &fakeItem{title: title, tooltip: tooltip, box: &fakeCheckbox{checked: checked}, clicks: make(chan struct{})}
+		items = append(items, it)
+		return it.box, it.clicks
+	})
+
+	buildDeviceMenu([]Device{{ID: "a", Name: "Колонки"}, {ID: "b", Name: "Наушники"}}, "a")
+	if len(items) != 2 || items[0].title != "Колонки" || items[1].title != "Наушники" {
+		t.Fatalf("пункты меню: %+v", items)
+	}
+	if !items[0].box.checked || items[1].box.checked {
+		t.Error("галочка должна стоять на текущем устройстве")
+	}
+
+	// Клик по второму пункту делает его устройством по умолчанию.
+	items[1].clicks <- struct{}{}
+	if tip := <-tips; tip != "Volume Switch: Наушники" {
+		t.Errorf("подсказка %q", tip)
+	}
+	if fmt.Sprint(sw.setIDs) != "[b]" || items[0].box.checked || !items[1].box.checked {
+		t.Errorf("после клика: SetDefault=%v, галочки %v/%v", sw.setIDs, items[0].box.checked, items[1].box.checked)
+	}
+	for _, it := range items {
+		close(it.clicks) // завершить горутины пунктов меню
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ветки ошибок, которые можно вызвать без вреда для системы
+// ---------------------------------------------------------------------------
+
+func TestFixOverlayWindowChromeZeroExStyle(t *testing.T) {
+	// У окон GLFW расширенный стиль никогда не нулевой, поэтому 0 от
+	// GetWindowLongPtrW считается ошибкой.
+	title := uniqueTitle(t, "zero")
+	newNativeWindow(t, title, 0)
+	if err := fixOverlayWindowChrome(title, false); err == nil {
+		t.Error("для окна с нулевым расширенным стилем ожидалась ошибка")
+	}
+}
+
+func TestLogRegistryCloseError(t *testing.T) {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software`, registry.QUERY_VALUE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Close(); err != nil {
+		t.Fatal(err)
+	}
+	logRegistryClose(k, "уже закрытый") // повторное закрытие — ошибка только в лог
+}
+
+func setRegistryDWord(t *testing.T, path, name string, value uint32) {
+	t.Helper()
+	k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	if err := k.SetDWordValue(name, value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegistryValuesOfWrongType(t *testing.T) {
+	// Значения не строкового типа: не «нет значения», а ошибка чтения —
+	// логируется, результат как при отсутствии значения.
+	path := tempRegistryKey(t)
+	setRegistryDWord(t, path, autostartValueName, 1)
+	setRegistryDWord(t, path, "ExePath", 1)
+
+	setVar(t, &autostartRegistryPath, path)
+	if isAutostartEnabled() {
+		t.Error("DWORD вместо строки: автозапуск считается включённым")
+	}
+	setVar(t, &mpcRegistryPath, path)
+	if got := mpcExeFromRegistry(); got != "" {
+		t.Errorf("DWORD вместо строки: ExePath = %q", got)
+	}
+}
+
+// truncatedServer обещает в Content-Length больше, чем отдаёт: сервер
+// закрывает соединение, клиент получает ошибку при чтении тела.
+func truncatedServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte("<p id="))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestFetchStateTruncatedBody(t *testing.T) {
+	srv := truncatedServer(t)
+	if _, err := fetchState(srv.URL, srv.Client()); err == nil {
+		t.Error("оборванный ответ: ожидалась ошибка")
+	}
+}
+
+func TestToggleMPCPlaybackTruncatedBody(t *testing.T) {
+	started := fakeStart(t, nil)
+	srv := truncatedServer(t)
+	toggleMPCPlayback(srv.URL + "/variables.html") // ошибка чтения только в лог
+	if len(*started) != 0 {
+		t.Error("ответ получен — MPC-HC запускать не нужно")
+	}
 }

@@ -1,0 +1,40 @@
+name: release
+
+# Публикует релиз с собранным volume_switch.exe при пуше тега вида v1.2.3:
+#   git tag v1.2.3 && git push origin v1.2.3
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # -H=windowsgui — GUI subsystem, без окна консоли (см. README, «Сборка»);
+      # -s -w убирают отладочную информацию и заметно уменьшают exe.
+      - name: Build
+        shell: bash
+        run: go build -trimpath -ldflags "-H=windowsgui -s -w" -o volume_switch.exe .
+
+      # При перезапуске job релиз уже существует — тогда exe просто
+      # перезаливается в него.
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" volume_switch.exe --clobber
+          else
+            gh release create "$TAG" volume_switch.exe --title "$TAG" --generate-notes
+          fi

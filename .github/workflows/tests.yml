@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Программа использует Win32/COM API (golang.org/x/sys/windows, WASAPI),
+    # поэтому собирается и тестируется только под Windows.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Fyne (GLFW/OpenGL) и -race требуют cgo, то есть gcc в PATH.
+      - name: Check gcc
+        run: gcc --version
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 -v ./...

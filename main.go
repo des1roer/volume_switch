@@ -1,6 +1,7 @@
 // Command volume_switch sits in the system tray. F5 toggles an MPC-HC
 // progress overlay window, F7/F8 cycle the default Windows playback
-// device, the same way Volume2 does.
+// device, the same way Volume2 does, and F3/F4 lower/raise the master
+// volume.
 package main
 
 import (
@@ -109,6 +110,7 @@ var (
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procGetMessageW         = user32.NewProc("GetMessageW")
+	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	procPeekMessageW        = user32.NewProc("PeekMessageW")
 	procPostThreadMessageW  = user32.NewProc("PostThreadMessageW")
 
@@ -632,20 +634,67 @@ func (s *Switcher) CurrentVolume() (volumeReading, error) {
 	return execValue(s, s.currentVolumeLocked)
 }
 
-func (s *Switcher) currentVolumeLocked() (volumeReading, error) {
+// StepVolume меняет громкость текущего default-устройства на delta (доля
+// шкалы 0..1; отрицательная — тише) и, как клавиши громкости Windows,
+// снимает mute.
+func (s *Switcher) StepVolume(delta float64) error {
+	return s.exec(func() error { return s.stepVolumeLocked(delta) })
+}
+
+// stepLevel возвращает уровень громкости после шага delta: в пределах 0..1
+// и округлённый до целого процента, чтобы ошибки float32 не копились от
+// нажатия к нажатию.
+func stepLevel(level, delta float64) float64 {
+	return min(max(math.Round((level+delta)*100)/100, 0), 1)
+}
+
+// endpointVolumeLocked возвращает ID текущего default-устройства и его
+// IAudioEndpointVolume; вызывающий освобождает aev.
+func (s *Switcher) endpointVolumeLocked() (string, *wca.IAudioEndpointVolume, error) {
 	var dev *wca.IMMDevice
 	if err := s.mmde.GetDefaultAudioEndpoint(wca.ERender, wca.EConsole, &dev); err != nil {
-		return volumeReading{}, err
+		return "", nil, err
 	}
 	defer dev.Release()
 
 	id, err := deviceID(dev)
 	if err != nil {
-		return volumeReading{}, err
+		return "", nil, err
 	}
-
 	var aev *wca.IAudioEndpointVolume
 	if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+		return "", nil, err
+	}
+	return id, aev, nil
+}
+
+func (s *Switcher) stepVolumeLocked(delta float64) error {
+	_, aev, err := s.endpointVolumeLocked()
+	if err != nil {
+		return err
+	}
+	defer aev.Release()
+
+	var scalar float32
+	if err := aev.GetMasterVolumeLevelScalar(&scalar); err != nil {
+		return err
+	}
+	if err := aev.SetMasterVolumeLevelScalar(float32(stepLevel(float64(scalar), delta)), nil); err != nil {
+		return err
+	}
+	// SetMute без изменения состояния возвращает S_FALSE, а go-wca считает
+	// ошибкой любой ненулевой HRESULT, поэтому mute снимается, только если
+	// он действительно включён.
+	var muted bool
+	if err := aev.GetMute(&muted); err != nil || !muted {
+		return err
+	}
+	return aev.SetMute(false, nil)
+}
+
+func (s *Switcher) currentVolumeLocked() (volumeReading, error) {
+	id, aev, err := s.endpointVolumeLocked()
+	if err != nil {
 		return volumeReading{}, err
 	}
 	defer aev.Release()
@@ -1647,6 +1696,7 @@ var (
 type deviceSwitcher interface {
 	SetDefault(id string) error
 	Cycle(direction int) (Device, error)
+	StepVolume(delta float64) error
 	Close()
 }
 
@@ -1838,6 +1888,8 @@ func onReady(debug bool) {
 	}()
 
 	stopHotkeys, err = startHotkeys(map[uint32]func(){
+		vkF3: func() { log.Printf("hotkey: F3"); onVolumeKey(-volumeKeyStep) },
+		vkF4: func() { log.Printf("hotkey: F4"); onVolumeKey(volumeKeyStep) },
 		vkF5: func() { log.Printf("hotkey: F5"); toggleMPCWindow() },
 		vkF7: func() { log.Printf("hotkey: F7"); onCycle(-1) },
 		vkF8: func() { log.Printf("hotkey: F8"); onCycle(1) },
@@ -1845,7 +1897,7 @@ func onReady(debug bool) {
 	if err != nil {
 		log.Printf("hotkey: не удалось установить хук: %v", err)
 	} else {
-		log.Printf("hotkey: хук установлен (F5/F7/F8)")
+		log.Printf("hotkey: хук установлен (F3/F4/F5/F7/F8)")
 	}
 
 	// Колбэк вызывается из горутины поллера; вся работа с UI внутри
@@ -1902,6 +1954,18 @@ func selectDevice(dev Device) {
 	announceSwitch(dev)
 }
 
+// volumeKeyStep — шаг громкости по F3/F4, как у мультимедийных клавиш
+// громкости Windows (2% шкалы).
+const volumeKeyStep = 0.02
+
+// onVolumeKey меняет общую громкость на delta. Оверлей громкости отдельно
+// не показывается — его поднимает pollVolume, увидев изменение уровня.
+func onVolumeKey(delta float64) {
+	if err := switcher.StepVolume(delta); err != nil {
+		log.Printf("audio: StepVolume(%+.2f) failed: %v", delta, err)
+	}
+}
+
 func onCycle(direction int) {
 	log.Printf("audio: Cycle direction=%d", direction)
 	dev, err := switcher.Cycle(direction)
@@ -1933,18 +1997,49 @@ func setChecked(checkedID string) {
 }
 
 // ---------------------------------------------------------------------------
-// Глобальный хук клавиатуры Windows (F5/F7/F8)
+// Глобальный хук клавиатуры Windows (F3/F4/F5/F7/F8)
 // ---------------------------------------------------------------------------
 
 const (
 	whKeyboardLL = 13
 	wmKeyDown    = 0x0100
 	wmSysKeyDown = 0x0104
+	llkhfAltDown = 0x20 // KBDLLHOOKSTRUCT.Flags: зажат Alt
 
+	vkShift   = 0x10
+	vkControl = 0x11
+	vkLWin    = 0x5B
+	vkRWin    = 0x5C
+
+	vkF3 = 0x72
+	vkF4 = 0x73
 	vkF5 = 0x74
 	vkF7 = 0x76
 	vkF8 = 0x77
 )
+
+// keyHeld сообщает, зажата ли сейчас клавиша vk. Переменная только ради
+// тестов: настоящее состояние клавиатуры в тесте не задать.
+var keyHeld = func(vk uintptr) bool {
+	r, _, _ := procGetAsyncKeyState.Call(vk)
+	return r&0x8000 != 0
+}
+
+// modifierHeld сообщает, нажата ли клавиша вместе с Alt, Ctrl, Shift или
+// Win. Такие сочетания хоткеями не считаются и уходят программам: иначе хук
+// съедал бы Alt+F4 (закрыть окно), Ctrl+F4 (закрыть вкладку), Shift+F3,
+// Ctrl+F5 и т.п.
+func modifierHeld(kb *kbdllHookStruct) bool {
+	if kb.Flags&llkhfAltDown != 0 {
+		return true
+	}
+	for _, vk := range []uintptr{vkShift, vkControl, vkLWin, vkRWin} {
+		if keyHeld(vk) {
+			return true
+		}
+	}
+	return false
+}
 
 type kbdllHookStruct struct {
 	VkCode      uint32
@@ -2027,9 +2122,10 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 	}, nil
 }
 
-// hookProc — процедура хука WH_KEYBOARD_LL. Наши клавиши «съедаются»
-// (возврат 1), обработчик запускается в отдельной горутине, чтобы хук
-// возвращался быстро; остальные передаются дальше по цепочке хуков.
+// hookProc — процедура хука WH_KEYBOARD_LL. Наши клавиши без модификаторов
+// «съедаются» (возврат 1), обработчик запускается в отдельной горутине,
+// чтобы хук возвращался быстро; остальные, включая наши клавиши с
+// Alt/Ctrl/Shift/Win, передаются дальше по цепочке хуков.
 //
 // lParam хука — указатель на KBDLLHOOKSTRUCT в памяти Windows;
 // syscall.NewCallback сразу отдаёт его типизированным указателем, без
@@ -2039,7 +2135,7 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 // признак ошибки, поэтому третье значение Call здесь не нужно.
 func hookProc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
 	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
-		if handler := hotkeys[kb.VkCode]; handler != nil {
+		if handler := hotkeys[kb.VkCode]; handler != nil && !modifierHeld(kb) {
 			go handler()
 			return 1
 		}

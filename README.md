@@ -16,7 +16,7 @@
 - Пункт меню «Запускать при входе в Windows» (с галочкой) включает/выключает автозапуск через `HKCU\...\Run`.
 - Всплывающее уведомление при каждом переключении с именем нового устройства.
 - Оверлей-ползунок уровня глобальной громкости в четверть экрана (в левом нижнем углу монитора под курсором), с большим процентом/`MUTE` и шкалой-градацией 0—100 через каждые 10, при любом изменении громкости — клавишами, колесом мыши в системном микшере, аппаратными кнопками или сторонними программами. Изменение детектируется поллингом текущего уровня каждые 120 мс (`Switcher.CurrentVolume`, `pollVolume`), а не перехватом конкретных клавиш, поэтому ловится независимо от источника. Переключение default-устройства (F7/F8, трей, панель задач Windows) оверлей НЕ показывает, даже если у нового устройства другой сохранённый уровень громкости — поллер сравнивает уровень только в рамках одного и того же устройства (по ID). Гаснет сам примерно через 1.2 секунды после последнего изменения.
-- **F5** показывает/скрывает окно-оверлей поверх всех окон (не забирая фокус), которое опрашивает веб-интерфейс MPC-HC (`variables.html`) и отображает название/прогресс/прошедшее/оставшееся время.
+- **F5** показывает/скрывает окно-оверлей поверх всех окон (не забирая фокус), которое опрашивает JSON API веб-интерфейса MPC-HC (`status.json`) и отображает название/прогресс/прошедшее/оставшееся время.
 - Клик средней кнопкой мыши (колесом) по оверлею открывает в проводнике папку с текущим файлом (с выделением самого файла).
 - Клик левой кнопкой по полосе прогресса ставит воспроизведение на паузу/возобновляет его; если MPC-HC не запущен — запускает его (путь берётся из `MPC_EXE`, по умолчанию `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, а если такого файла нет — из `HKCU\Software\MPC-HC\MPC-HC\ExePath`, который MPC-HC пишет сам).
 - Необязательный файл `.env` для конфигурации; при отсутствии используются переменные окружения, затем флаги.
@@ -64,7 +64,7 @@ Workflow собирает exe с вшитой версией, создаёт Git
 
 - Go 1.27.1+ (как в `go.mod`)
 - Windows (использует `syscall`/`golang.org/x/sys/windows` и вызовы WinAPI напрямую; не соберётся и не запустится на других платформах)
-- Опционально: MPC-HC с включённым веб-интерфейсом, отдающий `http://localhost:7777/variables.html` (нужен только для оверлея по F5)
+- Опционально: MPC-HC 2.x (форк clsid2, его ставит K-Lite) с включённым веб-интерфейсом на `http://localhost:7777` — нужен только для оверлея по F5; состояние берётся из `status.json`
 
 ## Сборка
 
@@ -107,7 +107,7 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 | Флаг        | Переменная окр. | По умолчанию                           | Значение                            |
 |-------------|-----------------|----------------------------------------|-------------------------------------|
 | `-debug`    | —               | `false`                                | Показывать консоль с логами отладки |
-| `-url`      | `MPC_URL`       | `http://localhost:7777/variables.html` | URL `variables.html` MPC-HC         |
+| `-url`      | `MPC_URL`       | `http://localhost:7777/`               | Адрес веб-интерфейса MPC-HC (корень или любая его страница — имя страницы заменяется на `status.json`/`command.html`) |
 | `-interval` | `MPC_INTERVAL`  | `500ms`                                | Интервал опроса для оверлея         |
 | —           | `MPC_EXE`       | `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe` | Путь к MPC-HC для запуска по клику  |
 
@@ -126,7 +126,7 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 
 1. Логирование (`ensureConsole`, `setupLogging`)
 2. Загрузка `.env` (`dotEnvPaths`, `loadDotEnv`)
-3. Парсинг `variables.html` MPC-HC (на регулярках, `fetchState`/`MPCState`)
+3. Состояние MPC-HC через JSON API веб-интерфейса (`status.json`, `fetchState`/`MPCState`, `mpcEndpoint`)
 4. Хелперы Win32: монитор под курсором и высота заголовка окна (`screenLayout`, `titleBarHeight`)
 5. Переключение аудиоустройств и шаг громкости через WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
 6. Монитор глобальной громкости поллингом (`Switcher.CurrentVolume`, `pollVolume`)
@@ -168,7 +168,7 @@ Written for my own use as a Volume² replacement on Windows 11: its overlay and 
 - The "Запускать при входе в Windows" ("Run at Windows sign-in") menu item, with a checkmark, enables/disables autostart via `HKCU\...\Run`.
 - A balloon notification with the new device name on every switch.
 - A quarter-screen master volume slider overlay (in the bottom-left corner of the monitor under the cursor) with a large percentage/`MUTE` and a 0—100 scale marked every 10, shown on any volume change — by hotkeys, the mouse wheel in the system mixer, hardware buttons or third-party programs. Changes are detected by polling the current level every 120 ms (`Switcher.CurrentVolume`, `pollVolume`) rather than by intercepting specific keys, so they are caught regardless of the source. Switching the default device (F7/F8, tray, Windows taskbar) does NOT show the overlay, even if the new device has a different saved volume level — the poller compares levels only within the same device (by ID). It fades out by itself about 1.2 seconds after the last change.
-- **F5** shows/hides an always-on-top overlay window (without stealing focus) that polls the MPC-HC web interface (`variables.html`) and displays the title/progress/elapsed/remaining time.
+- **F5** shows/hides an always-on-top overlay window (without stealing focus) that polls the MPC-HC web interface JSON API (`status.json`) and displays the title/progress/elapsed/remaining time.
 - A middle-click (wheel click) on the overlay opens the folder of the current file in Explorer, with the file itself selected.
 - A left click on the progress bar pauses/resumes playback; if MPC-HC is not running, it launches it (the path comes from `MPC_EXE`, by default `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, and if that file doesn't exist — from `HKCU\Software\MPC-HC\MPC-HC\ExePath`, which MPC-HC writes itself).
 - An optional `.env` file for configuration; environment variables and then flags take precedence over it.
@@ -216,7 +216,7 @@ The workflow builds the exe with the version embedded, creates a GitHub Release 
 
 - Go 1.27.1+ (as in `go.mod`)
 - Windows (uses `syscall`/`golang.org/x/sys/windows` and WinAPI calls directly; won't build or run on other platforms)
-- Optional: MPC-HC with the web interface enabled, serving `http://localhost:7777/variables.html` (needed only for the F5 overlay)
+- Optional: MPC-HC 2.x (the clsid2 fork, installed by K-Lite) with the web interface enabled at `http://localhost:7777` — needed only for the F5 overlay; the state is read from `status.json`
 
 ## Building
 
@@ -258,7 +258,7 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 | Flag        | Env variable    | Default                                | Meaning                             |
 |-------------|-----------------|----------------------------------------|-------------------------------------|
 | `-debug`    | —               | `false`                                | Show a console with debug logs      |
-| `-url`      | `MPC_URL`       | `http://localhost:7777/variables.html` | MPC-HC `variables.html` URL         |
+| `-url`      | `MPC_URL`       | `http://localhost:7777/`               | MPC-HC web interface address (the root or any of its pages — the page name is replaced with `status.json`/`command.html`) |
 | `-interval` | `MPC_INTERVAL`  | `500ms`                                | Polling interval for the overlay    |
 | —           | `MPC_EXE`       | `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe` | Path to MPC-HC to launch on click   |
 
@@ -277,7 +277,7 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 
 1. Logging (`ensureConsole`, `setupLogging`)
 2. `.env` loading (`dotEnvPaths`, `loadDotEnv`)
-3. Parsing MPC-HC `variables.html` (regex-based, `fetchState`/`MPCState`)
+3. MPC-HC state via the web interface JSON API (`status.json`, `fetchState`/`MPCState`, `mpcEndpoint`)
 4. Win32 helpers: monitor under the cursor and window title bar height (`screenLayout`, `titleBarHeight`)
 5. Audio device switching and volume stepping via WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
 6. Master volume monitoring by polling (`Switcher.CurrentVolume`, `pollVolume`)

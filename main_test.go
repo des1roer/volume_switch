@@ -364,7 +364,7 @@ func TestMPCExePathFromEnv(t *testing.T) {
 func TestHookProc(t *testing.T) {
 	called := make(chan uint32, 1)
 	setVar(t, &hotkeys, map[uint32]func(){
-		vkF4: func() { called <- vkF4 },
+		vkF3: func() { called <- vkF3 },
 		vkF5: func() { called <- vkF5 },
 		vkF8: func() { called <- vkF8 },
 	})
@@ -373,7 +373,7 @@ func TestHookProc(t *testing.T) {
 	held := map[uintptr]bool{}
 	setVar(t, &keyHeld, func(vk uintptr) bool { return held[vk] })
 
-	for _, vk := range []uint32{vkF4, vkF5, vkF8} {
+	for _, vk := range []uint32{vkF3, vkF5, vkF8} {
 		if r := hookProc(0, wmKeyDown, &kbdllHookStruct{VkCode: vk}); r != 1 {
 			t.Errorf("vk=%#x: hookProc = %d, want 1 (клавиша съедена)", vk, r)
 		}
@@ -388,7 +388,7 @@ func TestHookProc(t *testing.T) {
 	}
 
 	// Чужая клавиша, отпускание нашей клавиши, nCode < 0 и наши клавиши с
-	// модификаторами (Alt+F4 должен закрывать окно!) уходят дальше по цепочке
+	// модификаторами (Shift+F3 — «найти назад»!) уходят дальше по цепочке
 	// хуков (CallNextHookEx без хуков возвращает 0) и обработчики не вызывают.
 	for _, tc := range []struct {
 		name   string
@@ -401,8 +401,8 @@ func TestHookProc(t *testing.T) {
 		{name: "чужая клавиша", wParam: wmKeyDown, vk: 0x41},
 		{name: "отпускание F5", wParam: 0x0101, vk: vkF5}, // WM_KEYUP
 		{name: "nCode < 0", nCode: -1, wParam: wmKeyDown, vk: vkF5},
-		{name: "Alt+F4", wParam: wmSysKeyDown, vk: vkF4, flags: llkhfAltDown},
-		{name: "Ctrl+F4", wParam: wmKeyDown, vk: vkF4, held: vkControl},
+		{name: "Alt+F3", wParam: wmSysKeyDown, vk: vkF3, flags: llkhfAltDown},
+		{name: "Ctrl+F3", wParam: wmKeyDown, vk: vkF3, held: vkControl},
 		{name: "Shift+F5", wParam: wmKeyDown, vk: vkF5, held: vkShift},
 		{name: "Win+F8", wParam: wmKeyDown, vk: vkF8, held: vkRWin},
 	} {
@@ -419,6 +419,82 @@ func TestHookProc(t *testing.T) {
 		t.Errorf("лишний вызов обработчика %#x", got)
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+func TestHookProcToggle(t *testing.T) {
+	called := make(chan uint32, 1)
+	setVar(t, &hotkeys, map[uint32]func(){vkF2: func() { called <- vkF2 }})
+	held := map[uintptr]bool{}
+	setVar(t, &keyHeld, func(vk uintptr) bool { return held[vk] })
+	setVar(t, &systrayClassName, uniqueTitle(t, "NoSuchClass"))
+	sounds := make(chan string, 1)
+	setVar(t, &playSystemSound, func(alias string) { sounds <- alias })
+	t.Cleanup(func() { hotkeysDisabled.Store(false); toggleKeyDown = false })
+
+	press := func(wParam uintptr) uintptr {
+		return hookProc(0, wParam, &kbdllHookStruct{VkCode: vkF2})
+	}
+	// toggle нажимает и отпускает Ctrl+F2 и ждёт звука уведомления (заодно
+	// это синхронизация с горутиной announceHotkeys).
+	toggle := func(wantDisabled bool, wantSound string) {
+		t.Helper()
+		held[vkControl] = true
+		if r := press(wmKeyDown); r != 1 {
+			t.Errorf("Ctrl+F2: hookProc = %d, want 1", r)
+		}
+		if r := press(wmKeyDown); r != 1 { // автоповтор: съеден, но не переключает
+			t.Errorf("автоповтор Ctrl+F2: hookProc = %d, want 1", r)
+		}
+		press(wmKeyUp)
+		held[vkControl] = false
+		if hotkeysDisabled.Load() != wantDisabled {
+			t.Fatalf("hotkeysDisabled = %v, want %v", !wantDisabled, wantDisabled)
+		}
+		select {
+		case got := <-sounds:
+			if got != wantSound {
+				t.Errorf("звук %q, want %q", got, wantSound)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("звук не проигран")
+		}
+	}
+
+	toggle(true, "DeviceDisconnect")
+	// Выключенный хоткей уходит программам и обработчик не вызывает.
+	if r := press(wmKeyDown); r != 0 {
+		t.Errorf("F2 при выключенных хоткеях: hookProc = %d, want 0", r)
+	}
+
+	// Ctrl+Shift+F2 — не переключатель.
+	held[vkControl], held[vkShift] = true, true
+	if r := press(wmKeyDown); r != 0 || !hotkeysDisabled.Load() {
+		t.Errorf("Ctrl+Shift+F2: hookProc = %d, disabled = %v", r, hotkeysDisabled.Load())
+	}
+	press(wmKeyUp)
+	clear(held)
+
+	toggle(false, "DeviceConnect")
+	if r := press(wmKeyDown); r != 1 {
+		t.Errorf("F2 после включения: hookProc = %d, want 1", r)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("обработчик F2 не вызван")
+	}
+	select {
+	case got := <-sounds:
+		t.Errorf("лишний звук %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestPlaySystemSound(t *testing.T) {
+	// Несуществующий псевдоним с SND_NODEFAULT ничего не играет — проверяется
+	// только, что вызов не падает (ошибка, если будет, уйдёт в лог).
+	playSystemSound(uniqueTitle(t, "NoSuchSound"))
+	playSystemSound("bad\x00alias")
 }
 
 func TestVolumeChanged(t *testing.T) {
@@ -666,7 +742,7 @@ func TestFindOwnTrayWindowAndNotification(t *testing.T) {
 	if hwnd, err := findOwnTrayWindow(); err != nil || hwnd != 0 {
 		t.Fatalf("без окна трея: hwnd=%v err=%v", hwnd, err)
 	}
-	showNotification("t", "окна трея нет — только запись в лог")
+	showNotification("t", "окна трея нет — только запись в лог", false)
 
 	// Окно класса STATIC нашего процесса изображает окно systray.
 	hwnd := newNativeWindow(t, uniqueTitle(t, "tray"), 0)
@@ -677,7 +753,7 @@ func TestFindOwnTrayWindowAndNotification(t *testing.T) {
 	}
 	// Иконки трея у этого окна нет, поэтому Shell_NotifyIcon вернёт ошибку,
 	// которая уйдёт в лог; ничего не показывается.
-	showNotification("t", "b")
+	showNotification("t", "b", true)
 }
 
 func TestAcquireSingleInstance(t *testing.T) {
@@ -1614,7 +1690,7 @@ func TestToggleMPCPlaybackTruncatedBody(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Громкость по F3/F4
+// Громкость по F2/F3
 // ---------------------------------------------------------------------------
 
 func TestStepLevel(t *testing.T) {

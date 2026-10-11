@@ -2,15 +2,16 @@
 
 *English version: [below](#english).*
 
-Утилита для системного трея Windows в духе [Volume²](https://github.com/irzyxa/Volume2): **F7/F8** переключают устройство воспроизведения звука по умолчанию, **F3/F4** убавляют/прибавляют общую громкость, а **F5** показывает/скрывает встроенное окно-оверлей с прогрессом MPC-HC.
+Утилита для системного трея Windows в духе [Volume²](https://github.com/irzyxa/Volume2): **F7/F8** переключают устройство воспроизведения звука по умолчанию, **F2/F3** убавляют/прибавляют общую громкость, а **F5** показывает/скрывает встроенное окно-оверлей с прогрессом MPC-HC.
 
 Написана для себя как замена Volume² на Windows 11: там его оверлей и хоткеи стали подлагивать, а в логе периодически появляется падение в `ShowOSDWindow` ([irzyxa/Volume2#426](https://github.com/irzyxa/Volume2/issues/426)). Сюда вошло только то, чем я пользовался в Volume², — переключение устройства и громкость с оверлеем — плюс оверлей прогресса MPC-HC.
 
 ## Возможности
 
 - Глобальные горячие клавиши **F7/F8** переключают устройство воспроизведения Windows по умолчанию (роли console, multimedia и communications переключаются вместе с ним).
-- **F3/F4** убавляют/прибавляют общую громкость текущего устройства на 2% (как мультимедийные клавиши Windows) и, как и они, снимают mute; при этом показывается оверлей громкости.
+- **F2/F3** убавляют/прибавляют общую громкость текущего устройства на 2% (как мультимедийные клавиши Windows) и, как и они, снимают mute; при этом показывается оверлей громкости.
 - Горячие клавиши срабатывают только без модификаторов: сочетания с Alt/Ctrl/Shift/Win (Alt+F4, Ctrl+F4, Shift+F3, Ctrl+F5 и т.п.) передаются программам как обычно.
+- **Ctrl+F2** выключает/включает все остальные горячие клавиши (например, на время игры): выключенные F2/F3/F5/F7/F8 уходят программам как обычные клавиши. При переключении показывается уведомление, как при смене устройства, и звучит системный звук подключения/отключения устройства.
 - Меню в трее содержит список всех активных устройств воспроизведения с галочкой на текущем устройстве по умолчанию; клик по любой записи переключает на неё напрямую.
 - Пункт меню «Запускать при входе в Windows» (с галочкой) включает/выключает автозапуск через `HKCU\...\Run`.
 - Всплывающее уведомление при каждом переключении с именем нового устройства.
@@ -105,7 +106,7 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 8. Генерация иконки трея во время выполнения (`trayIconData`, PNG, обёрнутый в минимальный контейнер `.ico` — без внешнего файла ресурсов)
 9. Встроенное окно-оверлей Fyne (`runFyne`, `toggleMPCWindow`); `clickCatcher` ловит клик средней кнопкой мыши и открывает папку с файлом (`openContainingFolder`, `explorer /select,`); второй оверлей — ползунок громкости с градацией (`volumeWindow`, `showVolumeOverlay`, `layoutVolumeOverlay`)
 10. Подключение systray + меню устройств (`main`, `onReady`, `onExit`, `buildDeviceMenu`, `selectDevice`, `onCycle`)
-11. Глобальный низкоуровневый хук клавиатуры для F3/F4/F5/F7/F8 (`startHotkeys`, `hookProc`, `WH_KEYBOARD_LL`)
+11. Глобальный низкоуровневый хук клавиатуры для F2/F3/F5/F7/F8 и Ctrl+F2 (`startHotkeys`, `hookProc`, `WH_KEYBOARD_LL`)
 
 **Ключевые типы / инварианты:**
 
@@ -125,15 +126,16 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 
 # volume_switch (English)
 
-A Windows system tray utility in the spirit of [Volume²](https://github.com/irzyxa/Volume2): **F7/F8** switch the default audio playback device, **F3/F4** lower/raise the master volume, and **F5** shows/hides a built-in overlay window with MPC-HC playback progress.
+A Windows system tray utility in the spirit of [Volume²](https://github.com/irzyxa/Volume2): **F7/F8** switch the default audio playback device, **F2/F3** lower/raise the master volume, and **F5** shows/hides a built-in overlay window with MPC-HC playback progress.
 
 Written for my own use as a Volume² replacement on Windows 11: its overlay and hotkeys started to lag there, and its log periodically shows a crash in `ShowOSDWindow` ([irzyxa/Volume2#426](https://github.com/irzyxa/Volume2/issues/426)). It includes only what I actually used in Volume² — device switching and volume with an overlay — plus an MPC-HC progress overlay.
 
 ## Features
 
 - Global hotkeys **F7/F8** switch the Windows default playback device (the console, multimedia and communications roles are switched together).
-- **F3/F4** lower/raise the master volume of the current device by 2% (like the Windows multimedia keys) and, like them, unmute; the volume overlay is shown.
+- **F2/F3** lower/raise the master volume of the current device by 2% (like the Windows multimedia keys) and, like them, unmute; the volume overlay is shown.
 - Hotkeys fire only without modifiers: combinations with Alt/Ctrl/Shift/Win (Alt+F4, Ctrl+F4, Shift+F3, Ctrl+F5, etc.) are passed to applications as usual.
+- **Ctrl+F2** turns all the other hotkeys off and back on (e.g. while gaming): when off, F2/F3/F5/F7/F8 reach applications as ordinary keys. Each toggle shows a notification, like a device switch, and plays the system device connect/disconnect sound.
 - The tray menu lists all active playback devices with a checkmark on the current default; clicking any entry switches to it directly.
 - The "Запускать при входе в Windows" ("Run at Windows sign-in") menu item, with a checkmark, enables/disables autostart via `HKCU\...\Run`.
 - A balloon notification with the new device name on every switch.
@@ -227,7 +229,7 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 8. Tray icon generation at runtime (`trayIconData`, a PNG wrapped in a minimal `.ico` container, no external resource file)
 9. Built-in Fyne overlay window (`runFyne`, `toggleMPCWindow`); `clickCatcher` catches the middle click and opens the file's folder (`openContainingFolder`, `explorer /select,`); the second overlay is the volume slider with a scale (`volumeWindow`, `showVolumeOverlay`, `layoutVolumeOverlay`)
 10. Systray wiring + device menu (`main`, `onReady`, `onExit`, `buildDeviceMenu`, `selectDevice`, `onCycle`)
-11. Global low-level keyboard hook for F3/F4/F5/F7/F8 (`startHotkeys`, `hookProc`, `WH_KEYBOARD_LL`)
+11. Global low-level keyboard hook for F2/F3/F5/F7/F8 and Ctrl+F2 (`startHotkeys`, `hookProc`, `WH_KEYBOARD_LL`)
 
 **Key types / invariants:**
 

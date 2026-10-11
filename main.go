@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,10 +18,10 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -49,7 +50,7 @@ import (
 )
 
 const (
-	defaultURL      = "http://localhost:7777/variables.html"
+	defaultURL      = "http://localhost:7777/" // корень web-интерфейса MPC-HC
 	defaultInterval = 500 * time.Millisecond
 	logFileName     = "volume_switch.log"
 	appDirName      = "volume_switch" // каталог программы в %LOCALAPPDATA%: лог и .env
@@ -313,52 +314,55 @@ func loadDotEnv(path string) {
 }
 
 // ---------------------------------------------------------------------------
-// Разбор variables.html MPC-HC
+// Состояние MPC-HC через JSON API web-интерфейса (status.json)
 // ---------------------------------------------------------------------------
 
-// mpcField собирает регулярку для поля <p id="...">значение</p> страницы.
-func mpcField(id string) *regexp.Regexp {
-	return regexp.MustCompile(`<p id="` + id + `">([^<]*)</p>`)
-}
-
-var (
-	rePosition    = mpcField("position")
-	reDuration    = mpcField("duration")
-	rePositionStr = mpcField("positionstring")
-	reStateString = mpcField("statestring")
-	reFile        = mpcField("file")
-	reFilePath    = mpcField("filepath")
-)
-
+// MPCState — ответ /status.json web-интерфейса MPC-HC. Из JSON берутся только
+// поля, нужные оверлею; позиция и длительность — в миллисекундах. Без
+// открытого файла MPC-HC отдаёт пустые строки и нули.
 type MPCState struct {
-	Position    int64
-	Duration    int64
-	PositionStr string
-	StateString string
-	File        string
-	FilePath    string
+	File        string `json:"file"`
+	FilePath    string `json:"path"`
+	StateString string `json:"stateString"`
+	Position    int64  `json:"position"`
+	Duration    int64  `json:"duration"`
 }
 
-// extractInt возвращает 0, если поля в странице нет или оно пустое (MPC-HC
-// без открытого файла), и ошибку, если число в поле не разбирается.
-func extractInt(html string, re *regexp.Regexp) (int64, error) {
-	s := strings.TrimSpace(extractStr(html, re))
-	if s == "" {
-		return 0, nil
-	}
-	return strconv.ParseInt(s, 10, 64)
-}
-
-func extractStr(html string, re *regexp.Regexp) string {
-	m := re.FindStringSubmatch(html)
-	if len(m) < 2 {
+// mpcEndpoint строит URL страницы web-интерфейса MPC-HC из адреса MPC_URL:
+// последний сегмент пути заменяется на page (page может содержать query), а
+// прежние query и fragment отбрасываются. Поэтому в MPC_URL годится и корень
+// web-интерфейса, и любая его страница — например, прежнее значение по
+// умолчанию variables.html:
+//
+//	http://localhost:7777                + status.json -> http://localhost:7777/status.json
+//	http://localhost:7777/variables.html + status.json -> http://localhost:7777/status.json
+//
+// Пустой или неразбираемый адрес даёт пустую строку.
+func mpcEndpoint(base, page string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
 		return ""
 	}
-	return m[1]
+	b, err := url.Parse(base)
+	if err != nil {
+		return ""
+	}
+	ref, err := url.Parse(page)
+	if err != nil {
+		return ""
+	}
+	return b.ResolveReference(ref).String()
 }
 
-func fetchState(url string, client *http.Client) (_ *MPCState, err error) {
-	resp, err := client.Get(url)
+// fetchState запрашивает состояние плеера из /status.json. Эта страница есть
+// в MPC-HC 2.x (форк clsid2, его же ставит K-Lite); у старых версий её нет —
+// тогда приходит 404.
+func fetchState(baseURL string, client *http.Client) (_ *MPCState, err error) {
+	statusURL := mpcEndpoint(baseURL, "status.json")
+	if statusURL == "" {
+		return nil, fmt.Errorf("некорректный адрес web-интерфейса %q", baseURL)
+	}
+	resp, err := client.Get(statusURL)
 	if err != nil {
 		return nil, err
 	}
@@ -367,33 +371,19 @@ func fetchState(url string, client *http.Client) (_ *MPCState, err error) {
 			err = fmt.Errorf("закрытие ответа: %w", cerr)
 		}
 	}()
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return nil, fmt.Errorf("HTTP %s: нет status.json — нужен MPC-HC 2.x", resp.Status)
+	default:
 		return nil, fmt.Errorf("HTTP %s", resp.Status)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	var st MPCState
+	if err = json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return nil, fmt.Errorf("разбор status.json: %w", err)
 	}
-	html := string(body)
-
-	position, err := extractInt(html, rePosition)
-	if err != nil {
-		return nil, fmt.Errorf("position: %w", err)
-	}
-	duration, err := extractInt(html, reDuration)
-	if err != nil {
-		return nil, fmt.Errorf("duration: %w", err)
-	}
-
-	return &MPCState{
-		Position:    position,
-		Duration:    duration,
-		PositionStr: extractStr(html, rePositionStr),
-		StateString: extractStr(html, reStateString),
-		File:        extractStr(html, reFile),
-		FilePath:    extractStr(html, reFilePath),
-	}, nil
+	return &st, nil
 }
 
 func formatTime(ms int64) string {
@@ -1049,8 +1039,8 @@ var (
 	// статус воспроизведения), читается из progressBar.TextFormatter.
 	progressText string
 
-	// currentFilePath — полный путь к текущему файлу MPC-HC (поле filepath
-	// из variables.html), используется по клику колесом для открытия папки.
+	// currentFilePath — полный путь к текущему файлу MPC-HC (поле path
+	// из status.json), используется по клику колесом для открытия папки.
 	currentFilePath string
 
 	// volumeWindow и компоненты ниже — оверлей-ползунок уровня громкости,
@@ -1076,7 +1066,7 @@ var (
 //     возобновляет его (команда 889 «Play/Pause» web-интерфейса MPC-HC); если
 //     web-интерфейс недоступен (MPC-HC не запущен) — запускает MPC-HC.
 //
-// Правая кнопка не перехватывается вовсе. URL variables.html передаётся в
+// Правая кнопка не перехватывается вовсе. Адрес web-интерфейса передаётся в
 // конструктор, чтобы клик мог отправить команду в тот же web-интерфейс
 // MPC-HC, который опрашивает оверлей.
 type clickCatcher struct {
@@ -1133,25 +1123,12 @@ func pointInProgressBar(p fyne.Position) bool {
 // же номера принимает web-интерфейс в command.html.
 const mpcPlayPauseCommand = 889
 
-// mpcCommandURL строит URL команды web-интерфейса MPC-HC из URL
-// variables.html: берётся тот же каталог, файл заменяется на command.html, а
-// номер команды передаётся параметром wm_command.
+// mpcCommandURL строит URL команды web-интерфейса MPC-HC (command.html, номер
+// команды — параметром wm_command) из адреса MPC_URL, см. mpcEndpoint.
 //
-//	http://localhost:7777/variables.html -> http://localhost:7777/command.html?wm_command=889
-func mpcCommandURL(variablesURL string, command int) string {
-	base := strings.TrimSpace(variablesURL)
-	if base == "" {
-		return ""
-	}
-	if i := strings.IndexAny(base, "?#"); i >= 0 {
-		base = base[:i]
-	}
-	if i := strings.LastIndex(base, "/"); i >= 0 {
-		base = base[:i+1]
-	} else {
-		base += "/"
-	}
-	return fmt.Sprintf("%scommand.html?wm_command=%d", base, command)
+//	http://localhost:7777/ -> http://localhost:7777/command.html?wm_command=889
+func mpcCommandURL(baseURL string, command int) string {
+	return mpcEndpoint(baseURL, fmt.Sprintf("command.html?wm_command=%d", command))
 }
 
 // toggleMPCPlayback отправляет в web-интерфейс MPC-HC команду «Play/Pause»,
@@ -1159,10 +1136,10 @@ func mpcCommandURL(variablesURL string, command int) string {
 // зависимости от текущего состояния плеера. Состояние заранее не
 // запрашивается: команда сама по себе переключающая, а лишний опрос добавил
 // бы только гонку между чтением состояния и его изменением.
-func toggleMPCPlayback(variablesURL string) {
-	cmdURL := mpcCommandURL(variablesURL, mpcPlayPauseCommand)
+func toggleMPCPlayback(baseURL string) {
+	cmdURL := mpcCommandURL(baseURL, mpcPlayPauseCommand)
 	if cmdURL == "" {
-		log.Printf("mpc command: URL variables.html неизвестен, команда не отправлена")
+		log.Printf("mpc command: адрес web-интерфейса неизвестен, команда не отправлена")
 		return
 	}
 
@@ -1430,11 +1407,7 @@ func showProgress(st *MPCState) {
 	}
 	progress := min(max(float64(st.Position)/float64(st.Duration), 0), 1)
 
-	elapsed := st.PositionStr
-	if elapsed == "" {
-		elapsed = formatTime(st.Position)
-	}
-	elapsedLabel.SetText(elapsed)
+	elapsedLabel.SetText(formatTime(st.Position))
 	remainingLabel.SetText("-" + formatTime(st.Duration-st.Position))
 	progressText = fmt.Sprintf("%s   —   %.1f%%  %s  (из %s)",
 		st.File, progress*100, st.StateString, formatTime(st.Duration))
@@ -1892,7 +1865,7 @@ func acquireSingleInstance() (release func(), already bool, err error) {
 
 func main() {
 	debug := flag.Bool("debug", false, "Показывать консоль с дебаг-логами")
-	urlFlag := flag.String("url", "", "URL variables.html (перекрывает MPC_URL)")
+	urlFlag := flag.String("url", "", "адрес web-интерфейса MPC-HC (перекрывает MPC_URL)")
 	intervalFlag := flag.Duration("interval", 0, "Интервал опроса (перекрывает MPC_INTERVAL)")
 	flag.Parse()
 

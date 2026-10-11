@@ -30,69 +30,54 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-const sampleVariablesHTML = `<html><body>
-<p id="file">movie.mkv</p>
-<p id="filepath">E:\movies\movie.mkv</p>
-<p id="statestring">Воспроизведение</p>
-<p id="position">61000</p>
-<p id="positionstring">00:01:01</p>
-<p id="duration">3600000</p>
-<p id="durationstring">01:00:00</p>
-</body></html>`
+// sampleStatusJSON — ответ /status.json MPC-HC 2.8 (дорожки сокращены).
+const sampleStatusJSON = `{"file":"movie.mkv","path":"E:\\movies\\movie.mkv","state":2,` +
+	`"stateString":"Воспроизведение","position":61000,"duration":3600000,"volume":60,` +
+	`"muted":false,"rate":1,"size":"1,5 ГБ","version":"2.8.1.0","preview":false,` +
+	`"audio":{"active":0,"tracks":[{"name":"A: English [eng]","id":2201}]},` +
+	`"subtitle":{"active":-1,"tracks":[]}}`
 
-func TestExtractInt(t *testing.T) {
+func TestMPCEndpoint(t *testing.T) {
 	tests := []struct {
-		name    string
-		html    string
-		want    int64
-		wantErr bool
+		base, page, want string
 	}{
-		{"число", `<p id="position">42</p>`, 42, false},
-		{"отрицательное", `<p id="position">-7</p>`, -7, false},
-		{"пробелы вокруг", `<p id="position"> 42 </p>`, 42, false},
-		{"поля нет", `<p id="duration">5</p>`, 0, false},
-		{"пустое поле", `<p id="position"></p>`, 0, false},
-		{"не число", `<p id="position">abc</p>`, 0, true},
+		{"http://localhost:7777/", "status.json", "http://localhost:7777/status.json"},
+		{"http://localhost:7777", "status.json", "http://localhost:7777/status.json"},
+		{"  http://localhost:7777/variables.html  ", "status.json", "http://localhost:7777/status.json"},
+		{"http://localhost:7777/variables.html?x=1#top", "status.json", "http://localhost:7777/status.json"},
+		{"http://host/sub/dir/", "status.json", "http://host/sub/dir/status.json"},
+		{"http://host/sub/dir/variables.html", "command.html?wm_command=1", "http://host/sub/dir/command.html?wm_command=1"},
+		{"", "status.json", ""},
+		{"   ", "status.json", ""},
+		{"http://bad host/", "status.json", ""},
+		{"http://localhost:7777/", "%zz", ""},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := extractInt(tt.html, rePosition)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if got != tt.want {
-				t.Errorf("got %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestExtractStr(t *testing.T) {
-	if got := extractStr(sampleVariablesHTML, reFile); got != "movie.mkv" {
-		t.Errorf("file = %q", got)
-	}
-	if got := extractStr(sampleVariablesHTML, reFilePath); got != `E:\movies\movie.mkv` {
-		t.Errorf("filepath = %q", got)
-	}
-	if got := extractStr("<html></html>", reFile); got != "" {
-		t.Errorf("отсутствующее поле = %q, want пусто", got)
+		if got := mpcEndpoint(tt.base, tt.page); got != tt.want {
+			t.Errorf("mpcEndpoint(%q, %q) = %q, want %q", tt.base, tt.page, got, tt.want)
+		}
 	}
 }
 
 func TestFetchState(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(sampleVariablesHTML))
+	var path atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path.Store(r.URL.Path)
+		_, _ = w.Write([]byte(sampleStatusJSON))
 	}))
 	defer srv.Close()
 
-	st, err := fetchState(srv.URL, srv.Client())
+	// Старое значение MPC_URL (variables.html) тоже работает.
+	st, err := fetchState(srv.URL+"/variables.html", srv.Client())
 	if err != nil {
 		t.Fatalf("fetchState: %v", err)
+	}
+	if p := path.Load(); p != "/status.json" {
+		t.Errorf("запрошен %v, want /status.json", p)
 	}
 	want := MPCState{
 		Position:    61000,
 		Duration:    3600000,
-		PositionStr: "00:01:01",
 		StateString: "Воспроизведение",
 		File:        "movie.mkv",
 		FilePath:    `E:\movies\movie.mkv`,
@@ -109,9 +94,11 @@ func TestFetchStateErrors(t *testing.T) {
 		body    string
 		errPart string
 	}{
-		{"HTTP-ошибка", http.StatusInternalServerError, "", "HTTP"},
-		{"битая позиция", http.StatusOK, `<p id="position">x</p>`, "position"},
-		{"битая длительность", http.StatusOK, `<p id="duration">x</p>`, "duration"},
+		{"HTTP-ошибка", http.StatusInternalServerError, "", "HTTP 500"},
+		{"старый MPC-HC без status.json", http.StatusNotFound, "", "MPC-HC 2.x"},
+		{"не JSON", http.StatusOK, `<html></html>`, "разбор status.json"},
+		{"битая позиция", http.StatusOK, `{"position":"x"}`, "разбор status.json"},
+		{"пустой ответ", http.StatusOK, "", "разбор status.json"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -137,6 +124,9 @@ func TestFetchStateConnectionRefused(t *testing.T) {
 	client := &http.Client{Timeout: time.Second}
 	if _, err := fetchState(url, client); err == nil {
 		t.Error("ожидалась ошибка соединения")
+	}
+	if _, err := fetchState("", client); err == nil || !strings.Contains(err.Error(), "некорректный адрес") {
+		t.Errorf("пустой адрес: err = %v", err)
 	}
 }
 
@@ -166,14 +156,10 @@ func TestMPCCommandURL(t *testing.T) {
 	tests := []struct {
 		in, want string
 	}{
-		{"http://localhost:7777/variables.html", "http://localhost:7777/command.html?wm_command=889"},
-		{"  http://localhost:7777/variables.html  ", "http://localhost:7777/command.html?wm_command=889"},
-		{"http://localhost:7777/variables.html?x=1#top", "http://localhost:7777/command.html?wm_command=889"},
-		{"http://host/sub/dir/variables.html", "http://host/sub/dir/command.html?wm_command=889"},
 		{"http://localhost:7777/", "http://localhost:7777/command.html?wm_command=889"},
+		{"http://localhost:7777", "http://localhost:7777/command.html?wm_command=889"},
+		{"http://localhost:7777/variables.html?x=1#top", "http://localhost:7777/command.html?wm_command=889"},
 		{"", ""},
-		{"   ", ""},
-		{"variables.html", "variables.html/command.html?wm_command=889"},
 	}
 	for _, tt := range tests {
 		if got := mpcCommandURL(tt.in, mpcPlayPauseCommand); got != tt.want {
@@ -1103,9 +1089,9 @@ func TestToggleMPCWindow(t *testing.T) {
 func TestShowProgress(t *testing.T) {
 	setupUI(t, defaultURL)
 
-	showProgress(&MPCState{Position: 61_000, Duration: 3_600_000, PositionStr: "00:01:01",
+	showProgress(&MPCState{Position: 61_000, Duration: 3_600_000,
 		StateString: "Пауза", File: "movie.mkv", FilePath: `E:\movie.mkv`})
-	if elapsedLabel.Text != "00:01:01" || remainingLabel.Text != "-58:59" {
+	if elapsedLabel.Text != "01:01" || remainingLabel.Text != "-58:59" {
 		t.Errorf("подписи %q / %q", elapsedLabel.Text, remainingLabel.Text)
 	}
 	if want := "movie.mkv   —   1.7%  Пауза  (из 1:00:00)"; progressText != want {
@@ -1115,7 +1101,7 @@ func TestShowProgress(t *testing.T) {
 		t.Errorf("currentFilePath = %q", currentFilePath)
 	}
 
-	// Без positionstring время считается само; позиция за концом обрезается.
+	// Позиция за концом файла: полоса обрезается до 100%.
 	showProgress(&MPCState{Position: 5_000_000, Duration: 3_600_000})
 	if elapsedLabel.Text != "1:23:20" || progressBar.Value != 1 {
 		t.Errorf("elapsed=%q value=%v", elapsedLabel.Text, progressBar.Value)
@@ -1146,7 +1132,7 @@ func TestPollMPC(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		_, _ = w.Write([]byte(sampleVariablesHTML))
+		_, _ = w.Write([]byte(sampleStatusJSON))
 	}))
 	defer srv.Close()
 	setupUI(t, srv.URL)
@@ -1731,7 +1717,7 @@ func truncatedServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "1000")
-		_, _ = w.Write([]byte("<p id="))
+		_, _ = w.Write([]byte(`{"file":`))
 	}))
 	t.Cleanup(srv.Close)
 	return srv

@@ -626,6 +626,32 @@ func TestFixOverlayWindowChrome(t *testing.T) {
 	}
 }
 
+func TestCreateAsToolWindows(t *testing.T) {
+	const wsExToolWindow = 0x80
+
+	// Окно нужного класса становится toolwindow уже при создании — до
+	// любого показа и без fixOverlayWindowChrome.
+	setVar(t, &overlayWindowClass, "STATIC")
+	var hwnd uintptr
+	createAsToolWindows(func() { hwnd = newNativeWindow(t, uniqueTitle(t, "cbt"), wsExAppWindow) })
+	if s := exStyle(hwnd); s&wsExToolWindow == 0 || s&wsExAppWindow != 0 {
+		t.Errorf("exStyle=%#x, want TOOLWINDOW без APPWINDOW", s)
+	}
+
+	// Окна других классов хук не трогает.
+	setVar(t, &overlayWindowClass, "NoSuchClass")
+	createAsToolWindows(func() { hwnd = newNativeWindow(t, uniqueTitle(t, "cbt other"), wsExAppWindow) })
+	if s := exStyle(hwnd); s&wsExToolWindow != 0 || s&wsExAppWindow == 0 {
+		t.Errorf("чужой класс: exStyle=%#x, want APPWINDOW без TOOLWINDOW", s)
+	}
+
+	// После снятия хука новые окна создаются как обычно.
+	setVar(t, &overlayWindowClass, "STATIC")
+	if s := exStyle(newNativeWindow(t, uniqueTitle(t, "cbt after"), wsExAppWindow)); s&wsExToolWindow != 0 {
+		t.Errorf("хук не снят: exStyle=%#x", s)
+	}
+}
+
 func TestFixOverlayWindowChromeErrors(t *testing.T) {
 	if err := fixOverlayWindowChrome(uniqueTitle(t, "нет такого окна"), false); err == nil {
 		t.Error("для несуществующего окна ожидалась ошибка")

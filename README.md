@@ -87,7 +87,7 @@ Win32 `EnumWindows`): с `-debug=false` (по умолчанию) после `-H
 Раньше это ломалось из-за отдельного бага: `onReady()` безусловно вызывал
 `ensureConsole()` (оставшийся от прежней версии, где консоль была всегда) —
 из-за этого консоль появлялась заново сразу после инициализации трея, даже
-при `-debug=false`. Теперь вызов обёрнут проверкой `if debug` (флаг передаётся в `onReady`).
+при `-debug=false`. Теперь вызов обёрнут проверкой `if a.debug` (флаг хранится в `trayApp`).
 
 Для разработки без флага удобнее `go run .` / `go build` — тогда видна
 консоль с логами независимо от `-debug` (так как subsystem по умолчанию
@@ -122,31 +122,43 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 
 Это намеренно **однофайловая программа на Go** (`main.go`, `package main`, без пакетов в `internal/`), чтобы всё целиком можно было вставить в контекст другой модели одним блоком.
 
+**Объекты** — состояние программы собрано в типы с методами, глобальных переменных с состоянием нет:
+
+- `trayApp` — программа с точки зрения трея: связывает меню, аудио, хоткеи и оверлеи (`onReady`/`onExit` — колбэки `systray.Run`; `selectDevice`, `cycle`, `stepVolume` — действия меню и хоткеев);
+- `deviceMenu` — пункты устройств в меню трея с галочкой на текущем;
+- `Switcher` — WASAPI/COM: список устройств, устройство по умолчанию, громкость;
+- `overlays` — приложение Fyne с двумя окнами: `progressOverlay` (прогресс MPC-HC по F5) и `volumeOverlay` (ползунок громкости);
+- `mpcClient` — web-интерфейс MPC-HC (`State`, `TogglePlayback`) и запуск самого плеера (`Launch`);
+- `hotkeyHook` — глобальный хук клавиатуры с обработчиками и выключателем Ctrl+F2;
+- `autostart` — значение автозапуска в `HKCU\...\Run`;
+- `config` — итоговые настройки (`resolveConfig`: флаги > окружение/`.env` > умолчания).
+
 **Структура файла** (по порядку, каждая часть помечена заголовком секции `// ---...---` в `main.go`):
 
 1. Логирование (`ensureConsole`, `setupLogging`)
-2. Загрузка `.env` (`dotEnvPaths`, `loadDotEnv`)
-3. Состояние MPC-HC через JSON API веб-интерфейса (`status.json`, `fetchState`/`MPCState`, `mpcEndpoint`)
+2. Загрузка `.env` и настройки (`dotEnvPaths`, `loadDotEnv`, `config`, `resolveConfig`)
+3. MPC-HC: состояние через JSON API веб-интерфейса, команды и запуск плеера (`mpcClient`, `MPCState`, `mpcEndpoint`)
 4. Хелперы Win32: монитор под курсором и высота заголовка окна (`screenLayout`, `titleBarHeight`)
 5. Переключение аудиоустройств и шаг громкости через WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
 6. Монитор глобальной громкости поллингом (`Switcher.CurrentVolume`, `pollVolume`)
 7. Всплывающие уведомления (`showNotification` — находит скрытое окно systray и вызывает `Shell_NotifyIconW` напрямую; публичного API systray для этого нет)
 8. Генерация иконки трея во время выполнения (`trayIconData`, PNG, обёрнутый в минимальный контейнер `.ico` — без внешнего файла ресурсов)
-9. Встроенное окно-оверлей Fyne (`runFyne`, `toggleMPCWindow`); `clickCatcher` ловит клик средней кнопкой мыши и открывает папку с файлом (`openContainingFolder`, `explorer /select,`); второй оверлей — ползунок громкости с градацией (`volumeWindow`, `showVolumeOverlay`, `layoutVolumeOverlay`)
-10. Подключение systray + меню устройств (`main`, `onReady`, `onExit`, `buildDeviceMenu`, `selectDevice`, `onCycle`)
-11. Глобальный низкоуровневый хук клавиатуры для F2/F3/F5/F7/F8 и Ctrl+F2 (`startHotkeys`, `hookProc`, `WH_KEYBOARD_LL`)
+9. Встроенные окна-оверлеи Fyne (`overlays`, `progressOverlay`, `volumeOverlay`); `clickCatcher` ловит клики по оверлею прогресса: средняя кнопка открывает папку с файлом (`openContainingFolder`, `explorer /select,`), левая по полосе — Play/Pause
+10. Автозапуск через реестр (`autostart`)
+11. Подключение systray + меню устройств (`main`, `trayApp`, `deviceMenu`)
+12. Глобальный низкоуровневый хук клавиатуры для F2/F3/F5/F7/F8 и Ctrl+F2 (`hotkeyHook`, `WH_KEYBOARD_LL`)
 
-**Ключевые типы / инварианты:**
+**Ключевые инварианты:**
 
 - `Switcher` владеет COM-объектами (`IMMDeviceEnumerator`, `IPolicyConfigVista`). Все вызовы COM сериализуются в **одну выделенную горутину, закреплённую через `runtime.LockOSThread`**, через канал (`reqCh`/`exec`), потому что COM-объекты живут в квартире этого потока (`CoInitializeEx(COINIT_APARTMENTTHREADED)`). Никогда не вызывайте методы COM из другой горутины.
-- `startHotkeys` устанавливает хук `WH_KEYBOARD_LL` в своём собственном закреплённом OS-потоке со своим циклом сообщений Win32; обработчики берутся из карты `hotkeys` (virtual-key → функция, заполняется до установки хука и дальше не меняется) и запускаются через `go handler()`, чтобы процедура хука возвращалась быстро.
+- `hotkeyHook.Start` устанавливает хук `WH_KEYBOARD_LL` в своём собственном закреплённом OS-потоке со своим циклом сообщений Win32; обработчики берутся из карты `handlers` (virtual-key → функция, задаётся при создании и дальше не меняется) и запускаются через `go handler()`, чтобы процедура хука (`proc`) возвращалась быстро.
 - Громкость отслеживается поллингом (`pollVolume`), а не push-уведомлениями WASAPI. Изначально были реализованы push-уведомления через самодельный `IAudioEndpointVolumeCallback` (`github.com/diegosz/go-wca` объявляет `IAudioEndpointVolume` с правильными смещениями vtable, но `Register/UnregisterControlChangeNotify` у неё — заглушки (`E_NOTIMPL`), а сам колбэк-интерфейс в библиотеке не реализован вообще, так что оба куска пришлось бы делать вручную по образцу `IMMNotificationClient`) — регистрация проходила успешно, но `OnNotify` ни разу не сработал даже с доработанным циклом сообщений (`TranslateMessage`/`DispatchMessageW`). От push-модели отказались в пользу простого поллинга `Switcher.CurrentVolume()` каждые 120 мс — надёжно работает независимо от драйвера/окружения и не требует отдельного потока/COM-квартиры.
-- Fyne 2.8 требует модели потоков `fyne.Do`/`fyne.DoAndWait`: любое изменение UI из горутины, отличной от той, что вызвала `fyneApp.Run()`, должно быть обёрнуто в `fyne.Do(func() { ... })` (см. цикл опроса MPC и `toggleMPCWindow`).
-- **Важный инвариант потоков:** пакет `github.com/getlantern/systray` в своём `init()` безусловно вызывает `runtime.LockOSThread()` — а `init()` выполняется на горутине, которая затем становится горутиной `main()`, то есть эта горутина навсегда закрепляется за главным потоком процесса ещё до начала `main()`. Fyne 2.8+ требует, чтобы `app.New()`/`NewWindow()`/`Run()` вызывались именно на этой горутине (см. https://docs.fyne.io/started/goroutines) — если вызвать их из другой горутины (как было до исправления), Fyne лишь печатает предупреждение о неверном потоке и затем **зависает насовсем** внутри `NewWindow()`, так что окно никогда не создаётся и F5 ничего не делает. Поэтому `main()` вызывает `runFyne(...)` напрямую (блокируясь на горутине `main`), а `systray.Run(onReady, onExit)` запускается в отдельной горутине со своим `runtime.LockOSThread()`.
+- Fyne 2.8 требует модели потоков `fyne.Do`/`fyne.DoAndWait`: любое изменение UI из горутины, отличной от той, что вызвала `app.Run()`, должно быть обёрнуто в `fyne.Do(func() { ... })` (см. `progressOverlay.Poll` и `progressOverlay.Toggle`).
+- **Важный инвариант потоков:** пакет `github.com/getlantern/systray` в своём `init()` безусловно вызывает `runtime.LockOSThread()` — а `init()` выполняется на горутине, которая затем становится горутиной `main()`, то есть эта горутина навсегда закрепляется за главным потоком процесса ещё до начала `main()`. Fyne 2.8+ требует, чтобы `app.New()`/`NewWindow()`/`Run()` вызывались именно на этой горутине (см. https://docs.fyne.io/started/goroutines) — если вызвать их из другой горутины (как было до исправления), Fyne лишь печатает предупреждение о неверном потоке и затем **зависает насовсем** внутри `NewWindow()`, так что окно никогда не создаётся и F5 ничего не делает. Поэтому `main()` создаёт оверлеи (`newOverlays`) и запускает `overlays.Run(...)` напрямую (блокируясь на горутине `main`), а `systray.Run(tray.onReady, tray.onExit)` запускается в отдельной горутине со своим `runtime.LockOSThread()`. Оверлеи создаются до запуска трея, поэтому хоткеи и меню всегда находят готовые окна.
 
 **Зависимости:** `fyne.io/fyne/v2` v2.8.1 (UI оверлея), `github.com/getlantern/systray` (иконка/меню трея), `github.com/diegosz/go-wca` + `github.com/go-ole/go-ole` (переключение устройств WASAPI/COM), `golang.org/x/sys` (сисколлы Win32).
 
-**Напоминание о флагах сборки:** основной способ сборки — `go build -ldflags "-H=windowsgui"` (GUI subsystem в PE-заголовке, загрузчик Windows не создаёт консоль). `-debug` по умолчанию `false` — логи в `volume_switch.log`, окон кроме трея нет (проверено перебором окон процесса). `onReady()` вызывает `ensureConsole()` только при `-debug=true` — раньше вызов был безусловным и пересоздавал консоль сразу после инициализации трея даже при `-debug=false`.
+**Напоминание о флагах сборки:** основной способ сборки — `go build -ldflags "-H=windowsgui"` (GUI subsystem в PE-заголовке, загрузчик Windows не создаёт консоль). `-debug` по умолчанию `false` — логи в `volume_switch.log`, окон кроме трея нет (проверено перебором окон процесса). `trayApp.onReady()` вызывает `ensureConsole()` только при `-debug=true` — раньше вызов был безусловным и пересоздавал консоль сразу после инициализации трея даже при `-debug=false`.
 
 ---
 
@@ -239,7 +251,7 @@ service windows, and the log goes to `volume_switch.log`. This used to break
 because of a separate bug: `onReady()` unconditionally called `ensureConsole()`
 (left over from an earlier version where the console was always present), so
 the console reappeared right after the tray initialized, even with
-`-debug=false`. Now the call is guarded by `if debug` (the flag is passed to `onReady`).
+`-debug=false`. Now the call is guarded by `if a.debug` (the flag is stored in `trayApp`).
 
 For development, plain `go run .` / `go build` is more convenient — the console
 with logs is visible regardless of `-debug` (since the default subsystem is
@@ -273,28 +285,40 @@ Flags override environment variables, which override the `.env` file, which over
 
 This is intentionally a **single-file Go program** (`main.go`, `package main`, no packages in `internal/`), so the whole thing can be pasted into another model's context in one block.
 
+**Objects**: the program state lives in types with methods; there are no global variables holding state:
+
+- `trayApp` is the program as seen from the tray: it ties together the menu, audio, hotkeys and overlays (`onReady`/`onExit` are the `systray.Run` callbacks; `selectDevice`, `cycle`, `stepVolume` are the menu and hotkey actions);
+- `deviceMenu` holds the device items of the tray menu with a checkmark on the current one;
+- `Switcher` is WASAPI/COM: the device list, the default device, the volume;
+- `overlays` is the Fyne application with two windows: `progressOverlay` (MPC-HC progress on F5) and `volumeOverlay` (the volume slider);
+- `mpcClient` is the MPC-HC web interface (`State`, `TogglePlayback`) plus launching the player itself (`Launch`);
+- `hotkeyHook` is the global keyboard hook with its handlers and the Ctrl+F2 switch;
+- `autostart` is the autostart value in `HKCU\...\Run`;
+- `config` holds the resolved settings (`resolveConfig`: flags > environment/`.env` > defaults).
+
 **File layout** (in order, each part marked with a `// ---...---` section header in `main.go`):
 
 1. Logging (`ensureConsole`, `setupLogging`)
-2. `.env` loading (`dotEnvPaths`, `loadDotEnv`)
-3. MPC-HC state via the web interface JSON API (`status.json`, `fetchState`/`MPCState`, `mpcEndpoint`)
+2. `.env` loading and settings (`dotEnvPaths`, `loadDotEnv`, `config`, `resolveConfig`)
+3. MPC-HC: state via the web interface JSON API, commands and launching the player (`mpcClient`, `MPCState`, `mpcEndpoint`)
 4. Win32 helpers: monitor under the cursor and window title bar height (`screenLayout`, `titleBarHeight`)
 5. Audio device switching and volume stepping via WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
 6. Master volume monitoring by polling (`Switcher.CurrentVolume`, `pollVolume`)
 7. Balloon notifications (`showNotification` finds the hidden systray window and calls `Shell_NotifyIconW` directly; systray has no public API for this)
 8. Tray icon generation at runtime (`trayIconData`, a PNG wrapped in a minimal `.ico` container, no external resource file)
-9. Built-in Fyne overlay window (`runFyne`, `toggleMPCWindow`); `clickCatcher` catches the middle click and opens the file's folder (`openContainingFolder`, `explorer /select,`); the second overlay is the volume slider with a scale (`volumeWindow`, `showVolumeOverlay`, `layoutVolumeOverlay`)
-10. Systray wiring + device menu (`main`, `onReady`, `onExit`, `buildDeviceMenu`, `selectDevice`, `onCycle`)
-11. Global low-level keyboard hook for F2/F3/F5/F7/F8 and Ctrl+F2 (`startHotkeys`, `hookProc`, `WH_KEYBOARD_LL`)
+9. Built-in Fyne overlay windows (`overlays`, `progressOverlay`, `volumeOverlay`); `clickCatcher` catches clicks on the progress overlay: the middle button opens the file's folder (`openContainingFolder`, `explorer /select,`), a left click on the bar toggles Play/Pause
+10. Autostart via the registry (`autostart`)
+11. Systray wiring + device menu (`main`, `trayApp`, `deviceMenu`)
+12. Global low-level keyboard hook for F2/F3/F5/F7/F8 and Ctrl+F2 (`hotkeyHook`, `WH_KEYBOARD_LL`)
 
-**Key types / invariants:**
+**Key invariants:**
 
 - `Switcher` owns the COM objects (`IMMDeviceEnumerator`, `IPolicyConfigVista`). All COM calls are serialized onto **one dedicated goroutine pinned with `runtime.LockOSThread`** through a channel (`reqCh`/`exec`), because the COM objects live in that thread's apartment (`CoInitializeEx(COINIT_APARTMENTTHREADED)`). Never call COM methods from another goroutine.
-- `startHotkeys` installs the `WH_KEYBOARD_LL` hook on its own pinned OS thread with its own Win32 message loop; handlers come from the `hotkeys` map (virtual-key → function, filled before the hook is installed and never changed afterwards) and are run via `go handler()` so the hook procedure returns quickly.
+- `hotkeyHook.Start` installs the `WH_KEYBOARD_LL` hook on its own pinned OS thread with its own Win32 message loop; handlers come from the `handlers` map (virtual-key → function, set at creation and never changed afterwards) and are run via `go handler()` so the hook procedure (`proc`) returns quickly.
 - Volume is tracked by polling (`pollVolume`), not by WASAPI push notifications. Push notifications were implemented first via a hand-made `IAudioEndpointVolumeCallback` (`github.com/diegosz/go-wca` declares `IAudioEndpointVolume` with correct vtable offsets, but its `Register/UnregisterControlChangeNotify` are stubs (`E_NOTIMPL`), and the callback interface isn't implemented in the library at all, so both pieces had to be written by hand following the `IMMNotificationClient` pattern). Registration succeeded, but `OnNotify` never fired even with an improved message loop (`TranslateMessage`/`DispatchMessageW`). The push model was dropped in favor of simply polling `Switcher.CurrentVolume()` every 120 ms: it works reliably regardless of driver/environment and needs no separate thread/COM apartment.
-- Fyne 2.8 requires the `fyne.Do`/`fyne.DoAndWait` threading model: any UI change from a goroutine other than the one that called `fyneApp.Run()` must be wrapped in `fyne.Do(func() { ... })` (see the MPC polling loop and `toggleMPCWindow`).
-- **Important threading invariant:** the `github.com/getlantern/systray` package unconditionally calls `runtime.LockOSThread()` in its `init()`, and `init()` runs on the goroutine that then becomes the `main()` goroutine, so that goroutine is pinned to the process main thread forever before `main()` even starts. Fyne 2.8+ requires `app.New()`/`NewWindow()`/`Run()` to be called on exactly this goroutine (see https://docs.fyne.io/started/goroutines). If they are called from another goroutine (as before the fix), Fyne only prints a wrong-thread warning and then **hangs forever** inside `NewWindow()`, so the window is never created and F5 does nothing. That's why `main()` calls `runFyne(...)` directly (blocking on the `main` goroutine), while `systray.Run(onReady, onExit)` runs in a separate goroutine with its own `runtime.LockOSThread()`.
+- Fyne 2.8 requires the `fyne.Do`/`fyne.DoAndWait` threading model: any UI change from a goroutine other than the one that called `app.Run()` must be wrapped in `fyne.Do(func() { ... })` (see `progressOverlay.Poll` and `progressOverlay.Toggle`).
+- **Important threading invariant:** the `github.com/getlantern/systray` package unconditionally calls `runtime.LockOSThread()` in its `init()`, and `init()` runs on the goroutine that then becomes the `main()` goroutine, so that goroutine is pinned to the process main thread forever before `main()` even starts. Fyne 2.8+ requires `app.New()`/`NewWindow()`/`Run()` to be called on exactly this goroutine (see https://docs.fyne.io/started/goroutines). If they are called from another goroutine (as before the fix), Fyne only prints a wrong-thread warning and then **hangs forever** inside `NewWindow()`, so the window is never created and F5 does nothing. That's why `main()` creates the overlays (`newOverlays`) and calls `overlays.Run(...)` directly (blocking on the `main` goroutine), while `systray.Run(tray.onReady, tray.onExit)` runs in a separate goroutine with its own `runtime.LockOSThread()`. The overlays are created before the tray starts, so hotkeys and the menu always find the windows ready.
 
 **Dependencies:** `fyne.io/fyne/v2` v2.8.1 (overlay UI), `github.com/getlantern/systray` (tray icon/menu), `github.com/diegosz/go-wca` + `github.com/go-ole/go-ole` (WASAPI/COM device switching), `golang.org/x/sys` (Win32 syscalls).
 
-**Build flags reminder:** the main way to build is `go build -ldflags "-H=windowsgui"` (GUI subsystem in the PE header, the Windows loader creates no console). `-debug` defaults to `false`: logs go to `volume_switch.log`, no windows besides the tray (verified by enumerating process windows). `onReady()` calls `ensureConsole()` only with `-debug=true`; the call used to be unconditional and recreated the console right after the tray initialized even with `-debug=false`.
+**Build flags reminder:** the main way to build is `go build -ldflags "-H=windowsgui"` (GUI subsystem in the PE header, the Windows loader creates no console). `-debug` defaults to `false`: logs go to `volume_switch.log`, no windows besides the tray (verified by enumerating process windows). `trayApp.onReady()` calls `ensureConsole()` only with `-debug=true`; the call used to be unconditional and recreated the console right after the tray initialized even with `-debug=false`.

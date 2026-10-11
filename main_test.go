@@ -59,7 +59,7 @@ func TestMPCEndpoint(t *testing.T) {
 	}
 }
 
-func TestFetchState(t *testing.T) {
+func TestMPCState(t *testing.T) {
 	var path atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path.Store(r.URL.Path)
@@ -68,9 +68,9 @@ func TestFetchState(t *testing.T) {
 	defer srv.Close()
 
 	// Старое значение MPC_URL (variables.html) тоже работает.
-	st, err := fetchState(srv.URL+"/variables.html", srv.Client())
+	st, err := (&mpcClient{baseURL: srv.URL + "/variables.html", http: srv.Client()}).State()
 	if err != nil {
-		t.Fatalf("fetchState: %v", err)
+		t.Fatalf("State: %v", err)
 	}
 	if p := path.Load(); p != "/status.json" {
 		t.Errorf("запрошен %v, want /status.json", p)
@@ -87,7 +87,7 @@ func TestFetchState(t *testing.T) {
 	}
 }
 
-func TestFetchStateErrors(t *testing.T) {
+func TestMPCStateErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		status  int
@@ -108,7 +108,7 @@ func TestFetchStateErrors(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, err := fetchState(srv.URL, srv.Client())
+			_, err := (&mpcClient{baseURL: srv.URL, http: srv.Client()}).State()
 			if err == nil || !strings.Contains(err.Error(), tt.errPart) {
 				t.Errorf("err = %v, want содержащую %q", err, tt.errPart)
 			}
@@ -116,16 +116,15 @@ func TestFetchStateErrors(t *testing.T) {
 	}
 }
 
-func TestFetchStateConnectionRefused(t *testing.T) {
+func TestMPCStateConnectionRefused(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	url := srv.URL
 	srv.Close()
 
-	client := &http.Client{Timeout: time.Second}
-	if _, err := fetchState(url, client); err == nil {
+	if _, err := newMPCClient(url).State(); err == nil {
 		t.Error("ожидалась ошибка соединения")
 	}
-	if _, err := fetchState("", client); err == nil || !strings.Contains(err.Error(), "некорректный адрес") {
+	if _, err := newMPCClient("").State(); err == nil || !strings.Contains(err.Error(), "некорректный адрес") {
 		t.Errorf("пустой адрес: err = %v", err)
 	}
 }
@@ -168,14 +167,14 @@ func TestMPCCommandURL(t *testing.T) {
 	}
 }
 
-func TestToggleMPCPlaybackSendsCommand(t *testing.T) {
+func TestMPCTogglePlaybackSendsCommand(t *testing.T) {
 	got := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		got <- r.URL.RequestURI()
 	}))
 	defer srv.Close()
 
-	toggleMPCPlayback(srv.URL + "/variables.html")
+	newMPCClient(srv.URL + "/variables.html").TogglePlayback()
 
 	select {
 	case uri := <-got:
@@ -367,6 +366,35 @@ func TestDotEnvPaths(t *testing.T) {
 	}
 }
 
+func TestResolveConfig(t *testing.T) {
+	t.Setenv("MPC_URL", "")
+	t.Setenv("MPC_INTERVAL", "")
+	want := config{mpcURL: defaultURL, interval: defaultInterval}
+	if got := resolveConfig(false, "", 0); got != want {
+		t.Errorf("умолчания: %+v, want %+v", got, want)
+	}
+
+	t.Setenv("MPC_URL", "http://env:1/")
+	t.Setenv("MPC_INTERVAL", "1s")
+	want = config{debug: true, mpcURL: "http://env:1/", interval: time.Second}
+	if got := resolveConfig(true, "", 0); got != want {
+		t.Errorf("из окружения: %+v, want %+v", got, want)
+	}
+
+	want = config{mpcURL: "http://flag:2/", interval: 2 * time.Second}
+	if got := resolveConfig(false, "http://flag:2/", 2*time.Second); got != want {
+		t.Errorf("флаги поверх окружения: %+v, want %+v", got, want)
+	}
+
+	// Неразбираемый или неположительный интервал — значение по умолчанию.
+	for _, v := range []string{"abc", "-1s", "0"} {
+		t.Setenv("MPC_INTERVAL", v)
+		if got := resolveConfig(false, "", 0).interval; got != defaultInterval {
+			t.Errorf("MPC_INTERVAL=%q: %v, want %v", v, got, defaultInterval)
+		}
+	}
+}
+
 func TestLoadDotEnvMissingFile(t *testing.T) {
 	// Отсутствующий файл — штатная ситуация: просто ничего не загружается.
 	loadDotEnv(filepath.Join(t.TempDir(), "nope.env"))
@@ -375,26 +403,26 @@ func TestLoadDotEnvMissingFile(t *testing.T) {
 func TestMPCExePathFromEnv(t *testing.T) {
 	const exe = `D:\Tools\mpc-hc64.exe`
 	t.Setenv("MPC_EXE", exe)
-	if got := mpcExePath(); got != exe {
-		t.Errorf("mpcExePath() = %q, want %q", got, exe)
+	if got := newMPCClient("").exePath(); got != exe {
+		t.Errorf("exePath() = %q, want %q", got, exe)
 	}
 }
 
-func TestHookProc(t *testing.T) {
+func TestHotkeyHookProc(t *testing.T) {
 	called := make(chan uint32, 1)
-	setVar(t, &hotkeys, map[uint32]func(){
+	h := newHotkeyHook(map[uint32]func(){
 		vkF3: func() { called <- vkF3 },
 		vkF5: func() { called <- vkF5 },
 		vkF8: func() { called <- vkF8 },
-	})
+	}, func(bool) { t.Error("лишнее переключение хоткеев") })
 	// Настоящее состояние клавиатуры в тесте не задать: зажатые клавиши
 	// подменяются набором held.
 	held := map[uintptr]bool{}
 	setVar(t, &keyHeld, func(vk uintptr) bool { return held[vk] })
 
 	for _, vk := range []uint32{vkF3, vkF5, vkF8} {
-		if r := hookProc(0, wmKeyDown, &kbdllHookStruct{VkCode: vk}); r != 1 {
-			t.Errorf("vk=%#x: hookProc = %d, want 1 (клавиша съедена)", vk, r)
+		if r := h.proc(0, wmKeyDown, &kbdllHookStruct{VkCode: vk}); r != 1 {
+			t.Errorf("vk=%#x: proc = %d, want 1 (клавиша съедена)", vk, r)
 		}
 		select {
 		case got := <-called:
@@ -429,8 +457,8 @@ func TestHookProc(t *testing.T) {
 		if tc.held != 0 {
 			held[tc.held] = true
 		}
-		if r := hookProc(tc.nCode, tc.wParam, &kbdllHookStruct{VkCode: tc.vk, Flags: tc.flags}); r != 0 {
-			t.Errorf("%s: hookProc = %d, want 0", tc.name, r)
+		if r := h.proc(tc.nCode, tc.wParam, &kbdllHookStruct{VkCode: tc.vk, Flags: tc.flags}); r != 0 {
+			t.Errorf("%s: proc = %d, want 0", tc.name, r)
 		}
 	}
 	select {
@@ -440,18 +468,17 @@ func TestHookProc(t *testing.T) {
 	}
 }
 
-func TestHookProcToggle(t *testing.T) {
+func TestHotkeyHookToggle(t *testing.T) {
 	called := make(chan uint32, 1)
-	setVar(t, &hotkeys, map[uint32]func(){vkF2: func() { called <- vkF2 }})
+	h := newHotkeyHook(map[uint32]func(){vkF2: func() { called <- vkF2 }}, announceHotkeys)
 	held := map[uintptr]bool{}
 	setVar(t, &keyHeld, func(vk uintptr) bool { return held[vk] })
 	setVar(t, &systrayClassName, uniqueTitle(t, "NoSuchClass"))
 	sounds := make(chan string, 1)
 	setVar(t, &playSystemSound, func(alias string) { sounds <- alias })
-	t.Cleanup(func() { hotkeysDisabled.Store(false); toggleKeyDown = false })
 
 	press := func(wParam uintptr) uintptr {
-		return hookProc(0, wParam, &kbdllHookStruct{VkCode: vkF2})
+		return h.proc(0, wParam, &kbdllHookStruct{VkCode: vkF2})
 	}
 	// toggle нажимает и отпускает Ctrl+F2 и ждёт звука уведомления (заодно
 	// это синхронизация с горутиной announceHotkeys).
@@ -459,15 +486,15 @@ func TestHookProcToggle(t *testing.T) {
 		t.Helper()
 		held[vkControl] = true
 		if r := press(wmKeyDown); r != 1 {
-			t.Errorf("Ctrl+F2: hookProc = %d, want 1", r)
+			t.Errorf("Ctrl+F2: proc = %d, want 1", r)
 		}
 		if r := press(wmKeyDown); r != 1 { // автоповтор: съеден, но не переключает
-			t.Errorf("автоповтор Ctrl+F2: hookProc = %d, want 1", r)
+			t.Errorf("автоповтор Ctrl+F2: proc = %d, want 1", r)
 		}
 		press(wmKeyUp)
 		held[vkControl] = false
-		if hotkeysDisabled.Load() != wantDisabled {
-			t.Fatalf("hotkeysDisabled = %v, want %v", !wantDisabled, wantDisabled)
+		if h.disabled.Load() != wantDisabled {
+			t.Fatalf("disabled = %v, want %v", !wantDisabled, wantDisabled)
 		}
 		select {
 		case got := <-sounds:
@@ -482,20 +509,20 @@ func TestHookProcToggle(t *testing.T) {
 	toggle(true, "DeviceDisconnect")
 	// Выключенный хоткей уходит программам и обработчик не вызывает.
 	if r := press(wmKeyDown); r != 0 {
-		t.Errorf("F2 при выключенных хоткеях: hookProc = %d, want 0", r)
+		t.Errorf("F2 при выключенных хоткеях: proc = %d, want 0", r)
 	}
 
 	// Ctrl+Shift+F2 — не переключатель.
 	held[vkControl], held[vkShift] = true, true
-	if r := press(wmKeyDown); r != 0 || !hotkeysDisabled.Load() {
-		t.Errorf("Ctrl+Shift+F2: hookProc = %d, disabled = %v", r, hotkeysDisabled.Load())
+	if r := press(wmKeyDown); r != 0 || !h.disabled.Load() {
+		t.Errorf("Ctrl+Shift+F2: proc = %d, disabled = %v", r, h.disabled.Load())
 	}
 	press(wmKeyUp)
 	clear(held)
 
 	toggle(false, "DeviceConnect")
 	if r := press(wmKeyDown); r != 1 {
-		t.Errorf("F2 после включения: hookProc = %d, want 1", r)
+		t.Errorf("F2 после включения: proc = %d, want 1", r)
 	}
 	select {
 	case <-called:
@@ -654,14 +681,11 @@ func uniqueTitle(t *testing.T, base string) string {
 
 // setupUI собирает оба окна на тестовом драйвере Fyne (без настоящих окон) с
 // уникальными заголовками.
-func setupUI(t *testing.T, mpcURL string) {
+func setupUI(t *testing.T, mpcURL string) *overlays {
 	t.Helper()
-	setVar(t, &fyneApp, test.NewTempApp(t))
 	setVar(t, &windowTitle, uniqueTitle(t, windowTitle))
 	setVar(t, &volumeWindowTitle, uniqueTitle(t, volumeWindowTitle))
-	setVar(t, &winVisible, false)
-	setVar(t, &currentFilePath, "")
-	buildUI(mpcURL)
+	return newOverlays(test.NewTempApp(t), newMPCClient(mpcURL))
 }
 
 // ---------------------------------------------------------------------------
@@ -809,56 +833,56 @@ func TestAcquireSingleInstanceErrors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAutostart(t *testing.T) {
-	setVar(t, &autostartRegistryPath, tempRegistryKey(t))
+	run := autostart{key: tempRegistryKey(t)}
 
-	if isAutostartEnabled() {
+	if run.Enabled() {
 		t.Error("пустой ключ: автозапуск включён")
 	}
-	if err := setAutostart(true); err != nil {
-		t.Fatalf("setAutostart(true): %v", err)
+	if err := run.Set(true); err != nil {
+		t.Fatalf("Set(true): %v", err)
 	}
-	if !isAutostartEnabled() {
+	if !run.Enabled() {
 		t.Error("после включения автозапуск выключен")
 	}
 
-	setRegistryString(t, autostartRegistryPath, autostartValueName, `"C:\old\volume_switch.exe"`)
-	if isAutostartEnabled() {
+	setRegistryString(t, run.key, autostartValueName, `"C:\old\volume_switch.exe"`)
+	if run.Enabled() {
 		t.Error("значение указывает на другой exe, а автозапуск считается включённым")
 	}
 
-	if err := setAutostart(false); err != nil {
-		t.Fatalf("setAutostart(false): %v", err)
+	if err := run.Set(false); err != nil {
+		t.Fatalf("Set(false): %v", err)
 	}
-	if isAutostartEnabled() {
+	if run.Enabled() {
 		t.Error("после выключения автозапуск включён")
 	}
-	if err := setAutostart(false); err != nil {
+	if err := run.Set(false); err != nil {
 		t.Errorf("повторное выключение: %v", err)
 	}
 }
 
 func TestAutostartMissingKey(t *testing.T) {
-	setVar(t, &autostartRegistryPath, `Software\volume_switch_test_no_such_key`)
-	if isAutostartEnabled() {
+	run := autostart{key: `Software\volume_switch_test_no_such_key`}
+	if run.Enabled() {
 		t.Error("нет ключа: автозапуск включён")
 	}
-	if err := setAutostart(true); err == nil {
+	if err := run.Set(true); err == nil {
 		t.Error("нет ключа: ожидалась ошибка")
 	}
 }
 
 func TestMPCExeFromRegistry(t *testing.T) {
-	setVar(t, &mpcRegistryPath, `Software\volume_switch_test_no_such_key`)
-	if got := mpcExeFromRegistry(); got != "" {
+	c := &mpcClient{registryKey: `Software\volume_switch_test_no_such_key`}
+	if got := c.exeFromRegistry(); got != "" {
 		t.Errorf("нет ключа: %q", got)
 	}
 
-	mpcRegistryPath = tempRegistryKey(t)
-	if got := mpcExeFromRegistry(); got != "" {
+	c.registryKey = tempRegistryKey(t)
+	if got := c.exeFromRegistry(); got != "" {
 		t.Errorf("нет значения: %q", got)
 	}
-	setRegistryString(t, mpcRegistryPath, "ExePath", `D:\MPC\mpc-hc64.exe`)
-	if got := mpcExeFromRegistry(); got != `D:\MPC\mpc-hc64.exe` {
+	setRegistryString(t, c.registryKey, "ExePath", `D:\MPC\mpc-hc64.exe`)
+	if got := c.exeFromRegistry(); got != `D:\MPC\mpc-hc64.exe` {
 		t.Errorf("ExePath = %q", got)
 	}
 }
@@ -870,22 +894,21 @@ func TestMPCExePathFallbacks(t *testing.T) {
 		t.Fatal(err)
 	}
 	missing := filepath.Join(t.TempDir(), "missing.exe")
-	setVar(t, &mpcRegistryPath, tempRegistryKey(t))
+	c := &mpcClient{defaultExe: existing, registryKey: tempRegistryKey(t)}
 
-	setVar(t, &defaultMPCExe, existing)
-	if got := mpcExePath(); got != existing {
+	if got := c.exePath(); got != existing {
 		t.Errorf("файл по умолчанию есть: %q", got)
 	}
 
-	defaultMPCExe = missing
-	if got := mpcExePath(); got != missing {
+	c.defaultExe = missing
+	if got := c.exePath(); got != missing {
 		t.Errorf("ни файла, ни реестра: %q, want путь по умолчанию", got)
 	}
 
 	// Stat падает не с «нет файла» — это логируется, дальше реестр.
-	defaultMPCExe = "bad\x00path"
-	setRegistryString(t, mpcRegistryPath, "ExePath", `D:\MPC\mpc-hc64.exe`)
-	if got := mpcExePath(); got != `D:\MPC\mpc-hc64.exe` {
+	c.defaultExe = "bad\x00path"
+	setRegistryString(t, c.registryKey, "ExePath", `D:\MPC\mpc-hc64.exe`)
+	if got := c.exePath(); got != `D:\MPC\mpc-hc64.exe` {
 		t.Errorf("из реестра: %q", got)
 	}
 }
@@ -905,12 +928,13 @@ func TestStartDetached(t *testing.T) {
 	}
 }
 
-func TestLaunchMPC(t *testing.T) {
+func TestMPCLaunch(t *testing.T) {
 	const exe = `D:\Tools\MPC\mpc-hc64.exe`
 	t.Setenv("MPC_EXE", exe)
+	c := newMPCClient(defaultURL)
 
 	started := fakeStart(t, nil)
-	launchMPC()
+	c.Launch()
 	if len(*started) != 1 {
 		t.Fatalf("запущено %d процессов, want 1", len(*started))
 	}
@@ -919,7 +943,7 @@ func TestLaunchMPC(t *testing.T) {
 	}
 
 	fakeStart(t, errors.New("boom"))
-	launchMPC() // ошибка только логируется
+	c.Launch() // ошибка только логируется
 }
 
 func TestOpenContainingFolder(t *testing.T) {
@@ -943,18 +967,18 @@ func TestOpenContainingFolder(t *testing.T) {
 	openContainingFolder(`C:\x.mkv`) // ошибка только логируется
 }
 
-func TestToggleMPCPlaybackFallbacks(t *testing.T) {
+func TestMPCTogglePlaybackFallbacks(t *testing.T) {
 	started := fakeStart(t, nil)
 	t.Setenv("MPC_EXE", `D:\MPC\mpc-hc64.exe`)
 
-	toggleMPCPlayback("")
+	newMPCClient("").TogglePlayback()
 	if len(*started) != 0 {
 		t.Fatal("без URL ничего запускаться не должно")
 	}
 
 	srv := httptest.NewServer(http.NotFoundHandler())
 	srv.Close()
-	toggleMPCPlayback(srv.URL + "/variables.html")
+	newMPCClient(srv.URL + "/variables.html").TogglePlayback()
 	if len(*started) != 1 || (*started)[0].Path != `D:\MPC\mpc-hc64.exe` {
 		t.Fatalf("MPC-HC недоступен — ожидался запуск MPC-HC, запущено: %v", *started)
 	}
@@ -963,7 +987,7 @@ func TestToggleMPCPlaybackFallbacks(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	defer rejected.Close()
-	toggleMPCPlayback(rejected.URL + "/variables.html")
+	newMPCClient(rejected.URL + "/variables.html").TogglePlayback()
 	if len(*started) != 1 {
 		t.Error("отказ web-интерфейса не должен запускать MPC-HC")
 	}
@@ -1016,34 +1040,30 @@ type fakeCheckbox struct{ checked bool }
 func (c *fakeCheckbox) Check()   { c.checked = true }
 func (c *fakeCheckbox) Uncheck() { c.checked = false }
 
-func TestSetChecked(t *testing.T) {
+func TestDeviceMenuCheck(t *testing.T) {
 	a, b := &fakeCheckbox{checked: true}, &fakeCheckbox{}
-	setVar(t, &deviceItems, map[string]checkbox{"a": a, "b": b})
+	m := &deviceMenu{items: map[string]checkbox{"a": a, "b": b}}
 
-	setChecked("b")
+	m.check("b")
 	if a.checked || !b.checked {
 		t.Errorf("после выбора b: a=%v b=%v", a.checked, b.checked)
 	}
-	setChecked("нет такого")
+	m.check("нет такого")
 	if a.checked || b.checked {
 		t.Errorf("неизвестный ID: a=%v b=%v, want обе сняты", a.checked, b.checked)
 	}
 }
 
-func TestStartHotkeys(t *testing.T) {
-	setVar(t, &hotkeys, nil)
+func TestHotkeyHookStartStop(t *testing.T) {
 	// Пустая карта: пока хук стоит, все клавиши проходят дальше как обычно.
-	stop, err := startHotkeys(map[uint32]func(){})
-	if err != nil {
-		t.Fatalf("startHotkeys: %v", err)
+	h := newHotkeyHook(map[uint32]func(){}, func(bool) {})
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-	if hotkeys == nil {
-		t.Error("карта обработчиков не установлена")
+	if err := h.Stop(); err != nil {
+		t.Errorf("Stop: %v", err)
 	}
-	if err := stop(); err != nil {
-		t.Errorf("stop: %v", err)
-	}
-	if err := stop(); err == nil {
+	if err := h.Stop(); err == nil {
 		t.Error("повторное снятие уже снятого хука: ожидалась ошибка")
 	}
 }
@@ -1052,65 +1072,59 @@ func TestStartHotkeys(t *testing.T) {
 // Окна Fyne (тестовый драйвер, без настоящих окон)
 // ---------------------------------------------------------------------------
 
-func TestBuildUI(t *testing.T) {
-	setupUI(t, defaultURL)
-	if mainWindow == nil || volumeWindow == nil {
-		t.Fatal("окна не созданы")
+func TestNewOverlays(t *testing.T) {
+	ui := setupUI(t, defaultURL)
+	if got := ui.progress.window.Title(); got != windowTitle {
+		t.Errorf("заголовок прогресса %q, want %q", got, windowTitle)
 	}
-	if mainWindow.Title() != windowTitle || volumeWindow.Title() != volumeWindowTitle {
-		t.Errorf("заголовки %q, %q", mainWindow.Title(), volumeWindow.Title())
+	if got := ui.volume.window.Title(); got != volumeWindowTitle {
+		t.Errorf("заголовок громкости %q, want %q", got, volumeWindowTitle)
 	}
-	if len(volumeTicks) != volumeTickCount+1 || volumeTickLabels[volumeTickCount].Text != "100" {
-		t.Errorf("шкала громкости: %d отметок", len(volumeTicks))
+	if len(ui.volume.ticks) != volumeTickCount+1 || ui.volume.tickLabels[volumeTickCount].Text != "100" {
+		t.Errorf("шкала громкости: %d отметок", len(ui.volume.ticks))
 	}
-	if got := progressBar.TextFormatter(); got != "Ожидание подключения к MPC-HC..." {
+	if got := ui.progress.bar.TextFormatter(); got != "Ожидание подключения к MPC-HC..." {
 		t.Errorf("начальный текст %q", got)
 	}
 }
 
-func TestToggleMPCWindow(t *testing.T) {
-	setupUI(t, defaultURL)
-	toggleMPCWindow()
-	if !winVisible {
+func TestProgressOverlayToggle(t *testing.T) {
+	p := setupUI(t, defaultURL).progress
+	p.Toggle()
+	if !p.visible {
 		t.Error("после первого F5 окно должно быть показано")
 	}
-	toggleMPCWindow()
-	if winVisible {
+	p.Toggle()
+	if p.visible {
 		t.Error("после второго F5 окно должно быть скрыто")
-	}
-
-	setVar(t, &mainWindow, nil)
-	toggleMPCWindow() // окно ещё не создано — только запись в лог
-	if winVisible {
-		t.Error("без окна состояние меняться не должно")
 	}
 }
 
-func TestShowProgress(t *testing.T) {
-	setupUI(t, defaultURL)
+func TestProgressOverlayShow(t *testing.T) {
+	p := setupUI(t, defaultURL).progress
 
-	showProgress(&MPCState{Position: 61_000, Duration: 3_600_000,
+	p.show(&MPCState{Position: 61_000, Duration: 3_600_000,
 		StateString: "Пауза", File: "movie.mkv", FilePath: `E:\movie.mkv`})
-	if elapsedLabel.Text != "01:01" || remainingLabel.Text != "-58:59" {
-		t.Errorf("подписи %q / %q", elapsedLabel.Text, remainingLabel.Text)
+	if p.elapsed.Text != "01:01" || p.remaining.Text != "-58:59" {
+		t.Errorf("подписи %q / %q", p.elapsed.Text, p.remaining.Text)
 	}
-	if want := "movie.mkv   —   1.7%  Пауза  (из 1:00:00)"; progressText != want {
-		t.Errorf("текст %q, want %q", progressText, want)
+	if want := "movie.mkv   —   1.7%  Пауза  (из 1:00:00)"; p.text != want {
+		t.Errorf("текст %q, want %q", p.text, want)
 	}
-	if currentFilePath != `E:\movie.mkv` {
-		t.Errorf("currentFilePath = %q", currentFilePath)
+	if p.filePath != `E:\movie.mkv` {
+		t.Errorf("filePath = %q", p.filePath)
 	}
 
 	// Позиция за концом файла: полоса обрезается до 100%.
-	showProgress(&MPCState{Position: 5_000_000, Duration: 3_600_000})
-	if elapsedLabel.Text != "1:23:20" || progressBar.Value != 1 {
-		t.Errorf("elapsed=%q value=%v", elapsedLabel.Text, progressBar.Value)
+	p.show(&MPCState{Position: 5_000_000, Duration: 3_600_000})
+	if p.elapsed.Text != "1:23:20" || p.bar.Value != 1 {
+		t.Errorf("elapsed=%q value=%v", p.elapsed.Text, p.bar.Value)
 	}
 
-	showProgress(&MPCState{})
-	if progressText != "Нет активного воспроизведения" || progressBar.Value != 0 ||
-		elapsedLabel.Text != "00:00" || remainingLabel.Text != "00:00" {
-		t.Errorf("без файла: %q value=%v %q %q", progressText, progressBar.Value, elapsedLabel.Text, remainingLabel.Text)
+	p.show(&MPCState{})
+	if p.text != "Нет активного воспроизведения" || p.bar.Value != 0 ||
+		p.elapsed.Text != "00:00" || p.remaining.Text != "00:00" {
+		t.Errorf("без файла: %q value=%v %q %q", p.text, p.bar.Value, p.elapsed.Text, p.remaining.Text)
 	}
 }
 
@@ -1125,7 +1139,7 @@ func ticksN(n int) <-chan time.Time {
 	return ticks
 }
 
-func TestPollMPC(t *testing.T) {
+func TestProgressOverlayPoll(t *testing.T) {
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if requests.Add(1) <= 2 {
@@ -1135,22 +1149,22 @@ func TestPollMPC(t *testing.T) {
 		_, _ = w.Write([]byte(sampleStatusJSON))
 	}))
 	defer srv.Close()
-	setupUI(t, srv.URL)
+	p := setupUI(t, srv.URL).progress
 
 	// Первый ответ — ошибка.
-	pollMPC(srv.URL, ticksN(1))
-	if !strings.HasPrefix(progressText, "⚠ Нет связи с MPC-HC: HTTP 503") {
-		t.Errorf("при ошибке текст %q", progressText)
+	p.Poll(ticksN(1))
+	if !strings.HasPrefix(p.text, "⚠ Нет связи с MPC-HC: HTTP 503") {
+		t.Errorf("при ошибке текст %q", p.text)
 	}
 
 	// Ещё одна такая же ошибка (в лог не дублируется), затем связь
 	// восстанавливается.
-	pollMPC(srv.URL, ticksN(2))
+	p.Poll(ticksN(2))
 	if requests.Load() != 3 {
 		t.Fatalf("запросов %d, want 3", requests.Load())
 	}
-	if !strings.HasPrefix(progressText, "movie.mkv") {
-		t.Errorf("после восстановления связи текст %q", progressText)
+	if !strings.HasPrefix(p.text, "movie.mkv") {
+		t.Errorf("после восстановления связи текст %q", p.text)
 	}
 }
 
@@ -1170,25 +1184,25 @@ func (w *hideSpy) Hide() {
 	}
 }
 
-func TestShowVolumeOverlay(t *testing.T) {
-	setupUI(t, defaultURL)
+func TestVolumeOverlayShow(t *testing.T) {
+	v := setupUI(t, defaultURL).volume
 	hidden := make(chan struct{}, 1)
-	setVar(t, &volumeWindow, fyne.Window(&hideSpy{Window: volumeWindow, hidden: hidden}))
+	v.window = &hideSpy{Window: v.window, hidden: hidden}
 
-	showVolumeOverlay(0.5, false)
-	if volumePercent.Text != "50%" || volumeBarFill.FillColor != volumeFillColor {
-		t.Errorf("текст %q, цвет %v", volumePercent.Text, volumeBarFill.FillColor)
+	v.Show(0.5, false)
+	if v.percent.Text != "50%" || v.fill.FillColor != volumeFillColor {
+		t.Errorf("текст %q, цвет %v", v.percent.Text, v.fill.FillColor)
 	}
-	if fill, track := volumeBarFill.Size().Width, volumeBarTrack.Size().Width; track <= 0 || fill != track/2 {
+	if fill, track := v.fill.Size().Width, v.track.Size().Width; track <= 0 || fill != track/2 {
 		t.Errorf("заливка %v при ширине трека %v, want половину", fill, track)
 	}
 
 	// Повторный вызов перезапускает таймер скрытия; mute красит заливку.
-	showVolumeOverlay(1.5, true)
-	if volumePercent.Text != "MUTE" || volumeBarFill.FillColor != volumeMuteColor {
-		t.Errorf("mute: текст %q, цвет %v", volumePercent.Text, volumeBarFill.FillColor)
+	v.Show(1.5, true)
+	if v.percent.Text != "MUTE" || v.fill.FillColor != volumeMuteColor {
+		t.Errorf("mute: текст %q, цвет %v", v.percent.Text, v.fill.FillColor)
 	}
-	if volumeBarFill.Size().Width != volumeBarTrack.Size().Width {
+	if v.fill.Size().Width != v.track.Size().Width {
 		t.Error("уровень больше 1 должен обрезаться до полной шкалы")
 	}
 
@@ -1197,15 +1211,6 @@ func TestShowVolumeOverlay(t *testing.T) {
 	case <-time.After(volumeOverlayDuration + 2*time.Second):
 		t.Fatal("оверлей не скрылся по таймеру")
 	}
-}
-
-func TestShowVolumeOverlayWithoutWindow(t *testing.T) {
-	setVar(t, &fyneApp, test.NewTempApp(t))
-	setVar(t, &volumeWindow, nil)
-	showVolumeOverlay(0.5, false) // окна ещё нет — ничего не происходит
-	volumeMu.Lock()
-	volumeHideTimer.Stop()
-	volumeMu.Unlock()
 }
 
 type fakeDesktopWindow struct {
@@ -1237,31 +1242,31 @@ func TestClickCatcher(t *testing.T) {
 		commands <- r.URL.RequestURI()
 	}))
 	defer srv.Close()
-	setupUI(t, srv.URL+"/variables.html")
-	mainWindow.Resize(fyne.NewSize(800, 100))
+	p := setupUI(t, srv.URL+"/variables.html").progress
+	p.window.Resize(fyne.NewSize(800, 100))
 	started := fakeStart(t, nil)
 
-	c := newClickCatcher(srv.URL + "/variables.html")
+	c := newClickCatcher(p)
 	if r := c.CreateRenderer(); len(r.Objects()) != 1 {
 		t.Errorf("рендерер: %d объектов", len(r.Objects()))
 	}
 	c.MouseDown(&desktop.MouseEvent{})
 
-	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(progressBar)
-	size := progressBar.Size()
+	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(p.bar)
+	size := p.bar.Size()
 	inside := pos.Add(fyne.NewPos(size.Width/2, size.Height/2))
 	outside := fyne.NewPos(pos.X+size.Width/2, pos.Y+size.Height+50)
-	if !pointInProgressBar(inside) || pointInProgressBar(outside) {
-		t.Fatalf("pointInProgressBar: inside=%v outside=%v (bar %v @ %v)",
-			pointInProgressBar(inside), pointInProgressBar(outside), size, pos)
+	if !p.inBar(inside) || p.inBar(outside) {
+		t.Fatalf("inBar: inside=%v outside=%v (bar %v @ %v)",
+			p.inBar(inside), p.inBar(outside), size, pos)
 	}
 
-	click := func(b desktop.MouseButton, p fyne.Position) {
-		c.MouseUp(&desktop.MouseEvent{PointEvent: fyne.PointEvent{Position: p}, Button: b})
+	click := func(b desktop.MouseButton, pt fyne.Position) {
+		c.MouseUp(&desktop.MouseEvent{PointEvent: fyne.PointEvent{Position: pt}, Button: b})
 	}
 
 	// Колесо — проводник с текущим файлом.
-	currentFilePath = `E:\movie.mkv`
+	p.filePath = `E:\movie.mkv`
 	click(desktop.MouseButtonTertiary, outside)
 	if len(*started) != 1 {
 		t.Errorf("клик колесом: запущено %d процессов, want 1 (explorer)", len(*started))
@@ -1285,13 +1290,6 @@ func TestClickCatcher(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("команда Play/Pause не отправлена")
-	}
-}
-
-func TestPointInProgressBarWithoutBar(t *testing.T) {
-	setVar(t, &progressBar, nil)
-	if pointInProgressBar(fyne.NewPos(1, 1)) {
-		t.Error("без полосы прогресса клик не может в неё попасть")
 	}
 }
 
@@ -1495,21 +1493,17 @@ func TestDataDir(t *testing.T) {
 }
 
 func TestOnExit(t *testing.T) {
-	stopped := 0
-	setVar(t, &stopHotkeys, func() error {
-		stopped++
-		if stopped > 1 {
-			return errors.New("уже снят")
-		}
-		return nil
-	})
-	setVar(t, &fyneApp, test.NewTempApp(t))
+	// Хук с пустой картой: пока он стоит, все клавиши проходят как обычно.
+	hk := newHotkeyHook(map[uint32]func(){}, func(bool) {})
+	if err := hk.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	sw := &Switcher{quit: make(chan struct{})}
-	setVar(t, &switcher, deviceSwitcher(sw))
+	a := &trayApp{ui: setupUI(t, defaultURL), switcher: sw, hotkeys: hk}
 
-	onExit()
-	if stopped != 1 {
-		t.Errorf("хук снимался %d раз, want 1", stopped)
+	a.onExit()
+	if err := hk.Stop(); err == nil {
+		t.Error("хук не снят")
 	}
 	select {
 	case <-sw.quit:
@@ -1517,10 +1511,10 @@ func TestOnExit(t *testing.T) {
 		t.Error("switcher не закрыт")
 	}
 
-	// Повторно: ошибка снятия хука только логируется; без switcher и Fyne
-	// ничего не падает.
-	switcher, fyneApp = nil, nil
-	onExit()
+	// Повторно: ошибка снятия уже снятого хука только логируется; без
+	// switcher и Fyne ничего не падает.
+	a.ui, a.switcher = nil, nil
+	a.onExit()
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,14 +1564,13 @@ func fakeTooltip(t *testing.T) <-chan string {
 	return tips
 }
 
-func TestSelectDevice(t *testing.T) {
+func TestTrayAppSelectDevice(t *testing.T) {
 	a, b := &fakeCheckbox{checked: true}, &fakeCheckbox{}
-	setVar(t, &deviceItems, map[string]checkbox{"a": a, "b": b})
 	sw := &fakeSwitcher{}
-	setVar(t, &switcher, deviceSwitcher(sw))
+	app := &trayApp{switcher: sw, devices: deviceMenu{items: map[string]checkbox{"a": a, "b": b}}}
 	tips := fakeTooltip(t)
 
-	selectDevice(Device{ID: "b", Name: "Наушники"})
+	app.selectDevice(Device{ID: "b", Name: "Наушники"})
 	if fmt.Sprint(sw.setIDs) != "[b]" {
 		t.Errorf("SetDefault вызван с %v", sw.setIDs)
 	}
@@ -1590,20 +1583,19 @@ func TestSelectDevice(t *testing.T) {
 
 	// Ошибка переключения: ни галочки, ни подсказка не меняются.
 	sw.setErr = errors.New("COM")
-	selectDevice(Device{ID: "a", Name: "Колонки"})
+	app.selectDevice(Device{ID: "a", Name: "Колонки"})
 	if a.checked || !b.checked || len(tips) != 0 {
 		t.Errorf("после ошибки: a=%v b=%v, подсказок %d", a.checked, b.checked, len(tips))
 	}
 }
 
-func TestOnCycle(t *testing.T) {
+func TestTrayAppCycle(t *testing.T) {
 	a, b := &fakeCheckbox{checked: true}, &fakeCheckbox{}
-	setVar(t, &deviceItems, map[string]checkbox{"a": a, "b": b})
 	sw := &fakeSwitcher{cycleDev: Device{ID: "b", Name: "Наушники"}}
-	setVar(t, &switcher, deviceSwitcher(sw))
+	app := &trayApp{switcher: sw, devices: deviceMenu{items: map[string]checkbox{"a": a, "b": b}}}
 	tips := fakeTooltip(t)
 
-	onCycle(1)
+	app.cycle(1)
 	if fmt.Sprint(sw.cycles) != "[1]" || a.checked || !b.checked {
 		t.Errorf("cycles=%v a=%v b=%v", sw.cycles, a.checked, b.checked)
 	}
@@ -1612,16 +1604,15 @@ func TestOnCycle(t *testing.T) {
 	}
 
 	sw.cycleErr = errors.New("нет устройств")
-	onCycle(-1)
+	app.cycle(-1)
 	if fmt.Sprint(sw.cycles) != "[1 -1]" || !b.checked || len(tips) != 0 {
 		t.Errorf("после ошибки: cycles=%v b=%v, подсказок %d", sw.cycles, b.checked, len(tips))
 	}
 }
 
-func TestBuildDeviceMenu(t *testing.T) {
-	setVar(t, &deviceItems, nil)
+func TestDeviceMenuBuild(t *testing.T) {
 	sw := &fakeSwitcher{}
-	setVar(t, &switcher, deviceSwitcher(sw))
+	app := &trayApp{switcher: sw}
 	tips := fakeTooltip(t)
 
 	type fakeItem struct {
@@ -1636,7 +1627,7 @@ func TestBuildDeviceMenu(t *testing.T) {
 		return it.box, it.clicks
 	})
 
-	buildDeviceMenu([]Device{{ID: "a", Name: "Колонки"}, {ID: "b", Name: "Наушники"}}, "a")
+	app.devices.build([]Device{{ID: "a", Name: "Колонки"}, {ID: "b", Name: "Наушники"}}, "a", app.selectDevice)
 	if len(items) != 2 || items[0].title != "Колонки" || items[1].title != "Наушники" {
 		t.Fatalf("пункты меню: %+v", items)
 	}
@@ -1701,12 +1692,10 @@ func TestRegistryValuesOfWrongType(t *testing.T) {
 	setRegistryDWord(t, path, autostartValueName, 1)
 	setRegistryDWord(t, path, "ExePath", 1)
 
-	setVar(t, &autostartRegistryPath, path)
-	if isAutostartEnabled() {
+	if (autostart{key: path}).Enabled() {
 		t.Error("DWORD вместо строки: автозапуск считается включённым")
 	}
-	setVar(t, &mpcRegistryPath, path)
-	if got := mpcExeFromRegistry(); got != "" {
+	if got := (&mpcClient{registryKey: path}).exeFromRegistry(); got != "" {
 		t.Errorf("DWORD вместо строки: ExePath = %q", got)
 	}
 }
@@ -1723,17 +1712,17 @@ func truncatedServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func TestFetchStateTruncatedBody(t *testing.T) {
+func TestMPCStateTruncatedBody(t *testing.T) {
 	srv := truncatedServer(t)
-	if _, err := fetchState(srv.URL, srv.Client()); err == nil {
+	if _, err := (&mpcClient{baseURL: srv.URL, http: srv.Client()}).State(); err == nil {
 		t.Error("оборванный ответ: ожидалась ошибка")
 	}
 }
 
-func TestToggleMPCPlaybackTruncatedBody(t *testing.T) {
+func TestMPCTogglePlaybackTruncatedBody(t *testing.T) {
 	started := fakeStart(t, nil)
 	srv := truncatedServer(t)
-	toggleMPCPlayback(srv.URL + "/variables.html") // ошибка чтения только в лог
+	newMPCClient(srv.URL + "/variables.html").TogglePlayback() // ошибка чтения только в лог
 	if len(*started) != 0 {
 		t.Error("ответ получен — MPC-HC запускать не нужно")
 	}
@@ -1763,18 +1752,18 @@ func TestStepLevel(t *testing.T) {
 	}
 }
 
-func TestOnVolumeKey(t *testing.T) {
+func TestTrayAppStepVolume(t *testing.T) {
 	sw := &fakeSwitcher{}
-	setVar(t, &switcher, deviceSwitcher(sw))
+	app := &trayApp{switcher: sw}
 
-	onVolumeKey(-volumeKeyStep)
-	onVolumeKey(volumeKeyStep)
+	app.stepVolume(-volumeKeyStep)
+	app.stepVolume(volumeKeyStep)
 	if fmt.Sprint(sw.steps) != "[-0.02 0.02]" {
 		t.Errorf("StepVolume вызван с %v", sw.steps)
 	}
 
 	sw.stepErr = errors.New("COM")
-	onVolumeKey(volumeKeyStep) // ошибка только в лог
+	app.stepVolume(volumeKeyStep) // ошибка только в лог
 }
 
 func TestKeyHeld(t *testing.T) {

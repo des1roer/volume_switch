@@ -313,8 +313,42 @@ func loadDotEnv(path string) {
 	log.Printf(".env: %s загружен, %d переменных", path, loaded)
 }
 
+// config — итоговые настройки программы.
+type config struct {
+	debug    bool
+	mpcURL   string        // адрес web-интерфейса MPC-HC
+	interval time.Duration // интервал опроса MPC-HC для оверлея
+}
+
+// resolveConfig собирает настройки по приоритету: флаги, затем окружение (к
+// этому моменту в нём уже и значения из .env), затем умолчания. Пустой флаг
+// (urlFlag == "", intervalFlag <= 0) означает «не задан».
+func resolveConfig(debug bool, urlFlag string, intervalFlag time.Duration) config {
+	cfg := config{debug: debug, mpcURL: defaultURL, interval: defaultInterval}
+
+	if v := os.Getenv("MPC_URL"); v != "" {
+		cfg.mpcURL = v
+	}
+	if urlFlag != "" {
+		cfg.mpcURL = urlFlag
+	}
+
+	if v := os.Getenv("MPC_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.interval = d
+		} else {
+			log.Printf("MPC_INTERVAL=%q не парсится как duration, беру %s", v, defaultInterval)
+		}
+	}
+	if intervalFlag > 0 {
+		cfg.interval = intervalFlag
+	}
+	return cfg
+}
+
 // ---------------------------------------------------------------------------
-// Состояние MPC-HC через JSON API web-интерфейса (status.json)
+// MPC-HC: состояние через JSON API web-интерфейса (status.json), команды и
+// запуск плеера
 // ---------------------------------------------------------------------------
 
 // MPCState — ответ /status.json web-интерфейса MPC-HC. Из JSON берутся только
@@ -354,15 +388,36 @@ func mpcEndpoint(base, page string) string {
 	return b.ResolveReference(ref).String()
 }
 
-// fetchState запрашивает состояние плеера из /status.json. Эта страница есть
+// mpcClient — MPC-HC с точки зрения программы: его web-интерфейс (опрос
+// состояния и команды) и сам exe, который запускается, если плеер не открыт.
+type mpcClient struct {
+	baseURL string // MPC_URL — корень web-интерфейса или любая его страница
+	http    *http.Client
+
+	// Где искать exe MPC-HC (см. exePath): путь по умолчанию и ключ HKCU, в
+	// который MPC-HC сам пишет ExePath. В тестах подменяются.
+	defaultExe  string
+	registryKey string
+}
+
+func newMPCClient(baseURL string) *mpcClient {
+	return &mpcClient{
+		baseURL:     baseURL,
+		http:        &http.Client{Timeout: 2 * time.Second},
+		defaultExe:  defaultMPCExe,
+		registryKey: mpcRegistryKey,
+	}
+}
+
+// State запрашивает состояние плеера из /status.json. Эта страница есть
 // в MPC-HC 2.x (форк clsid2, его же ставит K-Lite); у старых версий её нет —
 // тогда приходит 404.
-func fetchState(baseURL string, client *http.Client) (_ *MPCState, err error) {
-	statusURL := mpcEndpoint(baseURL, "status.json")
+func (c *mpcClient) State() (_ *MPCState, err error) {
+	statusURL := mpcEndpoint(c.baseURL, "status.json")
 	if statusURL == "" {
-		return nil, fmt.Errorf("некорректный адрес web-интерфейса %q", baseURL)
+		return nil, fmt.Errorf("некорректный адрес web-интерфейса %q", c.baseURL)
 	}
-	resp, err := client.Get(statusURL)
+	resp, err := c.http.Get(statusURL)
 	if err != nil {
 		return nil, err
 	}
@@ -384,6 +439,111 @@ func fetchState(baseURL string, client *http.Client) (_ *MPCState, err error) {
 		return nil, fmt.Errorf("разбор status.json: %w", err)
 	}
 	return &st, nil
+}
+
+// mpcPlayPauseCommand — WM_COMMAND ID пункта «Play/Pause» в MPC-HC
+// (ID_PLAY_PLAYPAUSE). Соседние команды: 887 Play, 888 Pause, 890 Stop — те
+// же номера принимает web-интерфейс в command.html.
+const mpcPlayPauseCommand = 889
+
+// mpcCommandURL строит URL команды web-интерфейса MPC-HC (command.html, номер
+// команды — параметром wm_command) из адреса MPC_URL, см. mpcEndpoint.
+//
+//	http://localhost:7777/ -> http://localhost:7777/command.html?wm_command=889
+func mpcCommandURL(baseURL string, command int) string {
+	return mpcEndpoint(baseURL, fmt.Sprintf("command.html?wm_command=%d", command))
+}
+
+// TogglePlayback отправляет в web-интерфейс MPC-HC команду «Play/Pause»,
+// то есть ставит воспроизведение на паузу либо возобновляет его — в
+// зависимости от текущего состояния плеера. Состояние заранее не
+// запрашивается: команда сама по себе переключающая, а лишний опрос добавил
+// бы только гонку между чтением состояния и его изменением. Если
+// web-интерфейс не отвечает (MPC-HC не запущен), запускает MPC-HC.
+func (c *mpcClient) TogglePlayback() {
+	cmdURL := mpcCommandURL(c.baseURL, mpcPlayPauseCommand)
+	if cmdURL == "" {
+		log.Printf("mpc command: адрес web-интерфейса неизвестен, команда не отправлена")
+		return
+	}
+
+	resp, err := c.http.Get(cmdURL)
+	if err != nil {
+		log.Printf("mpc command: не удалось отправить %s: %v — запускаю MPC-HC", cmdURL, err)
+		c.Launch()
+		return
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("mpc command: закрытие ответа: %v", err)
+		}
+	}()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		log.Printf("mpc command: чтение ответа: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("mpc command: play/pause -> %s отклонена: %s", cmdURL, resp.Status)
+		return
+	}
+	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
+}
+
+// Где по умолчанию искать MPC-HC (см. mpcClient.exePath).
+const (
+	defaultMPCExe  = `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`
+	mpcRegistryKey = `Software\MPC-HC\MPC-HC`
+)
+
+// exePath возвращает путь к MPC-HC: MPC_EXE из окружения/.env; иначе
+// defaultExe, если такой файл есть; иначе путь, который MPC-HC сам пишет в
+// реестр при каждом запуске (HKCU\Software\MPC-HC\MPC-HC\ExePath).
+func (c *mpcClient) exePath() string {
+	if p := os.Getenv("MPC_EXE"); p != "" {
+		return p
+	}
+	_, err := os.Stat(c.defaultExe)
+	if err == nil {
+		return c.defaultExe
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("mpc launch: проверка %s: %v", c.defaultExe, err)
+	}
+	if p := c.exeFromRegistry(); p != "" {
+		return p
+	}
+	return c.defaultExe
+}
+
+// exeFromRegistry читает ExePath из ключа registryKey в HKCU; "" — если
+// значения нет или его не удалось прочитать.
+func (c *mpcClient) exeFromRegistry() string {
+	key, err := registry.OpenKey(registry.CURRENT_USER, c.registryKey, registry.QUERY_VALUE)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			log.Printf("mpc launch: открытие ключа реестра MPC-HC: %v", err)
+		}
+		return ""
+	}
+	defer logRegistryClose(key, "MPC-HC")
+	p, _, err := key.GetStringValue("ExePath")
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		log.Printf("mpc launch: чтение ExePath из реестра: %v", err)
+	}
+	return p
+}
+
+// Launch запускает MPC-HC. Повторный запуск при уже открытом плеере
+// безвреден: MPC-HC по умолчанию работает в режиме одного экземпляра и просто
+// выводит своё окно на передний план.
+func (c *mpcClient) Launch() {
+	exe := c.exePath()
+	cmd := exec.Command(exe)
+	cmd.Dir = filepath.Dir(exe)
+	if err := startDetached(cmd); err != nil {
+		log.Printf("mpc launch: не удалось запустить %s: %v", exe, err)
+		return
+	}
+	log.Printf("mpc launch: запущен %s", exe)
 }
 
 func formatTime(ms int64) string {
@@ -1023,60 +1183,213 @@ func wrapICO(pngData []byte, w, h int) []byte {
 // Fyne-окно (встроенный mpcprogress)
 // ---------------------------------------------------------------------------
 
-var (
-	fyneApp    fyne.App
-	mainWindow fyne.Window
+// overlays — Fyne-приложение с двумя окнами-оверлеями: прогресс MPC-HC (по
+// F5) и ползунок громкости (при изменении громкости).
+type overlays struct {
+	app      fyne.App
+	progress *progressOverlay
+	volume   *volumeOverlay
+}
 
-	// winVisible читается и меняется только внутри fyne.Do, т.е. всегда в
-	// одном UI-потоке, поэтому мьютекс не нужен.
-	winVisible bool
+// newOverlays создаёт в приложении оба окна-оверлея и оставляет их скрытыми.
+// Вызывается на горутине main (см. main), как и Run.
+func newOverlays(a fyne.App, mpc *mpcClient) *overlays {
+	a.Settings().SetTheme(theme.DarkTheme())
+	o := &overlays{
+		app:      a,
+		progress: newProgressOverlay(a, mpc),
+		volume:   newVolumeOverlay(a),
+	}
 
-	elapsedLabel   *widget.Label
-	remainingLabel *widget.Label
-	progressBar    *widget.ProgressBar
+	// Нативный HWND у Fyne/GLFW создаётся лениво, только при первом Show(),
+	// и в том же вызове сразу становится видимым. Если окно хоть раз
+	// показалось с обычным стилем, Explorer заводит ему кнопку в панели
+	// задач и не убирает её, даже когда окно потом получает
+	// WS_EX_TOOLWINDOW и прячется: на кнопке остаётся «призрак» (особенно
+	// при автозапуске на входе в Windows, когда Explorer ещё не успевает
+	// обработать смену стиля до скрытия). Поэтому окна создаются здесь
+	// вхолостую (показ + скрытие) под CBT-хуком createAsToolWindows,
+	// который выставляет WS_EX_TOOLWINDOW в момент создания HWND — до
+	// того, как окно хоть раз станет видимым.
+	//
+	// После этого оба окна стартуют скрытыми: прогресс покажем по F5,
+	// громкость — по событию от volume poller.
+	createAsToolWindows(func() {
+		for _, w := range []fyne.Window{o.progress.window, o.volume.window} {
+			showOverlay(w, w == o.progress.window)
+			w.Hide()
+		}
+	})
+	log.Printf("fyne: окна созданы, стартуют скрытыми")
+	return o
+}
 
-	// progressText — текущий текст поверх полосы прогресса (имя файла и
-	// статус воспроизведения), читается из progressBar.TextFormatter.
-	progressText string
+// Run запускает опрос MPC-HC и цикл приложения Fyne. Блокируется до Quit
+// (обычно — до выхода из трея).
+func (o *overlays) Run(interval time.Duration) {
+	log.Printf("fyne: запуск (interval=%s)", interval)
+	go o.progress.Poll(time.Tick(interval))
+	o.app.Run()
+	log.Printf("fyne: цикл приложения завершён")
+}
 
-	// currentFilePath — полный путь к текущему файлу MPC-HC (поле path
-	// из status.json), используется по клику колесом для открытия папки.
-	currentFilePath string
+// Quit завершает цикл приложения Fyne.
+func (o *overlays) Quit() {
+	o.app.Quit()
+}
 
-	// volumeWindow и компоненты ниже — оверлей-ползунок уровня громкости,
-	// показывается по событиям volumeMonitor (см. showVolumeOverlay). Все
-	// позиции/размеры примитивов выставляются вручную в layoutVolumeOverlay
-	// при каждом показе (окно без автоматического layout-менеджера, т.к.
-	// размер оверлея каждый раз пересчитывается под монитор курсора).
-	volumeWindow     fyne.Window
-	volumePercent    *canvas.Text
-	volumeBarTrack   *canvas.Rectangle
-	volumeBarFill    *canvas.Rectangle
-	volumeTicks      []*canvas.Line
-	volumeTickLabels []*canvas.Text
+// progressOverlay — окно с прогрессом воспроизведения MPC-HC: полоса с
+// именем файла и статусом, слева прошедшее время, справа оставшееся.
+//
+// Все поля, кроме неизменяемых window и mpc, читаются и меняются только в
+// UI-потоке Fyne (внутри fyne.Do или в обработчиках событий), поэтому
+// мьютекс не нужен.
+type progressOverlay struct {
+	window fyne.Window
+	mpc    *mpcClient
 
-	volumeMu        sync.Mutex
-	volumeHideTimer *time.Timer
-)
+	visible bool
 
-// clickCatcher — прозрачный виджет на весь оверлей, который ловит клики по
-// нему:
+	elapsed   *widget.Label
+	remaining *widget.Label
+	bar       *widget.ProgressBar
+
+	// text — текущий текст поверх полосы прогресса (имя файла и статус
+	// воспроизведения), читается из bar.TextFormatter.
+	text string
+
+	// filePath — полный путь к текущему файлу MPC-HC (поле path из
+	// status.json), используется по клику колесом для открытия папки.
+	filePath string
+}
+
+func newProgressOverlay(a fyne.App, mpc *mpcClient) *progressOverlay {
+	p := &progressOverlay{window: a.NewWindow(windowTitle), mpc: mpc}
+
+	// --- Размер/позиция окна под монитор с курсором ---
+	windowWidth, windowHeight := float32(900), float32(170)
+	posX, posY := 0, 0
+	if work, monitor, err := screenLayout(); err != nil {
+		log.Printf("fyne: не удалось определить монитор, размер по умолчанию: %v", err)
+	} else if work.Right > work.Left {
+		titleBar := titleBarHeight()
+		windowWidth = float32(work.Right - work.Left)
+		windowHeight = float32(monitor.Bottom-monitor.Top)*0.10 - float32(titleBar)
+		posX, posY = int(work.Left), int(work.Top)+int(titleBar)
+		log.Printf("fyne: монитор work=(%d,%d)-(%d,%d) monitor=(%d,%d)-(%d,%d) titleBar=%d",
+			work.Left, work.Top, work.Right, work.Bottom,
+			monitor.Left, monitor.Top, monitor.Right, monitor.Bottom, titleBar)
+	}
+	log.Printf("fyne: окно %0.fx%0.f @ (%d,%d)", windowWidth, windowHeight, posX, posY)
+
+	p.window.Resize(fyne.NewSize(windowWidth, windowHeight))
+	requestPosition(p.window, posX, posY)
+
+	// --- Виджеты ---
+	// Имя файла и статус выводятся прямо на полосе прогресса (через
+	// TextFormatter), а не отдельной строкой — главный элемент оверлея это
+	// сама полоса, текст встроен в неё.
+	p.elapsed = widget.NewLabelWithStyle("00:00",
+		fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Monospace: true})
+	p.remaining = widget.NewLabelWithStyle("00:00",
+		fyne.TextAlignTrailing, fyne.TextStyle{Bold: true, Monospace: true})
+
+	p.text = "Ожидание подключения к MPC-HC..."
+	p.bar = widget.NewProgressBar()
+	p.bar.TextFormatter = func() string { return p.text }
+
+	progressRow := container.NewBorder(nil, nil, p.elapsed, p.remaining, p.bar)
+	pad := theme.Padding()
+	body := container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow)
+	p.window.SetContent(container.NewStack(body, newClickCatcher(p)))
+	return p
+}
+
+// Toggle показывает окно, если оно скрыто, и прячет, если показано.
+func (p *progressOverlay) Toggle() {
+	fyne.Do(func() {
+		if p.visible {
+			p.window.Hide()
+			log.Printf("F5: окно скрыто")
+		} else {
+			showOverlay(p.window, true)
+			log.Printf("F5: окно показано поверх всех окон")
+		}
+		p.visible = !p.visible
+	})
+}
+
+// Poll на каждый тик опрашивает web-интерфейс MPC-HC и обновляет оверлей.
+// Работает, пока не закрыт ticks.
+func (p *progressOverlay) Poll(ticks <-chan time.Time) {
+	var lastErr string
+	for range ticks {
+		st, err := p.mpc.State()
+		if err != nil {
+			if err.Error() != lastErr {
+				log.Printf("mpc poll: ошибка: %v", err)
+				lastErr = err.Error()
+			}
+			fyne.Do(func() {
+				p.text = "⚠ Нет связи с MPC-HC: " + err.Error()
+				p.bar.Refresh()
+			})
+			continue
+		}
+		if lastErr != "" {
+			log.Printf("mpc poll: связь восстановлена")
+			lastErr = ""
+		}
+		fyne.Do(func() { p.show(st) })
+	}
+}
+
+// show выводит состояние MPC-HC на оверлей. Вызывается только из UI-потока
+// (через fyne.Do).
+func (p *progressOverlay) show(st *MPCState) {
+	p.filePath = st.FilePath
+	if st.Duration <= 0 {
+		p.text = "Нет активного воспроизведения"
+		p.bar.SetValue(0)
+		p.elapsed.SetText("00:00")
+		p.remaining.SetText("00:00")
+		return
+	}
+	progress := min(max(float64(st.Position)/float64(st.Duration), 0), 1)
+
+	p.elapsed.SetText(formatTime(st.Position))
+	p.remaining.SetText("-" + formatTime(st.Duration-st.Position))
+	p.text = fmt.Sprintf("%s   —   %.1f%%  %s  (из %s)",
+		st.File, progress*100, st.StateString, formatTime(st.Duration))
+	p.bar.SetValue(progress)
+}
+
+// inBar сообщает, попала ли точка клика (в координатах окна) в границы
+// полосы прогресса. Полоса занимает почти всю ширину оверлея, но клик по
+// подписям времени или по пустым полям окна воспроизведение не переключает.
+func (p *progressOverlay) inBar(pt fyne.Position) bool {
+	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(p.bar)
+	size := p.bar.Size()
+	return pt.X >= pos.X && pt.X <= pos.X+size.Width &&
+		pt.Y >= pos.Y && pt.Y <= pos.Y+size.Height
+}
+
+// clickCatcher — прозрачный виджет на весь оверлей прогресса, который ловит
+// клики по нему:
 //   - средняя кнопка (колесо) — открывает папку с текущим файлом в проводнике;
 //   - левая кнопка по полосе прогресса — ставит воспроизведение на паузу или
 //     возобновляет его (команда 889 «Play/Pause» web-интерфейса MPC-HC); если
 //     web-интерфейс недоступен (MPC-HC не запущен) — запускает MPC-HC.
 //
-// Правая кнопка не перехватывается вовсе. Адрес web-интерфейса передаётся в
-// конструктор, чтобы клик мог отправить команду в тот же web-интерфейс
-// MPC-HC, который опрашивает оверлей.
+// Правая кнопка не перехватывается вовсе.
 type clickCatcher struct {
 	widget.BaseWidget
 
-	mpcURL string
+	overlay *progressOverlay
 }
 
-func newClickCatcher(mpcURL string) *clickCatcher {
-	c := &clickCatcher{mpcURL: mpcURL}
+func newClickCatcher(overlay *progressOverlay) *clickCatcher {
+	c := &clickCatcher{overlay: overlay}
 	c.ExtendBaseWidget(c)
 	return c
 }
@@ -1091,137 +1404,61 @@ func (c *clickCatcher) MouseUp(ev *desktop.MouseEvent) {
 	switch ev.Button {
 	case desktop.MouseButtonTertiary:
 		log.Printf("overlay: клик колесом, открываю папку с файлом")
-		openContainingFolder(currentFilePath)
+		openContainingFolder(c.overlay.filePath)
 	case desktop.MouseButtonPrimary:
-		if !pointInProgressBar(ev.Position) {
+		if !c.overlay.inBar(ev.Position) {
 			return
 		}
 		log.Printf("overlay: клик левой кнопкой по полосе прогресса — переключаю воспроизведение")
 		// Запрос уходит из отдельной горутины: если MPC-HC не отвечает,
 		// HTTP-клиент ждёт до своего таймаута, и держать на этом событийный
 		// цикл Fyne нельзя.
-		go toggleMPCPlayback(c.mpcURL)
+		go c.overlay.mpc.TogglePlayback()
 	}
 }
 
-// pointInProgressBar сообщает, попала ли точка клика (в координатах окна) в
-// границы полосы прогресса. Полоса занимает почти всю ширину оверлея, но
-// клик по подписям времени или по пустым полям окна воспроизведение не
-// переключает.
-func pointInProgressBar(p fyne.Position) bool {
-	if progressBar == nil || fyne.CurrentApp() == nil {
-		return false
-	}
-	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(progressBar)
-	size := progressBar.Size()
-	return p.X >= pos.X && p.X <= pos.X+size.Width &&
-		p.Y >= pos.Y && p.Y <= pos.Y+size.Height
+// volumeOverlay — оверлей-ползунок уровня громкости, показывается по
+// событиям поллера громкости (см. Show). Все позиции/размеры примитивов
+// выставляются вручную в layout при каждом показе (окно без автоматического
+// layout-менеджера, т.к. размер оверлея каждый раз пересчитывается под
+// монитор курсора).
+type volumeOverlay struct {
+	window     fyne.Window
+	percent    *canvas.Text
+	track      *canvas.Rectangle
+	fill       *canvas.Rectangle
+	ticks      []*canvas.Line
+	tickLabels []*canvas.Text
+
+	mu        sync.Mutex // защищает hideTimer
+	hideTimer *time.Timer
 }
 
-// mpcPlayPauseCommand — WM_COMMAND ID пункта «Play/Pause» в MPC-HC
-// (ID_PLAY_PLAYPAUSE). Соседние команды: 887 Play, 888 Pause, 890 Stop — те
-// же номера принимает web-интерфейс в command.html.
-const mpcPlayPauseCommand = 889
+// newVolumeOverlay создаёт окно ползунка: большой процент и полоса с
+// градацией 0..100.
+func newVolumeOverlay(a fyne.App) *volumeOverlay {
+	v := &volumeOverlay{window: a.NewWindow(volumeWindowTitle)}
 
-// mpcCommandURL строит URL команды web-интерфейса MPC-HC (command.html, номер
-// команды — параметром wm_command) из адреса MPC_URL, см. mpcEndpoint.
-//
-//	http://localhost:7777/ -> http://localhost:7777/command.html?wm_command=889
-func mpcCommandURL(baseURL string, command int) string {
-	return mpcEndpoint(baseURL, fmt.Sprintf("command.html?wm_command=%d", command))
-}
+	v.percent = canvas.NewText("", color.White)
+	v.percent.Alignment = fyne.TextAlignCenter
+	v.percent.TextStyle = fyne.TextStyle{Bold: true}
 
-// toggleMPCPlayback отправляет в web-интерфейс MPC-HC команду «Play/Pause»,
-// то есть ставит воспроизведение на паузу либо возобновляет его — в
-// зависимости от текущего состояния плеера. Состояние заранее не
-// запрашивается: команда сама по себе переключающая, а лишний опрос добавил
-// бы только гонку между чтением состояния и его изменением.
-func toggleMPCPlayback(baseURL string) {
-	cmdURL := mpcCommandURL(baseURL, mpcPlayPauseCommand)
-	if cmdURL == "" {
-		log.Printf("mpc command: адрес web-интерфейса неизвестен, команда не отправлена")
-		return
-	}
+	v.track = canvas.NewRectangle(volumeTrackColor)
+	v.fill = canvas.NewRectangle(volumeFillColor)
 
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(cmdURL)
-	if err != nil {
-		log.Printf("mpc command: не удалось отправить %s: %v — запускаю MPC-HC", cmdURL, err)
-		launchMPC()
-		return
+	objects := []fyne.CanvasObject{v.track, v.fill, v.percent}
+	v.ticks = make([]*canvas.Line, volumeTickCount+1)
+	v.tickLabels = make([]*canvas.Text, volumeTickCount+1)
+	for i := range v.ticks {
+		line := canvas.NewLine(volumeTickColor)
+		label := canvas.NewText(strconv.Itoa(i*100/volumeTickCount), volumeLabelColor)
+		label.Alignment = fyne.TextAlignCenter
+		v.ticks[i] = line
+		v.tickLabels[i] = label
+		objects = append(objects, line, label)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Printf("mpc command: закрытие ответа: %v", err)
-		}
-	}()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		log.Printf("mpc command: чтение ответа: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("mpc command: play/pause -> %s отклонена: %s", cmdURL, resp.Status)
-		return
-	}
-	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
-}
-
-// Где искать MPC-HC (см. mpcExePath). Переменные, а не константы, только ради
-// тестов.
-var (
-	defaultMPCExe   = `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`
-	mpcRegistryPath = `Software\MPC-HC\MPC-HC`
-)
-
-// mpcExePath возвращает путь к MPC-HC: MPC_EXE из окружения/.env; иначе
-// defaultMPCExe, если такой файл есть; иначе путь, который MPC-HC сам пишет в
-// реестр при каждом запуске (HKCU\Software\MPC-HC\MPC-HC\ExePath).
-func mpcExePath() string {
-	if p := os.Getenv("MPC_EXE"); p != "" {
-		return p
-	}
-	_, err := os.Stat(defaultMPCExe)
-	if err == nil {
-		return defaultMPCExe
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		log.Printf("mpc launch: проверка %s: %v", defaultMPCExe, err)
-	}
-	if p := mpcExeFromRegistry(); p != "" {
-		return p
-	}
-	return defaultMPCExe
-}
-
-// mpcExeFromRegistry читает HKCU\Software\MPC-HC\MPC-HC\ExePath; "" — если
-// значения нет или его не удалось прочитать.
-func mpcExeFromRegistry() string {
-	key, err := registry.OpenKey(registry.CURRENT_USER, mpcRegistryPath, registry.QUERY_VALUE)
-	if err != nil {
-		if !errors.Is(err, registry.ErrNotExist) {
-			log.Printf("mpc launch: открытие ключа реестра MPC-HC: %v", err)
-		}
-		return ""
-	}
-	defer logRegistryClose(key, "MPC-HC")
-	p, _, err := key.GetStringValue("ExePath")
-	if err != nil && !errors.Is(err, registry.ErrNotExist) {
-		log.Printf("mpc launch: чтение ExePath из реестра: %v", err)
-	}
-	return p
-}
-
-// launchMPC запускает MPC-HC. Повторный запуск при уже открытом плеере
-// безвреден: MPC-HC по умолчанию работает в режиме одного экземпляра и просто
-// выводит своё окно на передний план.
-func launchMPC() {
-	exe := mpcExePath()
-	cmd := exec.Command(exe)
-	cmd.Dir = filepath.Dir(exe)
-	if err := startDetached(cmd); err != nil {
-		log.Printf("mpc launch: не удалось запустить %s: %v", exe, err)
-		return
-	}
-	log.Printf("mpc launch: запущен %s", exe)
+	v.window.SetContent(container.NewWithoutLayout(objects...))
+	return v
 }
 
 // startDetached запускает процесс и не ждёт его завершения: дескриптор
@@ -1261,157 +1498,6 @@ func openContainingFolder(path string) {
 	if err := startDetached(cmd); err != nil {
 		log.Printf("overlay: не удалось открыть проводник: %v", err)
 	}
-}
-
-// runFyne запускает Fyne-приложение. Вызывается в отдельной горутине.
-// Блокируется до закрытия приложения (обычно — до systray.Quit()).
-func runFyne(url string, interval time.Duration) {
-	runtime.LockOSThread()
-	log.Printf("fyne: инициализация (url=%s, interval=%s)", url, interval)
-
-	fyneApp = app.New()
-	buildUI(url)
-	go pollMPC(url, time.Tick(interval))
-
-	fyneApp.Run()
-	log.Printf("fyne: цикл приложения завершён")
-}
-
-// buildUI создаёт в fyneApp оба окна-оверлея — прогресс MPC-HC (mainWindow)
-// и ползунок громкости (volumeWindow) — и оставляет их скрытыми.
-func buildUI(url string) {
-	fyneApp.Settings().SetTheme(theme.DarkTheme())
-	mainWindow = fyneApp.NewWindow(windowTitle)
-
-	// --- Размер/позиция окна под монитор с курсором ---
-	windowWidth, windowHeight := float32(900), float32(170)
-	posX, posY := 0, 0
-	if work, monitor, err := screenLayout(); err != nil {
-		log.Printf("fyne: не удалось определить монитор, размер по умолчанию: %v", err)
-	} else if work.Right > work.Left {
-		titleBar := titleBarHeight()
-		windowWidth = float32(work.Right - work.Left)
-		windowHeight = float32(monitor.Bottom-monitor.Top)*0.10 - float32(titleBar)
-		posX, posY = int(work.Left), int(work.Top)+int(titleBar)
-		log.Printf("fyne: монитор work=(%d,%d)-(%d,%d) monitor=(%d,%d)-(%d,%d) titleBar=%d",
-			work.Left, work.Top, work.Right, work.Bottom,
-			monitor.Left, monitor.Top, monitor.Right, monitor.Bottom, titleBar)
-	}
-	log.Printf("fyne: окно %0.fx%0.f @ (%d,%d)", windowWidth, windowHeight, posX, posY)
-
-	mainWindow.Resize(fyne.NewSize(windowWidth, windowHeight))
-	requestPosition(mainWindow, posX, posY)
-
-	// --- Виджеты ---
-	// Имя файла и статус выводятся прямо на полосе прогресса (через
-	// TextFormatter), а не отдельной строкой — главный элемент оверлея это
-	// сама полоса, текст встроен в неё.
-	elapsedLabel = widget.NewLabelWithStyle("00:00",
-		fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Monospace: true})
-	remainingLabel = widget.NewLabelWithStyle("00:00",
-		fyne.TextAlignTrailing, fyne.TextStyle{Bold: true, Monospace: true})
-
-	progressText = "Ожидание подключения к MPC-HC..."
-	progressBar = widget.NewProgressBar()
-	progressBar.TextFormatter = func() string { return progressText }
-
-	progressRow := container.NewBorder(nil, nil, elapsedLabel, remainingLabel, progressBar)
-	pad := theme.Padding()
-	body := container.New(layout.NewCustomPaddedLayout(pad, pad/2, pad, pad), progressRow)
-	mainWindow.SetContent(container.NewStack(body, newClickCatcher(url)))
-
-	// --- Оверлей уровня громкости: большой ползунок с градацией 0..100,
-	// см. volumeMonitor. Размер и позиция пересчитываются под монитор
-	// курсора при каждом показе (layoutVolumeOverlay), поэтому все примитивы
-	// собраны в контейнер без автоматического layout-менеджера.
-	volumeWindow = fyneApp.NewWindow(volumeWindowTitle)
-
-	volumePercent = canvas.NewText("", color.White)
-	volumePercent.Alignment = fyne.TextAlignCenter
-	volumePercent.TextStyle = fyne.TextStyle{Bold: true}
-
-	volumeBarTrack = canvas.NewRectangle(volumeTrackColor)
-	volumeBarFill = canvas.NewRectangle(volumeFillColor)
-
-	overlayObjects := []fyne.CanvasObject{volumeBarTrack, volumeBarFill, volumePercent}
-	volumeTicks = make([]*canvas.Line, volumeTickCount+1)
-	volumeTickLabels = make([]*canvas.Text, volumeTickCount+1)
-	for i := range volumeTicks {
-		line := canvas.NewLine(volumeTickColor)
-		label := canvas.NewText(strconv.Itoa(i*100/volumeTickCount), volumeLabelColor)
-		label.Alignment = fyne.TextAlignCenter
-		volumeTicks[i] = line
-		volumeTickLabels[i] = label
-		overlayObjects = append(overlayObjects, line, label)
-	}
-	volumeWindow.SetContent(container.NewWithoutLayout(overlayObjects...))
-
-	// Нативный HWND у Fyne/GLFW создаётся лениво, только при первом Show(),
-	// и в том же вызове сразу становится видимым. Если окно хоть раз
-	// показалось с обычным стилем, Explorer заводит ему кнопку в панели
-	// задач и не убирает её, даже когда окно потом получает
-	// WS_EX_TOOLWINDOW и прячется: на кнопке остаётся «призрак» (особенно
-	// при автозапуске на входе в Windows, когда Explorer ещё не успевает
-	// обработать смену стиля до скрытия). Поэтому окна создаются здесь
-	// вхолостую (показ + скрытие) под CBT-хуком createAsToolWindows,
-	// который выставляет WS_EX_TOOLWINDOW в момент создания HWND — до
-	// того, как окно хоть раз станет видимым.
-	//
-	// После этого оба окна стартуют скрытыми: mainWindow покажем по F5,
-	// volumeWindow — по событию от volume poller.
-	createAsToolWindows(func() {
-		for _, w := range []fyne.Window{mainWindow, volumeWindow} {
-			showOverlay(w, w == mainWindow)
-			w.Hide()
-		}
-	})
-	log.Printf("fyne: окно создано, стартует скрытым")
-}
-
-// pollMPC на каждый тик опрашивает web-интерфейс MPC-HC и обновляет оверлей
-// прогресса. Работает, пока не закрыт ticks.
-func pollMPC(url string, ticks <-chan time.Time) {
-	client := &http.Client{Timeout: 2 * time.Second}
-	var lastErr string
-	for range ticks {
-		st, err := fetchState(url, client)
-		if err != nil {
-			if err.Error() != lastErr {
-				log.Printf("mpc poll: ошибка: %v", err)
-				lastErr = err.Error()
-			}
-			fyne.Do(func() {
-				progressText = "⚠ Нет связи с MPC-HC: " + err.Error()
-				progressBar.Refresh()
-			})
-			continue
-		}
-		if lastErr != "" {
-			log.Printf("mpc poll: связь восстановлена")
-			lastErr = ""
-		}
-		fyne.Do(func() { showProgress(st) })
-	}
-}
-
-// showProgress выводит состояние MPC-HC на оверлей. Вызывается только из
-// UI-потока (через fyne.Do).
-func showProgress(st *MPCState) {
-	currentFilePath = st.FilePath
-	if st.Duration <= 0 {
-		progressText = "Нет активного воспроизведения"
-		progressBar.SetValue(0)
-		elapsedLabel.SetText("00:00")
-		remainingLabel.SetText("00:00")
-		return
-	}
-	progress := min(max(float64(st.Position)/float64(st.Duration), 0), 1)
-
-	elapsedLabel.SetText(formatTime(st.Position))
-	remainingLabel.SetText("-" + formatTime(st.Duration-st.Position))
-	progressText = fmt.Sprintf("%s   —   %.1f%%  %s  (из %s)",
-		st.File, progress*100, st.StateString, formatTime(st.Duration))
-	progressBar.SetValue(progress)
 }
 
 // requestPosition ставит окно в точку (x, y) экрана.
@@ -1545,7 +1631,7 @@ var cbtHookCallback = syscall.NewCallback(cbtHookProc)
 // WM_NCCREATE, окно ещё ни разу не было видимым). Так у Explorer нет
 // момента, когда окно видно с обычным стилем, и кнопка в панели задач для
 // него не появляется вообще. Хук локальный для потока: окна Fyne создаются
-// на потоке, вызвавшем Show() (горутина main, см. runFyne).
+// на потоке, вызвавшем Show() (горутина main, см. newOverlays и main).
 //
 // Если хук поставить не удалось, f всё равно выполняется — окно лишь
 // рискует остаться на панели задач, как раньше.
@@ -1589,31 +1675,13 @@ func cbtHookProc(nCode int, wParam, lParam uintptr) uintptr {
 	return r
 }
 
-// toggleMPCWindow показывает окно, если оно скрыто, и прячет, если показано.
-func toggleMPCWindow() {
-	fyne.Do(func() {
-		if mainWindow == nil {
-			log.Printf("F5: окно ещё не создано")
-			return
-		}
-		if winVisible {
-			mainWindow.Hide()
-			log.Printf("F5: окно скрыто")
-		} else {
-			showOverlay(mainWindow, true)
-			log.Printf("F5: окно показано поверх всех окон")
-		}
-		winVisible = !winVisible
-	})
-}
-
-// layoutVolumeOverlay расставляет все примитивы ползунка (трек, заливку,
-// текст процента, отметки и подписи градации 0..100) под уже вычисленный
-// размер окна width x height. Окно создано через container.NewWithoutLayout,
-// поэтому автоматической раскладки нет — координаты считаются вручную и
+// layout расставляет все примитивы ползунка (трек, заливку, текст процента,
+// отметки и подписи градации 0..100) под уже вычисленный размер окна
+// width x height. Окно создано через container.NewWithoutLayout, поэтому
+// автоматической раскладки нет — координаты считаются вручную и
 // пересчитываются при каждом показе, т.к. размер каждый раз подгоняется под
 // монитор курсора.
-func layoutVolumeOverlay(width, height float32, level float64, muted bool) {
+func (v *volumeOverlay) layout(width, height float32, level float64, muted bool) {
 	pad := width * 0.06
 	barX := pad
 	barWidth := width - 2*pad
@@ -1621,42 +1689,42 @@ func layoutVolumeOverlay(width, height float32, level float64, muted bool) {
 	barY := height * 0.5
 	radius := barHeight / 2
 
-	volumeBarTrack.CornerRadius = radius
-	volumeBarTrack.Resize(fyne.NewSize(barWidth, barHeight))
-	volumeBarTrack.Move(fyne.NewPos(barX, barY))
-	volumeBarTrack.Refresh()
+	v.track.CornerRadius = radius
+	v.track.Resize(fyne.NewSize(barWidth, barHeight))
+	v.track.Move(fyne.NewPos(barX, barY))
+	v.track.Refresh()
 
 	clamped := min(max(level, 0), 1)
-	volumeBarFill.FillColor = volumeFillColor
+	v.fill.FillColor = volumeFillColor
 	if muted {
-		volumeBarFill.FillColor = volumeMuteColor
+		v.fill.FillColor = volumeMuteColor
 	}
-	volumeBarFill.CornerRadius = radius
-	volumeBarFill.Resize(fyne.NewSize(barWidth*float32(clamped), barHeight))
-	volumeBarFill.Move(fyne.NewPos(barX, barY))
-	volumeBarFill.Refresh()
+	v.fill.CornerRadius = radius
+	v.fill.Resize(fyne.NewSize(barWidth*float32(clamped), barHeight))
+	v.fill.Move(fyne.NewPos(barX, barY))
+	v.fill.Refresh()
 
 	text := fmt.Sprintf("%d%%", int(math.Round(level*100)))
 	if muted {
 		text = "MUTE"
 	}
-	volumePercent.Text = text
-	volumePercent.TextSize = height * 0.26
-	volumePercent.Resize(fyne.NewSize(width, height*0.4))
-	volumePercent.Move(fyne.NewPos(0, height*0.05))
-	volumePercent.Refresh()
+	v.percent.Text = text
+	v.percent.TextSize = height * 0.26
+	v.percent.Resize(fyne.NewSize(width, height*0.4))
+	v.percent.Move(fyne.NewPos(0, height*0.05))
+	v.percent.Refresh()
 
 	tickY := barY + barHeight + 6
 	labelSize := height * 0.06
 	const labelWidth = float32(48)
-	for i, line := range volumeTicks {
+	for i, line := range v.ticks {
 		x := barX + barWidth*float32(i)/float32(volumeTickCount)
 		line.Position1 = fyne.NewPos(x, tickY)
 		line.Position2 = fyne.NewPos(x, tickY+10)
 		line.StrokeWidth = 2
 		line.Refresh()
 
-		label := volumeTickLabels[i]
+		label := v.tickLabels[i]
 		label.TextSize = labelSize
 		label.Resize(fyne.NewSize(labelWidth, labelSize+4))
 		label.Move(fyne.NewPos(x-labelWidth/2, tickY+12))
@@ -1664,19 +1732,15 @@ func layoutVolumeOverlay(width, height float32, level float64, muted bool) {
 	}
 }
 
-// showVolumeOverlay показывает оверлей-ползунок уровня громкости (0..100,
-// с градацией через каждые 10) в четверть экрана (половина ширины и половина
-// высоты рабочей области монитора под курсором мыши), прижатый к левому
-// нижнему углу, и прячет его через volumeOverlayDuration после последнего
-// вызова. Таймер скрытия каждый раз перезапускается (debounce), чтобы при
-// быстрой серии событий — например, при удержании клавиши громкости —
-// оверлей не мигал, а гас один раз после того, как изменения прекратились.
-func showVolumeOverlay(level float64, muted bool) {
+// Show показывает оверлей-ползунок уровня громкости (0..100, с градацией
+// через каждые 10) в четверть экрана (половина ширины и половина высоты
+// рабочей области монитора под курсором мыши), прижатый к левому нижнему
+// углу, и прячет его через volumeOverlayDuration после последнего вызова.
+// Таймер скрытия каждый раз перезапускается (debounce), чтобы при быстрой
+// серии событий — например, при удержании клавиши громкости — оверлей не
+// мигал, а гас один раз после того, как изменения прекратились.
+func (v *volumeOverlay) Show(level float64, muted bool) {
 	fyne.Do(func() {
-		if volumeWindow == nil {
-			return
-		}
-
 		width, height := volumeOverlayWidth, volumeOverlayHeight
 		x, y := 0, 0
 		if work, _, err := screenLayout(); err != nil {
@@ -1688,26 +1752,22 @@ func showVolumeOverlay(level float64, muted bool) {
 			y = int(work.Bottom) - int(height)
 		}
 
-		layoutVolumeOverlay(width, height, level, muted)
-		volumeWindow.Resize(fyne.NewSize(width, height))
-		requestPosition(volumeWindow, x, y)
+		v.layout(width, height, level, muted)
+		v.window.Resize(fyne.NewSize(width, height))
+		requestPosition(v.window, x, y)
 		log.Printf("volume overlay: показываю размер=%.0fx%.0f позиция=(%d,%d) level=%.0f%% muted=%v",
 			width, height, x, y, level*100, muted)
 
-		showOverlay(volumeWindow, false)
+		showOverlay(v.window, false)
 	})
 
-	volumeMu.Lock()
-	defer volumeMu.Unlock()
-	if volumeHideTimer != nil {
-		volumeHideTimer.Stop()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.hideTimer != nil {
+		v.hideTimer.Stop()
 	}
-	volumeHideTimer = time.AfterFunc(volumeOverlayDuration, func() {
-		fyne.Do(func() {
-			if volumeWindow != nil {
-				volumeWindow.Hide()
-			}
-		})
+	v.hideTimer = time.AfterFunc(volumeOverlayDuration, func() {
+		fyne.Do(v.window.Hide)
 	})
 }
 
@@ -1715,11 +1775,16 @@ func showVolumeOverlay(level float64, muted bool) {
 // Автозапуск через реестр (HKCU\...\Run)
 // ---------------------------------------------------------------------------
 
-const autostartValueName = "VolumeSwitch"
+const (
+	autostartValueName = "VolumeSwitch"
+	autostartRunKey    = `Software\Microsoft\Windows\CurrentVersion\Run`
+)
 
-// autostartRegistryPath — ключ автозапуска в HKCU; переменная только ради
-// тестов, чтобы они не трогали настоящий Run.
-var autostartRegistryPath = `Software\Microsoft\Windows\CurrentVersion\Run`
+// autostart — автозапуск программы через значение autostartValueName в
+// ключе HKCU\key (в программе — autostartRunKey, в тестах — временный ключ).
+type autostart struct {
+	key string
+}
 
 // autostartCommand возвращает командную строку для записи в Run: путь к
 // текущему exe в кавычках (без экранирования backslash — простое
@@ -1740,15 +1805,15 @@ func logRegistryClose(key registry.Key, name string) {
 	}
 }
 
-// isAutostartEnabled проверяет, что значение в HKCU\...\Run существует и
-// указывает именно на текущий exe (а не на устаревший путь).
-func isAutostartEnabled() bool {
+// Enabled проверяет, что значение в ключе автозапуска существует и указывает
+// именно на текущий exe (а не на устаревший путь).
+func (a autostart) Enabled() bool {
 	cmd, err := autostartCommand()
 	if err != nil {
 		log.Printf("autostart: путь к exe: %v", err)
 		return false
 	}
-	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryPath, registry.QUERY_VALUE)
+	key, err := registry.OpenKey(registry.CURRENT_USER, a.key, registry.QUERY_VALUE)
 	if err != nil {
 		log.Printf("autostart: открытие ключа Run: %v", err)
 		return false
@@ -1764,10 +1829,10 @@ func isAutostartEnabled() bool {
 	return val == cmd
 }
 
-// setAutostart включает или выключает автозапуск, записывая/удаляя значение
-// в HKCU\...\Run.
-func setAutostart(enable bool) (err error) {
-	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryPath, registry.SET_VALUE)
+// Set включает или выключает автозапуск, записывая/удаляя значение в ключе
+// автозапуска.
+func (a autostart) Set(enable bool) (err error) {
+	key, err := registry.OpenKey(registry.CURRENT_USER, a.key, registry.SET_VALUE)
 	if err != nil {
 		return err
 	}
@@ -1795,14 +1860,6 @@ func setAutostart(enable bool) (err error) {
 // ---------------------------------------------------------------------------
 // systray + аудиоустройства
 // ---------------------------------------------------------------------------
-
-var (
-	switcher    deviceSwitcher
-	stopHotkeys func() error
-
-	menuMu      sync.Mutex
-	deviceItems map[string]checkbox // пункты меню по ID устройства
-)
 
 // deviceSwitcher — то, что меню трея и хоткеи используют от *Switcher;
 // интерфейс нужен, чтобы их можно было проверить без COM и аудиоустройств.
@@ -1887,46 +1944,45 @@ func main() {
 	for _, path := range dotEnvPaths() {
 		loadDotEnv(path)
 	}
-
-	url := os.Getenv("MPC_URL")
-	if url == "" {
-		url = defaultURL
-	}
-	if *urlFlag != "" {
-		url = *urlFlag
-	}
-
-	interval := defaultInterval
-	if v := os.Getenv("MPC_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			interval = d
-		} else {
-			log.Printf("MPC_INTERVAL=%q не парсится как duration, беру %s", v, defaultInterval)
-		}
-	}
-	if *intervalFlag > 0 {
-		interval = *intervalFlag
-	}
-
-	log.Printf("config: url=%s interval=%s debug=%v", url, interval, *debug)
+	cfg := resolveConfig(*debug, *urlFlag, *intervalFlag)
+	log.Printf("config: url=%s interval=%s debug=%v", cfg.mpcURL, cfg.interval, cfg.debug)
 
 	// Fyne 2.8+ требует, чтобы app.New/NewWindow/Run вызывались на горутине main()
 	// (см. https://docs.fyne.io/started/goroutines) — именно она закреплена за
-	// главным потоком процесса пакетом systray в своём init(). Поэтому systray
-	// переезжает в отдельную закреплённую горутину, а Fyne остаётся в main().
+	// главным потоком процесса пакетом systray в своём init(). Поэтому оверлеи
+	// создаются и работают здесь, а systray переезжает в отдельную закреплённую
+	// горутину. Оверлеи создаются до запуска трея, так что хоткеи и меню трея
+	// всегда находят готовые окна.
+	runtime.LockOSThread()
+	ui := newOverlays(app.New(), newMPCClient(cfg.mpcURL))
+	tray := &trayApp{debug: cfg.debug, ui: ui}
 	go func() {
 		runtime.LockOSThread()
 		log.Printf("systray: запуск")
-		systray.Run(func() { onReady(*debug) }, onExit)
+		systray.Run(tray.onReady, tray.onExit)
 		log.Printf("systray: завершён, выход")
 	}()
 
-	runFyne(url, interval)
+	ui.Run(cfg.interval)
 }
 
-func onReady(debug bool) {
+// trayApp — программа с точки зрения трея: связывает меню трея, аудио
+// (switcher), хоткеи и оверлеи. onReady и onExit — колбэки systray.Run.
+//
+// switcher и hotkeys выставляются в onReady до того, как запускаются
+// горутины меню и хук клавиатуры, которые их читают, поэтому без мьютекса.
+type trayApp struct {
+	debug bool
+	ui    *overlays
+
+	switcher deviceSwitcher // nil, если аудио не инициализировалось
+	hotkeys  *hotkeyHook    // nil, если хук не установлен
+	devices  deviceMenu
+}
+
+func (a *trayApp) onReady() {
 	log.Printf("systray: onReady")
-	if debug {
+	if a.debug {
 		// systray мог спрятать консоль повторно
 		if err := ensureConsole(); err != nil {
 			log.Printf("console: %v", err)
@@ -1936,17 +1992,52 @@ func onReady(debug bool) {
 	systray.SetTitle("")
 	systray.SetTooltip("Volume Switch")
 
-	// В глобальный switcher (интерфейс) попадает только успешно созданный
-	// *Switcher: nil-указатель в интерфейсе прошёл бы проверку на nil в onExit.
+	// В switcher (интерфейс) попадает только успешно созданный *Switcher:
+	// nil-указатель в интерфейсе прошёл бы проверку на nil в onExit.
 	sw, err := NewSwitcher()
 	if err != nil {
 		log.Printf("audio: ошибка инициализации: %v", err)
 		systray.SetTooltip("Volume Switch: audio init failed")
 		return
 	}
-	switcher = sw
+	a.switcher = sw
 	log.Printf("audio: switcher создан")
 
+	a.addDeviceItems(sw)
+	systray.AddSeparator()
+	a.addMPCItem()
+	a.addAutostartItem(autostart{key: autostartRunKey})
+	a.addQuitItem()
+	a.startHotkeys()
+
+	// Колбэк вызывается из горутины поллера; вся работа с UI внутри Show
+	// идёт через fyne.Do.
+	go pollVolume(sw.CurrentVolume, a.ui.volume.Show, time.Tick(volumePollInterval))
+}
+
+func (a *trayApp) onExit() {
+	log.Printf("onExit: остановка")
+	if a.hotkeys != nil {
+		if err := a.hotkeys.Stop(); err != nil {
+			log.Printf("onExit: не удалось снять хук: %v", err)
+		} else {
+			log.Printf("onExit: хук снят")
+		}
+	}
+	if a.ui != nil {
+		a.ui.Quit()
+		log.Printf("onExit: fyne остановлен")
+	}
+	if a.switcher != nil {
+		a.switcher.Close()
+		log.Printf("onExit: switcher закрыт")
+	}
+	log.Printf("onExit: всё завершено")
+}
+
+// addDeviceItems добавляет в меню трея по пункту на каждое активное
+// устройство воспроизведения.
+func (a *trayApp) addDeviceItems(sw *Switcher) {
 	devices, err := sw.ListActiveDevices()
 	if err != nil {
 		log.Printf("audio: не удалось получить список устройств: %v", err)
@@ -1963,109 +2054,94 @@ func onReady(debug bool) {
 		log.Printf("audio: текущее устройство по умолчанию: %s", currentID)
 	}
 
-	buildDeviceMenu(devices, currentID)
+	a.devices.build(devices, currentID, a.selectDevice)
+}
 
-	systray.AddSeparator()
-	mShow := systray.AddMenuItem("Показать/скрыть MPC", "F5")
+// addMPCItem добавляет пункт меню, который показывает/скрывает оверлей
+// MPC-HC (как F5).
+func (a *trayApp) addMPCItem() {
+	item := systray.AddMenuItem("Показать/скрыть MPC", "F5")
 	go func() {
-		for range mShow.ClickedCh {
+		for range item.ClickedCh {
 			log.Printf("tray: пункт «Показать/скрыть MPC» нажат")
-			toggleMPCWindow()
+			a.ui.progress.Toggle()
 		}
 	}()
+}
 
-	mAutostart := systray.AddMenuItemCheckbox(
+// addAutostartItem добавляет пункт меню с галочкой, включающий/выключающий
+// автозапуск.
+func (a *trayApp) addAutostartItem(run autostart) {
+	item := systray.AddMenuItemCheckbox(
 		"Запускать при входе в Windows",
 		"Добавить/убрать из автозагрузки Windows",
-		isAutostartEnabled(),
+		run.Enabled(),
 	)
 	go func() {
-		for range mAutostart.ClickedCh {
-			enable := !mAutostart.Checked()
-			if err := setAutostart(enable); err != nil {
+		for range item.ClickedCh {
+			enable := !item.Checked()
+			if err := run.Set(enable); err != nil {
 				log.Printf("autostart: не удалось изменить: %v", err)
 				continue
 			}
 			if enable {
-				mAutostart.Check()
+				item.Check()
 			} else {
-				mAutostart.Uncheck()
+				item.Uncheck()
 			}
 			log.Printf("autostart: включён=%v", enable)
 		}
 	}()
+}
 
-	mQuit := systray.AddMenuItem("Выход", "Закрыть Volume Switch")
+func (a *trayApp) addQuitItem() {
+	item := systray.AddMenuItem("Выход", "Закрыть Volume Switch")
 	go func() {
-		<-mQuit.ClickedCh
+		<-item.ClickedCh
 		log.Printf("tray: «Выход» нажат")
 		systray.Quit()
 	}()
+}
 
-	stopHotkeys, err = startHotkeys(map[uint32]func(){
-		vkF2: func() { log.Printf("hotkey: F2"); onVolumeKey(-volumeKeyStep) },
-		vkF3: func() { log.Printf("hotkey: F3"); onVolumeKey(volumeKeyStep) },
-		vkF5: func() { log.Printf("hotkey: F5"); toggleMPCWindow() },
-		vkF7: func() { log.Printf("hotkey: F7"); onCycle(-1) },
-		vkF8: func() { log.Printf("hotkey: F8"); onCycle(1) },
-	})
-	if err != nil {
+// startHotkeys ставит глобальный хук клавиатуры с обработчиками F2/F3/F5/F7/F8.
+func (a *trayApp) startHotkeys() {
+	hk := newHotkeyHook(map[uint32]func(){
+		vkF2: func() { log.Printf("hotkey: F2"); a.stepVolume(-volumeKeyStep) },
+		vkF3: func() { log.Printf("hotkey: F3"); a.stepVolume(volumeKeyStep) },
+		vkF5: func() { log.Printf("hotkey: F5"); a.ui.progress.Toggle() },
+		vkF7: func() { log.Printf("hotkey: F7"); a.cycle(-1) },
+		vkF8: func() { log.Printf("hotkey: F8"); a.cycle(1) },
+	}, announceHotkeys)
+	if err := hk.Start(); err != nil {
 		log.Printf("hotkey: не удалось установить хук: %v", err)
-	} else {
-		log.Printf("hotkey: хук установлен (F2/F3/F5/F7/F8, Ctrl+F2 — вкл/выкл)")
+		return
 	}
-
-	// Колбэк вызывается из горутины поллера; вся работа с UI внутри
-	// showVolumeOverlay идёт через fyne.Do.
-	go pollVolume(sw.CurrentVolume, showVolumeOverlay, time.Tick(volumePollInterval))
+	a.hotkeys = hk
+	log.Printf("hotkey: хук установлен (F2/F3/F5/F7/F8, Ctrl+F2 — вкл/выкл)")
 }
 
-func onExit() {
-	log.Printf("onExit: остановка")
-	if stopHotkeys != nil {
-		if err := stopHotkeys(); err != nil {
-			log.Printf("onExit: не удалось снять хук: %v", err)
-		} else {
-			log.Printf("onExit: хук снят")
-		}
-	}
-	if fyneApp != nil {
-		fyneApp.Quit()
-		log.Printf("onExit: fyne остановлен")
-	}
-	if switcher != nil {
-		switcher.Close()
-		log.Printf("onExit: switcher закрыт")
-	}
-	log.Printf("onExit: всё завершено")
-}
-
-func buildDeviceMenu(devices []Device, currentID string) {
-	menuMu.Lock()
-	defer menuMu.Unlock()
-
-	deviceItems = make(map[string]checkbox, len(devices))
-	for _, dev := range devices {
-		item, clicked := addTrayCheckbox(dev.Name, "Сделать устройством по умолчанию", dev.ID == currentID)
-		deviceItems[dev.ID] = item
-
-		go func() {
-			for range clicked {
-				log.Printf("tray: выбран %q", dev.Name)
-				selectDevice(dev)
-			}
-		}()
-	}
-	log.Printf("menu: построено %d пунктов", len(devices))
-}
-
-func selectDevice(dev Device) {
+// selectDevice делает dev устройством по умолчанию (клик по пункту меню).
+func (a *trayApp) selectDevice(dev Device) {
 	log.Printf("audio: SetDefault id=%s name=%q", dev.ID, dev.Name)
-	if err := switcher.SetDefault(dev.ID); err != nil {
+	if err := a.switcher.SetDefault(dev.ID); err != nil {
 		log.Printf("audio: SetDefault failed: %v", err)
 		return
 	}
-	setChecked(dev.ID)
+	a.devices.check(dev.ID)
+	announceSwitch(dev)
+}
+
+// cycle переключает устройство по умолчанию на следующее (direction > 0) или
+// предыдущее (direction < 0) — F8/F7.
+func (a *trayApp) cycle(direction int) {
+	log.Printf("audio: Cycle direction=%d", direction)
+	dev, err := a.switcher.Cycle(direction)
+	if err != nil {
+		log.Printf("audio: Cycle failed: %v", err)
+		return
+	}
+	log.Printf("audio: новое устройство: id=%s name=%q", dev.ID, dev.Name)
+	a.devices.check(dev.ID)
 	announceSwitch(dev)
 }
 
@@ -2073,24 +2149,55 @@ func selectDevice(dev Device) {
 // громкости Windows (2% шкалы).
 const volumeKeyStep = 0.02
 
-// onVolumeKey меняет общую громкость на delta. Оверлей громкости отдельно
-// не показывается — его поднимает pollVolume, увидев изменение уровня.
-func onVolumeKey(delta float64) {
-	if err := switcher.StepVolume(delta); err != nil {
+// stepVolume меняет общую громкость на delta (F2/F3). Оверлей громкости
+// отдельно не показывается — его поднимает pollVolume, увидев изменение
+// уровня.
+func (a *trayApp) stepVolume(delta float64) {
+	if err := a.switcher.StepVolume(delta); err != nil {
 		log.Printf("audio: StepVolume(%+.2f) failed: %v", delta, err)
 	}
 }
 
-func onCycle(direction int) {
-	log.Printf("audio: Cycle direction=%d", direction)
-	dev, err := switcher.Cycle(direction)
-	if err != nil {
-		log.Printf("audio: Cycle failed: %v", err)
-		return
+// deviceMenu — пункты меню трея с устройствами воспроизведения; галочка
+// стоит на текущем устройстве по умолчанию.
+type deviceMenu struct {
+	mu    sync.Mutex
+	items map[string]checkbox // пункты меню по ID устройства
+}
+
+// build добавляет в меню трея по пункту на каждое устройство; клик по пункту
+// вызывает onSelect с этим устройством.
+func (m *deviceMenu) build(devices []Device, currentID string, onSelect func(Device)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.items = make(map[string]checkbox, len(devices))
+	for _, dev := range devices {
+		item, clicked := addTrayCheckbox(dev.Name, "Сделать устройством по умолчанию", dev.ID == currentID)
+		m.items[dev.ID] = item
+
+		go func() {
+			for range clicked {
+				log.Printf("tray: выбран %q", dev.Name)
+				onSelect(dev)
+			}
+		}()
 	}
-	log.Printf("audio: новое устройство: id=%s name=%q", dev.ID, dev.Name)
-	setChecked(dev.ID)
-	announceSwitch(dev)
+	log.Printf("menu: построено %d пунктов", len(devices))
+}
+
+// check ставит галочку на пункт устройства id и снимает с остальных.
+func (m *deviceMenu) check(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for itemID, item := range m.items {
+		if itemID == id {
+			item.Check()
+		} else {
+			item.Uncheck()
+		}
+	}
 }
 
 func announceSwitch(dev Device) {
@@ -2128,19 +2235,6 @@ var playSystemSound = func(alias string) {
 	}
 	if r, _, errno := procPlaySoundW.Call(uintptr(unsafe.Pointer(name)), 0, sndAlias|sndAsync|sndNoDefault); r == 0 {
 		log.Printf("audio: звук %q: %v", alias, win32Error("PlaySoundW", errno))
-	}
-}
-
-func setChecked(checkedID string) {
-	menuMu.Lock()
-	defer menuMu.Unlock()
-
-	for id, item := range deviceItems {
-		if id == checkedID {
-			item.Check()
-		} else {
-			item.Uncheck()
-		}
 	}
 }
 
@@ -2202,15 +2296,6 @@ type kbdllHookStruct struct {
 // vkToggleHotkeys с зажатым Ctrl включает/выключает хоткеи (Ctrl+F2).
 const vkToggleHotkeys = vkF2
 
-// hotkeysDisabled — хоткеи выключены по Ctrl+F2. Пишется только в hookProc,
-// читается там же и в тестах, поэтому атомарный.
-var hotkeysDisabled atomic.Bool
-
-// toggleKeyDown — Ctrl+F2 нажат и F2 ещё не отпущена (подавление
-// автоповтора). Используется только в hookProc, который Windows вызывает
-// последовательно в потоке хука, поэтому без синхронизации.
-var toggleKeyDown bool
-
 // toggleComboPressed сообщает, что нажата клавиша переключения хоткеев
 // вместе с Ctrl и без других модификаторов: Ctrl+Shift+F2 и т.п. уходят
 // программам.
@@ -2221,33 +2306,47 @@ func toggleComboPressed(kb *kbdllHookStruct) bool {
 	return !slices.ContainsFunc([]uintptr{vkShift, vkLWin, vkRWin}, keyHeld)
 }
 
-// hotkeys — обработчики перехватываемых клавиш по virtual-key коду.
-// Заполняется в startHotkeys до установки хука и дальше не меняется, поэтому
-// hookProc читает её без блокировок.
-var hotkeys map[uint32]func()
+// hotkeyHook — глобальный хук клавиатуры WH_KEYBOARD_LL. Перехватывает
+// клавиши из handlers (только без модификаторов) и Ctrl+F2, который
+// выключает/включает все остальные.
+type hotkeyHook struct {
+	// handlers — обработчики перехватываемых клавиш по virtual-key коду. Не
+	// меняются после создания, поэтому proc читает их без блокировок.
+	handlers map[uint32]func()
+	// onToggle вызывается в отдельной горутине после каждого Ctrl+F2.
+	onToggle func(disabled bool)
 
-// startHotkeys устанавливает глобальный хук клавиатуры WH_KEYBOARD_LL и
-// возвращает функцию, которая его снимает. Хук живёт в отдельном закреплённом
-// OS-потоке со своим циклом сообщений: без цикла сообщений в потоке, который
-// поставил хук, Windows не вызывает hookProc.
-func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
+	// disabled — хоткеи выключены по Ctrl+F2. Пишется только в proc,
+	// читается там же и в тестах, поэтому атомарный.
+	disabled atomic.Bool
+	// toggleKeyDown — Ctrl+F2 нажат и F2 ещё не отпущена (подавление
+	// автоповтора). Используется только в proc, который Windows вызывает
+	// последовательно в потоке хука, поэтому без синхронизации.
+	toggleKeyDown bool
+
+	hook     uintptr // HHOOK установленного хука
+	threadID uint32  // поток хука с его циклом сообщений
+}
+
+func newHotkeyHook(handlers map[uint32]func(), onToggle func(disabled bool)) *hotkeyHook {
+	return &hotkeyHook{handlers: handlers, onToggle: onToggle}
+}
+
+// Start устанавливает хук. Хук живёт в отдельном закреплённом OS-потоке со
+// своим циклом сообщений: без цикла сообщений в потоке, который поставил хук,
+// Windows не вызывает процедуру хука.
+func (h *hotkeyHook) Start() error {
 	hInst, _, errno := procGetModuleHandleW.Call(0)
 	if hInst == 0 {
-		return nil, win32Error("GetModuleHandleW", errno)
+		return win32Error("GetModuleHandleW", errno)
 	}
-	hotkeys = handlers
 
-	type result struct {
-		hook     uintptr
-		threadID uint32
-		err      error
-	}
-	ready := make(chan result, 1)
+	ready := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		// PeekMessage создаёт очередь сообщений потока заранее: иначе stop,
+		// PeekMessage создаёт очередь сообщений потока заранее: иначе Stop,
 		// вызванный сразу после установки хука, не смог бы отправить ей
 		// WM_QUIT (PostThreadMessage требует существующей очереди).
 		const pmNoRemove = 0
@@ -2256,13 +2355,14 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 
 		// Колбэки syscall.NewCallback никогда не освобождаются, так что
 		// хранить ссылку на cb, чтобы его не собрал GC, не нужно.
-		cb := syscall.NewCallback(hookProc)
+		cb := syscall.NewCallback(h.proc)
 		hook, _, errno := procSetWindowsHookExW.Call(whKeyboardLL, cb, hInst, 0)
 		if hook == 0 {
-			ready <- result{err: win32Error("SetWindowsHookExW", errno)}
+			ready <- win32Error("SetWindowsHookExW", errno)
 			return
 		}
-		ready <- result{hook: hook, threadID: windows.GetCurrentThreadId()}
+		h.hook, h.threadID = hook, windows.GetCurrentThreadId()
+		ready <- nil
 
 		for {
 			ret, _, errno := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg[0])), 0, 0, 0)
@@ -2276,25 +2376,22 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 			}
 		}
 	}()
-
-	res := <-ready
-	if res.err != nil {
-		return nil, res.err
-	}
-	// stop снимает хук и завершает цикл сообщений его потока.
-	return func() error {
-		const wmQuit = 0x0012
-		if r, _, errno := procUnhookWindowsHookEx.Call(res.hook); r == 0 {
-			return win32Error("UnhookWindowsHookEx", errno)
-		}
-		if r, _, errno := procPostThreadMessageW.Call(uintptr(res.threadID), wmQuit, 0, 0); r == 0 {
-			return win32Error("PostThreadMessageW", errno)
-		}
-		return nil
-	}, nil
+	return <-ready
 }
 
-// hookProc — процедура хука WH_KEYBOARD_LL. Наши клавиши без модификаторов
+// Stop снимает хук и завершает цикл сообщений его потока.
+func (h *hotkeyHook) Stop() error {
+	const wmQuit = 0x0012
+	if r, _, errno := procUnhookWindowsHookEx.Call(h.hook); r == 0 {
+		return win32Error("UnhookWindowsHookEx", errno)
+	}
+	if r, _, errno := procPostThreadMessageW.Call(uintptr(h.threadID), wmQuit, 0, 0); r == 0 {
+		return win32Error("PostThreadMessageW", errno)
+	}
+	return nil
+}
+
+// proc — процедура хука WH_KEYBOARD_LL. Наши клавиши без модификаторов
 // «съедаются» (возврат 1), обработчик запускается в отдельной горутине,
 // чтобы хук возвращался быстро; остальные, включая наши клавиши с
 // Alt/Ctrl/Shift/Win, передаются дальше по цепочке хуков.
@@ -2308,23 +2405,23 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 //
 // Ctrl+F2 перехватывается всегда и включает/выключает остальные хоткеи;
 // выключенные хоткеи уходят программам как обычные клавиши.
-func hookProc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
+func (h *hotkeyHook) proc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
 	if nCode >= 0 && kb.VkCode == vkToggleHotkeys && (wParam == wmKeyUp || wParam == wmSysKeyUp) {
-		toggleKeyDown = false
+		h.toggleKeyDown = false
 	}
 	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
 		if toggleComboPressed(kb) {
 			// Автоповтор зажатого Ctrl+F2 не переключает хоткеи туда-обратно:
 			// повторное переключение — только после отпускания F2.
-			if !toggleKeyDown {
-				toggleKeyDown = true
-				disabled := !hotkeysDisabled.Load()
-				hotkeysDisabled.Store(disabled)
-				go announceHotkeys(disabled)
+			if !h.toggleKeyDown {
+				h.toggleKeyDown = true
+				disabled := !h.disabled.Load()
+				h.disabled.Store(disabled)
+				go h.onToggle(disabled)
 			}
 			return 1
 		}
-		if handler := hotkeys[kb.VkCode]; handler != nil && !hotkeysDisabled.Load() && !modifierHeld(kb) {
+		if handler := h.handlers[kb.VkCode]; handler != nil && !h.disabled.Load() && !modifierHeld(kb) {
 			go handler()
 			return 1
 		}

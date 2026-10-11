@@ -1,0 +1,27 @@
+{
+    "version": "1.0.0",
+    "description": "Tray utility in the spirit of Volume²: switch the default playback device with F7/F8, change the volume with F2/F3 and an on-screen overlay.",
+    "homepage": "https://github.com/des1roer/volume_switch",
+    "license": "MIT",
+    "notes": "The log and an optional .env configuration file live in %LOCALAPPDATA%\\volume_switch.",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/des1roer/volume_switch/releases/download/v1.0.0/volume_switch.exe",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+    },
+    "shortcuts": [
+        [
+            "volume_switch.exe",
+            "Volume Switch"
+        ]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/des1roer/volume_switch/releases/download/v$version/volume_switch.exe"
+            }
+        }
+    }
+}

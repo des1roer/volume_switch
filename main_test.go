@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -345,6 +346,38 @@ func TestLoadDotEnv(t *testing.T) {
 	}
 	if _, ok := os.LookupEnv(keyComment); ok {
 		t.Errorf("%s из закомментированной строки не должен задаваться", keyComment)
+	}
+}
+
+func TestDotEnvPaths(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exeDir := filepath.Dir(exe)
+	wd, data := t.TempDir(), t.TempDir()
+	t.Chdir(wd)
+	setVar(t, &dataDir, func() (string, error) { return data, nil })
+	want := []string{
+		filepath.Join(wd, ".env"),
+		filepath.Join(exeDir, ".env"),
+		filepath.Join(data, ".env"),
+	}
+	if got := dotEnvPaths(); !slices.Equal(got, want) {
+		t.Errorf("dotEnvPaths() = %q, want %q", got, want)
+	}
+
+	// Совпадающие каталоги (с точностью до регистра) не повторяются, а
+	// недоступный каталог данных просто пропускается.
+	t.Chdir(exeDir)
+	want = []string{filepath.Join(exeDir, ".env")}
+	setVar(t, &dataDir, func() (string, error) { return strings.ToUpper(exeDir), nil })
+	if got := dotEnvPaths(); !slices.Equal(got, want) {
+		t.Errorf("dotEnvPaths() с каталогом данных = каталогу exe = %q, want %q", got, want)
+	}
+	setVar(t, &dataDir, func() (string, error) { return "", errors.New("нет LocalAppData") })
+	if got := dotEnvPaths(); !slices.Equal(got, want) {
+		t.Errorf("dotEnvPaths() без каталога данных = %q, want %q", got, want)
 	}
 }
 
@@ -1411,7 +1444,9 @@ func TestSwitcher(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSetupLoggingToFile(t *testing.T) {
-	t.Chdir(t.TempDir())
+	// Каталога ещё нет — setupLogging должен создать его сам.
+	dir := filepath.Join(t.TempDir(), appDirName)
+	setVar(t, &dataDir, func() (string, error) { return dir, nil })
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
 	// Тестовый бинарник собран с консольной subsystem, поэтому hideConsole
@@ -1421,11 +1456,11 @@ func TestSetupLoggingToFile(t *testing.T) {
 	log.Printf("тестовая запись")
 	closeLog()
 
-	data, err := os.ReadFile(logFileName)
+	data, err := os.ReadFile(filepath.Join(dir, logFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"=== volume_switch starting", "тестовая запись"} {
+	for _, want := range []string{"=== volume_switch " + version + " starting", "тестовая запись"} {
 		if !strings.Contains(string(data), want) {
 			t.Errorf("в логе нет %q:\n%s", want, data)
 		}
@@ -1433,15 +1468,44 @@ func TestSetupLoggingToFile(t *testing.T) {
 }
 
 func TestSetupLoggingFileError(t *testing.T) {
-	t.Chdir(t.TempDir())
+	dir := t.TempDir()
+	setVar(t, &dataDir, func() (string, error) { return dir, nil })
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 	// Каталог с именем лог-файла — открыть его на запись нельзя.
-	if err := os.Mkdir(logFileName, 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, logFileName), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	closeLog := setupLogging(false)
 	log.Printf("уходит в никуда")
 	closeLog()
+}
+
+func TestOpenLogFileErrors(t *testing.T) {
+	setVar(t, &dataDir, func() (string, error) { return "", errors.New("нет LocalAppData") })
+	if _, _, err := openLogFile(); err == nil {
+		t.Error("openLogFile без каталога данных: want ошибку")
+	}
+
+	// На месте каталога данных — файл: MkdirAll не сможет создать каталог.
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setVar(t, &dataDir, func() (string, error) { return file, nil })
+	if _, _, err := openLogFile(); err == nil {
+		t.Error("openLogFile с файлом вместо каталога: want ошибку")
+	}
+}
+
+func TestDataDir(t *testing.T) {
+	// Только вычисляет путь — каталог не создаётся.
+	dir, err := dataDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(dir) || filepath.Base(dir) != appDirName {
+		t.Errorf("dataDir() = %q, want абсолютный путь к каталогу %s", dir, appDirName)
+	}
 }
 
 func TestOnExit(t *testing.T) {

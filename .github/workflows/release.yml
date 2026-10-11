@@ -2,6 +2,9 @@ name: release
 
 # Публикует релиз с собранным volume_switch.exe при пуше тега вида v1.2.3:
 #   git tag v1.2.3 && git push origin v1.2.3
+# и затем обновляет пакеты: Scoop (bucket/ в этом репозитории), Chocolatey и
+# winget. Chocolatey и winget публикуются, только если заданы секреты
+# CHOCO_API_KEY и WINGET_TOKEN, — без них эти шаги пропускаются.
 on:
   push:
     tags: ['v*']
@@ -12,6 +15,9 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      sha256: ${{ steps.build.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v5
 
@@ -20,10 +26,19 @@ jobs:
           go-version-file: go.mod
 
       # -H=windowsgui — GUI subsystem, без окна консоли (см. README, «Сборка»);
-      # -s -w убирают отладочную информацию и заметно уменьшают exe.
+      # -s -w убирают отладочную информацию и заметно уменьшают exe;
+      # -X main.version вшивает версию из тега (v1.2.3 → 1.2.3).
+      # Собирается в dist/, чтобы не трогать закоммиченный volume_switch.exe.
       - name: Build
+        id: build
         shell: bash
-        run: go build -trimpath -ldflags "-H=windowsgui -s -w" -o volume_switch.exe .
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=$version" -o dist/volume_switch.exe .
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum dist/volume_switch.exe | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       # При перезапуске job релиз уже существует — тогда exe просто
       # перезаливается в него.
@@ -34,7 +49,74 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" volume_switch.exe --clobber
+            gh release upload "$TAG" dist/volume_switch.exe --clobber
           else
-            gh release create "$TAG" volume_switch.exe --title "$TAG" --generate-notes
+            gh release create "$TAG" dist/volume_switch.exe --title "$TAG" --generate-notes
           fi
+
+  # Манифест Scoop живёт в bucket/ этого репозитория: обновляем версию и хеш
+  # и коммитим в main. Пуш с GITHUB_TOKEN не запускает другие workflow.
+  scoop:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Update Scoop manifest
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # В autoupdate URL содержит $version, а не цифры, — его не трогаем.
+          sed -i -E \
+            -e "s/(\"version\": )\"[^\"]*\"/\1\"$VERSION\"/" \
+            -e "s/(\"hash\": )\"[^\"]*\"/\1\"$SHA256\"/" \
+            -e "s#/download/v[0-9][^/]*/#/download/v$VERSION/#" \
+            bucket/volume_switch.json
+          if git diff --quiet; then
+            echo "Манифест Scoop уже актуален"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Update Scoop manifest to $TAG" bucket/volume_switch.json
+          git push origin main
+
+  chocolatey:
+    needs: release
+    runs-on: windows-latest
+    env:
+      CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pack and push
+        if: env.CHOCO_API_KEY != ''
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
+        run: |
+          sed -i -e "s/__VERSION__/$VERSION/" -e "s/__SHA256__/$SHA256/" packaging/chocolatey/tools/chocolateyinstall.ps1
+          choco pack packaging/chocolatey/volume-switch.nuspec --version "$VERSION" --outputdirectory dist
+          choco push "dist/volume-switch.$VERSION.nupkg" --source https://push.chocolatey.org/ --api-key "$CHOCO_API_KEY"
+
+  # winget-releaser отправляет PR в microsoft/winget-pkgs через форк
+  # (fork-user — владелец этого репозитория). Пакет должен уже существовать в
+  # winget-pkgs: первая версия отправляется вручную. WINGET_TOKEN — classic PAT
+  # со scope public_repo.
+  winget:
+    needs: release
+    runs-on: windows-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@v2
+        if: env.WINGET_TOKEN != ''
+        with:
+          identifier: des1roer.VolumeSwitch
+          installers-regex: 'volume_switch\.exe$'
+          token: ${{ env.WINGET_TOKEN }}

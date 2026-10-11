@@ -52,12 +52,29 @@ const (
 	defaultURL      = "http://localhost:7777/variables.html"
 	defaultInterval = 500 * time.Millisecond
 	logFileName     = "volume_switch.log"
+	appDirName      = "volume_switch" // каталог программы в %LOCALAPPDATA%: лог и .env
 
 	volumeOverlayDuration = 1200 * time.Millisecond
 	volumeOverlayWidth    = float32(260)
 	volumeOverlayHeight   = float32(160)
 	volumeTickCount       = 10 // ползунок размечен от 0 до 100 с шагом 10 (11 отметок)
 )
+
+// version — версия программы; релизная сборка подставляет её из тега через
+// -ldflags "-X main.version=1.2.3" (см. .github/workflows/release.yml).
+var version = "dev"
+
+// dataDir возвращает каталог для лога и .env — %LOCALAPPDATA%\volume_switch.
+// Сам каталог не создаёт. Рабочий каталог для этого не годится: при
+// автозапуске это System32, а при установке через Chocolatey/winget/Scoop
+// exe лежит в каталоге пакета. Переменная только ради тестов.
+var dataDir = func() (string, error) {
+	base, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, 0)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, appDirName), nil
+}
 
 // Заголовки окон-оверлеев. По ним fixOverlayWindowChrome находит нативные
 // окна (FindWindowW), поэтому они должны быть уникальны в системе. Это
@@ -172,16 +189,16 @@ func setupLogging(debug bool) (closeLog func()) {
 	if debug {
 		consoleErr := ensureConsole()
 		log.SetOutput(os.Stderr)
-		log.Printf("=== volume_switch starting (debug mode) ===")
+		log.Printf("=== volume_switch %s starting (debug mode) ===", version)
 		if consoleErr != nil {
 			log.Printf("console: %v", consoleErr)
 		}
 		return func() {}
 	}
 	consoleErr := hideConsole()
-	f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	path, f, err := openLogFile()
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "volume_switch: не удалось открыть %s, лог отключён: %v\n", logFileName, err)
+		_, _ = fmt.Fprintf(os.Stderr, "volume_switch: не удалось открыть лог, лог отключён: %v\n", err)
 		if consoleErr != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "volume_switch: console: %v\n", consoleErr)
 		}
@@ -189,16 +206,31 @@ func setupLogging(debug bool) (closeLog func()) {
 		return func() {}
 	}
 	log.SetOutput(f)
-	log.Printf("=== volume_switch starting (log -> %s) ===", logFileName)
+	log.Printf("=== volume_switch %s starting (log -> %s) ===", version, path)
 	if consoleErr != nil {
 		log.Printf("console: %v", consoleErr)
 	}
 	return func() {
 		log.SetOutput(io.Discard)
 		if err := f.Close(); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "volume_switch: закрытие %s: %v\n", logFileName, err)
+			_, _ = fmt.Fprintf(os.Stderr, "volume_switch: закрытие %s: %v\n", path, err)
 		}
 	}
+}
+
+// openLogFile открывает на дозапись лог в dataDir, создавая каталог при
+// необходимости, и возвращает путь к нему.
+func openLogFile() (string, *os.File, error) {
+	dir, err := dataDir()
+	if err != nil {
+		return "", nil, fmt.Errorf("каталог данных: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", nil, err
+	}
+	path := filepath.Join(dir, logFileName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	return path, f, err
 }
 
 // hideConsole отвязывает процесс от унаследованной консоли и закрывает её
@@ -221,12 +253,37 @@ func hideConsole() error {
 // .env
 // ---------------------------------------------------------------------------
 
+// dotEnvPaths возвращает, где искать .env, в порядке приоритета: рабочий
+// каталог (разработка, `go run .`), каталог exe (переносная установка) и
+// dataDir. Повторяющиеся каталоги отбрасываются.
+func dotEnvPaths() []string {
+	var dirs []string
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, wd)
+	}
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	if dir, err := dataDir(); err == nil {
+		dirs = append(dirs, dir)
+	}
+	var paths []string
+	for _, dir := range dirs {
+		path := filepath.Join(dir, ".env")
+		if !slices.ContainsFunc(paths, func(p string) bool { return strings.EqualFold(p, path) }) {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
 // loadDotEnv читает KEY=VALUE построчно из .env и выставляет
-// переменные окружения, не перезаписывая уже заданные извне.
+// переменные окружения, не перезаписывая уже заданные извне (в том числе
+// загруженные из .env с более высоким приоритетом).
 func loadDotEnv(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf(".env not loaded (%v) — использую переменные окружения/флаги", err)
+		log.Printf(".env: %s не загружен: %v", path, err)
 		return
 	}
 	loaded := 0
@@ -252,7 +309,7 @@ func loadDotEnv(path string) {
 			log.Printf(".env: %s уже задан извне, пропускаю", key)
 		}
 	}
-	log.Printf(".env loaded: %d переменных", loaded)
+	log.Printf(".env: %s загружен, %d переменных", path, loaded)
 }
 
 // ---------------------------------------------------------------------------
@@ -1854,7 +1911,9 @@ func main() {
 		defer releaseInstance()
 	}
 
-	loadDotEnv(".env")
+	for _, path := range dotEnvPaths() {
+		loadDotEnv(path)
+	}
 
 	url := os.Getenv("MPC_URL")
 	if url == "" {

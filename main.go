@@ -1301,24 +1301,25 @@ func buildUI(url string) {
 	}
 	volumeWindow.SetContent(container.NewWithoutLayout(overlayObjects...))
 
-	// Нативный HWND у Fyne/GLFW создаётся лениво, только при первом Show().
-	// Если применить WS_EX_TOOLWINDOW уже ПОСЛЕ того, как окно хотя бы раз
-	// показалось с обычным стилем, Explorer иногда всё равно продолжает
-	// держать кнопку в панели задач (подтверждено на практике: однократный
-	// fixOverlayWindowChrome после первого Show() отрабатывал успешно, но
-	// кнопка оставалась) — похоже, таскбар кеширует факт появления окна с
-	// «обычным» стилем. Поэтому здесь окно показывается и сразу прячется
-	// один раз вхолостую ещё до первого реального показа — только чтобы
-	// форсировать создание HWND, применить стиль, и лишь после этого окно
-	// хоть раз станет видимым пользователю. Касается обоих окон: mainWindow
-	// без этого оставалось в панели задач после первого показа по F5.
+	// Нативный HWND у Fyne/GLFW создаётся лениво, только при первом Show(),
+	// и в том же вызове сразу становится видимым. Если окно хоть раз
+	// показалось с обычным стилем, Explorer заводит ему кнопку в панели
+	// задач и не убирает её, даже когда окно потом получает
+	// WS_EX_TOOLWINDOW и прячется: на кнопке остаётся «призрак» (особенно
+	// при автозапуске на входе в Windows, когда Explorer ещё не успевает
+	// обработать смену стиля до скрытия). Поэтому окна создаются здесь
+	// вхолостую (показ + скрытие) под CBT-хуком createAsToolWindows,
+	// который выставляет WS_EX_TOOLWINDOW в момент создания HWND — до
+	// того, как окно хоть раз станет видимым.
 	//
 	// После этого оба окна стартуют скрытыми: mainWindow покажем по F5,
 	// volumeWindow — по событию от volume poller.
-	for _, w := range []fyne.Window{mainWindow, volumeWindow} {
-		showOverlay(w, w == mainWindow)
-		w.Hide()
-	}
+	createAsToolWindows(func() {
+		for _, w := range []fyne.Window{mainWindow, volumeWindow} {
+			showOverlay(w, w == mainWindow)
+			w.Hide()
+		}
+	})
 	log.Printf("fyne: окно создано, стартует скрытым")
 }
 
@@ -1417,8 +1418,6 @@ func showOverlay(w fyne.Window, topmost bool) {
 // над оверлеем.
 func fixOverlayWindowChrome(title string, topmost bool) error {
 	const (
-		wsExToolWindow  = 0x00000080
-		wsExAppWindow   = 0x00040000
 		swpNoMove       = 0x0002
 		swpNoSize       = 0x0001
 		swpNoZOrder     = 0x0004
@@ -1429,9 +1428,6 @@ func fixOverlayWindowChrome(title string, topmost bool) error {
 
 		hwndTopmost = ^uintptr(0) // HWND_TOPMOST = (HWND)-1
 	)
-	// -20 переполняет uintptr как константа компиляции; через typed
-	// переменную Go делает корректное sign-extension в рантайме.
-	var gwlExStyle int32 = -20
 
 	titlePtr, err := syscall.UTF16PtrFromString(title)
 	if err != nil {
@@ -1442,15 +1438,8 @@ func fixOverlayWindowChrome(title string, topmost bool) error {
 		return fmt.Errorf("окно %q: %w", title, win32Error("FindWindowW", errno))
 	}
 
-	// У окна GLFW расширенный стиль никогда не нулевой, поэтому 0 от
-	// Get/SetWindowLongPtrW здесь однозначно означает ошибку.
-	exStyle, _, errno := procGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
-	if exStyle == 0 {
-		return win32Error("GetWindowLongPtrW", errno)
-	}
-	newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
-	if prev, _, errno := procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle); prev == 0 {
-		return win32Error("SetWindowLongPtrW", errno)
+	if err := setToolWindowStyle(hwnd); err != nil {
+		return err
 	}
 
 	// SWP_FRAMECHANGED заставляет Explorer пересчитать кнопку в панели
@@ -1474,6 +1463,89 @@ func fixOverlayWindowChrome(title string, topmost bool) error {
 		return fmt.Errorf("DwmSetWindowAttribute: %w", err)
 	}
 	return nil
+}
+
+// setToolWindowStyle делает окно toolwindow: такие окна не получают кнопку
+// в панели задач (WS_EX_APPWINDOW, принудительно её дающий, снимается).
+func setToolWindowStyle(hwnd uintptr) error {
+	const (
+		wsExToolWindow = 0x00000080
+		wsExAppWindow  = 0x00040000
+	)
+	// -20 переполняет uintptr как константа компиляции; через typed
+	// переменную Go делает корректное sign-extension в рантайме.
+	var gwlExStyle int32 = -20
+
+	// У окна GLFW расширенный стиль никогда не нулевой, поэтому 0 от
+	// Get/SetWindowLongPtrW здесь однозначно означает ошибку.
+	exStyle, _, errno := procGetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle))
+	if exStyle == 0 {
+		return win32Error("GetWindowLongPtrW", errno)
+	}
+	newExStyle := (exStyle &^ uintptr(wsExAppWindow)) | uintptr(wsExToolWindow)
+	if prev, _, errno := procSetWindowLongPtrW.Call(hwnd, uintptr(gwlExStyle), newExStyle); prev == 0 {
+		return win32Error("SetWindowLongPtrW", errno)
+	}
+	return nil
+}
+
+// overlayWindowClass — класс нативных окон Fyne/GLFW, которым
+// createAsToolWindows ставит WS_EX_TOOLWINDOW при создании. Переменная, а не
+// константа, только ради тестов: там окна создаются стандартного класса.
+var overlayWindowClass = "GLFW30"
+
+// cbtHookCallback создаётся один раз: колбэки syscall.NewCallback никогда не
+// освобождаются, а их число в процессе ограничено.
+var cbtHookCallback = syscall.NewCallback(cbtHookProc)
+
+// createAsToolWindows выполняет f, пока на текущем потоке стоит хук WH_CBT,
+// который делает каждое создаваемое окно класса overlayWindowClass
+// toolwindow сразу в момент создания (HCBT_CREATEWND приходит до
+// WM_NCCREATE, окно ещё ни разу не было видимым). Так у Explorer нет
+// момента, когда окно видно с обычным стилем, и кнопка в панели задач для
+// него не появляется вообще. Хук локальный для потока: окна Fyne создаются
+// на потоке, вызвавшем Show() (горутина main, см. runFyne).
+//
+// Если хук поставить не удалось, f всё равно выполняется — окно лишь
+// рискует остаться на панели задач, как раньше.
+func createAsToolWindows(f func()) {
+	const whCBT = 5
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	hook, _, errno := procSetWindowsHookExW.Call(whCBT, cbtHookCallback, 0, uintptr(windows.GetCurrentThreadId()))
+	if hook == 0 {
+		log.Printf("overlay: %v — окна могут попасть на панель задач", win32Error("SetWindowsHookExW", errno))
+		f()
+		return
+	}
+	defer func() {
+		if r, _, errno := procUnhookWindowsHookEx.Call(hook); r == 0 {
+			log.Printf("overlay: %v", win32Error("UnhookWindowsHookEx", errno))
+		}
+	}()
+	f()
+}
+
+// cbtHookProc — процедура хука WH_CBT из createAsToolWindows. На
+// HCBT_CREATEWND wParam — HWND только что созданного окна (имена классов в
+// Windows регистронезависимы, отсюда EqualFold). Возврат 0
+// разрешает создание окна; CallNextHookEx возвращает результат следующего
+// хука в цепочке, а не признак ошибки.
+func cbtHookProc(nCode int, wParam, lParam uintptr) uintptr {
+	const hcbtCreateWnd = 3
+	if nCode == hcbtCreateWnd {
+		var cls [64]uint16
+		n, err := windows.GetClassName(windows.HWND(wParam), &cls[0], int32(len(cls)))
+		if err == nil && strings.EqualFold(windows.UTF16ToString(cls[:n]), overlayWindowClass) {
+			if err := setToolWindowStyle(wParam); err != nil {
+				log.Printf("overlay: стиль toolwindow при создании окна: %v", err)
+			}
+		}
+	}
+	r, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+	return r
 }
 
 // toggleMPCWindow показывает окно, если оно скрыто, и прячет, если показано.

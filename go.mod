@@ -6,6 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.8.1
 	github.com/diegosz/go-wca v0.5.1
 	github.com/getlantern/systray v1.2.2
+	github.com/go-gl/glfw/v3.4/glfw v0.1.0-pre.2
 	github.com/go-ole/go-ole v1.3.0
 	golang.org/x/sys v0.48.0
 )
@@ -28,7 +29,6 @@ require (
 	github.com/getlantern/hidden v0.0.0-20220104173330-f221c5a24770 // indirect
 	github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 // indirect
 	github.com/go-gl/gl v0.0.0-20260331235117-4566fea9a276 // indirect
-	github.com/go-gl/glfw/v3.4/glfw v0.1.0-pre.2 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-stack/stack v1.8.1 // indirect

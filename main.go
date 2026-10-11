@@ -44,6 +44,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/diegosz/go-wca/pkg/wca"
+	"github.com/go-gl/glfw/v3.4/glfw"
 	"github.com/go-ole/go-ole"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -1214,9 +1215,10 @@ func newOverlays(a fyne.App, mpc *mpcClient) *overlays {
 	//
 	// После этого оба окна стартуют скрытыми: прогресс покажем по F5,
 	// громкость — по событию от volume poller.
+	disableFocusOnShow()
 	createAsToolWindows(func() {
 		for _, w := range []fyne.Window{o.progress.window, o.volume.window} {
-			showOverlay(w, w == o.progress.window)
+			showOverlay(w, true)
 			w.Hide()
 		}
 	})
@@ -1616,6 +1618,18 @@ func setToolWindowStyle(hwnd uintptr) error {
 	return nil
 }
 
+// disableFocusOnShow запрещает GLFW активировать окна при показе: иначе на
+// каждый Show() GLFW вызывает SetForegroundWindow, и topmost-оверлей
+// забирает фокус у активного окна (например, у MPC-HC во весь экран), пока
+// не спрячется. Хинт глобальный и действует на окна, созданные после него;
+// Fyne его не сбрасывает, а GLFW инициализирует в первом NewWindow, поэтому
+// вызывать — после создания окон Fyne и до их первого Show(), на горутине
+// main. Переменная ради тестов: в тестовом драйвере Fyne GLFW не
+// инициализирован, и glfw.WindowHint паникует.
+var disableFocusOnShow = func() {
+	glfw.WindowHint(glfw.FocusOnShow, glfw.False)
+}
+
 // overlayWindowClass — класс нативных окон Fyne/GLFW, которым
 // createAsToolWindows ставит WS_EX_TOOLWINDOW при создании. Переменная, а не
 // константа, только ради тестов: там окна создаются стандартного класса.
@@ -1739,6 +1753,10 @@ func (v *volumeOverlay) layout(width, height float32, level float64, muted bool)
 // Таймер скрытия каждый раз перезапускается (debounce), чтобы при быстрой
 // серии событий — например, при удержании клавиши громкости — оверлей не
 // мигал, а гас один раз после того, как изменения прекратились.
+//
+// Окно поднимается поверх всех окон, как и прогресс по F5: громкость обычно
+// меняют, когда активно другое окно (например, MPC-HC во весь экран), а
+// обычное окно фонового процесса Windows оставляет под активным.
 func (v *volumeOverlay) Show(level float64, muted bool) {
 	fyne.Do(func() {
 		width, height := volumeOverlayWidth, volumeOverlayHeight
@@ -1758,7 +1776,7 @@ func (v *volumeOverlay) Show(level float64, muted bool) {
 		log.Printf("volume overlay: показываю размер=%.0fx%.0f позиция=(%d,%d) level=%.0f%% muted=%v",
 			width, height, x, y, level*100, muted)
 
-		showOverlay(v.window, false)
+		showOverlay(v.window, true)
 	})
 
 	v.mu.Lock()

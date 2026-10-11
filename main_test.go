@@ -685,6 +685,7 @@ func setupUI(t *testing.T, mpcURL string) *overlays {
 	t.Helper()
 	setVar(t, &windowTitle, uniqueTitle(t, windowTitle))
 	setVar(t, &volumeWindowTitle, uniqueTitle(t, volumeWindowTitle))
+	setVar(t, &disableFocusOnShow, func() {})
 	return newOverlays(test.NewTempApp(t), newMPCClient(mpcURL))
 }
 

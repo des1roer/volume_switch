@@ -1,7 +1,7 @@
 // Command volume_switch sits in the system tray. F5 toggles an MPC-HC
 // progress overlay window, F7/F8 cycle the default Windows playback
-// device, the same way Volume2 does, and F3/F4 lower/raise the master
-// volume.
+// device, the same way Volume2 does, and F2/F3 lower/raise the master
+// volume. Ctrl+F2 turns all of these hotkeys off and back on.
 package main
 
 import (
@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -91,6 +92,7 @@ var (
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	user32   = windows.NewLazySystemDLL("user32.dll")
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
+	winmm    = windows.NewLazySystemDLL("winmm.dll")
 
 	procAllocConsole     = kernel32.NewProc("AllocConsole")
 	procFreeConsole      = kernel32.NewProc("FreeConsole")
@@ -115,6 +117,8 @@ var (
 	procPostThreadMessageW  = user32.NewProc("PostThreadMessageW")
 
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
+
+	procPlaySoundW = winmm.NewProc("PlaySoundW")
 )
 
 // ---------------------------------------------------------------------------
@@ -803,6 +807,7 @@ const (
 	nifInfo = 0x00000010
 
 	niifInfo             = 0x00000001
+	niifNoSound          = 0x00000010
 	niifRespectQuietTime = 0x00000080
 
 	trayIconID = 100
@@ -833,7 +838,10 @@ type notifyIconDataW struct {
 // body. It is a no-op if this process's tray window cannot be found (e.g.
 // called before systray finished initializing, or after a dependency
 // upgrade changed the implementation details above).
-func showNotification(title, body string) {
+//
+// With silent the notification plays no sound of its own (the caller plays
+// one instead).
+func showNotification(title, body string, silent bool) {
 	hwnd, err := findOwnTrayWindow()
 	if err != nil {
 		log.Printf("notification: поиск окна трея: %v", err)
@@ -850,6 +858,9 @@ func showNotification(title, body string) {
 	nid.uID = trayIconID
 	nid.uFlags = nifInfo
 	nid.dwInfoFlags = niifInfo | niifRespectQuietTime
+	if silent {
+		nid.dwInfoFlags |= niifNoSound
+	}
 	copyUTF16(nid.szInfo[:], body)
 	copyUTF16(nid.szInfoTitle[:], title)
 
@@ -1960,8 +1971,8 @@ func onReady(debug bool) {
 	}()
 
 	stopHotkeys, err = startHotkeys(map[uint32]func(){
-		vkF3: func() { log.Printf("hotkey: F3"); onVolumeKey(-volumeKeyStep) },
-		vkF4: func() { log.Printf("hotkey: F4"); onVolumeKey(volumeKeyStep) },
+		vkF2: func() { log.Printf("hotkey: F2"); onVolumeKey(-volumeKeyStep) },
+		vkF3: func() { log.Printf("hotkey: F3"); onVolumeKey(volumeKeyStep) },
 		vkF5: func() { log.Printf("hotkey: F5"); toggleMPCWindow() },
 		vkF7: func() { log.Printf("hotkey: F7"); onCycle(-1) },
 		vkF8: func() { log.Printf("hotkey: F8"); onCycle(1) },
@@ -1969,7 +1980,7 @@ func onReady(debug bool) {
 	if err != nil {
 		log.Printf("hotkey: не удалось установить хук: %v", err)
 	} else {
-		log.Printf("hotkey: хук установлен (F3/F4/F5/F7/F8)")
+		log.Printf("hotkey: хук установлен (F2/F3/F5/F7/F8, Ctrl+F2 — вкл/выкл)")
 	}
 
 	// Колбэк вызывается из горутины поллера; вся работа с UI внутри
@@ -2026,7 +2037,7 @@ func selectDevice(dev Device) {
 	announceSwitch(dev)
 }
 
-// volumeKeyStep — шаг громкости по F3/F4, как у мультимедийных клавиш
+// volumeKeyStep — шаг громкости по F2/F3, как у мультимедийных клавиш
 // громкости Windows (2% шкалы).
 const volumeKeyStep = 0.02
 
@@ -2052,7 +2063,40 @@ func onCycle(direction int) {
 
 func announceSwitch(dev Device) {
 	setTrayTooltip("Volume Switch: " + dev.Name)
-	showNotification("Аудиовыход переключён", dev.Name)
+	showNotification("Аудиовыход переключён", dev.Name, false)
+}
+
+// announceHotkeys сообщает о включении/выключении хоткеев по Ctrl+F2:
+// уведомление в углу экрана и системный звук — разный для включения и
+// выключения, чтобы состояние было понятно и на слух. Собственный звук
+// уведомления отключён, иначе звучали бы оба.
+func announceHotkeys(disabled bool) {
+	title, body, sound := "Горячие клавиши включены", "F2/F3, F5, F7/F8 снова работают", "DeviceConnect"
+	if disabled {
+		title, body, sound = "Горячие клавиши выключены", "Ctrl+F2 — включить снова", "DeviceDisconnect"
+	}
+	log.Printf("hotkey: %s", strings.ToLower(title))
+	showNotification(title, body, true)
+	playSystemSound(sound)
+}
+
+// playSystemSound асинхронно проигрывает системный звук по его псевдониму
+// из панели «Звуки» (DeviceConnect и т.п.). Переменная только ради тестов:
+// там звук не нужен.
+var playSystemSound = func(alias string) {
+	const (
+		sndAsync     = 0x00000001
+		sndNoDefault = 0x00000002
+		sndAlias     = 0x00010000
+	)
+	name, err := windows.UTF16PtrFromString(alias)
+	if err != nil {
+		log.Printf("audio: звук %q: %v", alias, err)
+		return
+	}
+	if r, _, errno := procPlaySoundW.Call(uintptr(unsafe.Pointer(name)), 0, sndAlias|sndAsync|sndNoDefault); r == 0 {
+		log.Printf("audio: звук %q: %v", alias, win32Error("PlaySoundW", errno))
+	}
 }
 
 func setChecked(checkedID string) {
@@ -2069,13 +2113,15 @@ func setChecked(checkedID string) {
 }
 
 // ---------------------------------------------------------------------------
-// Глобальный хук клавиатуры Windows (F3/F4/F5/F7/F8)
+// Глобальный хук клавиатуры Windows (F2/F3/F5/F7/F8, Ctrl+F2)
 // ---------------------------------------------------------------------------
 
 const (
 	whKeyboardLL = 13
 	wmKeyDown    = 0x0100
 	wmSysKeyDown = 0x0104
+	wmKeyUp      = 0x0101
+	wmSysKeyUp   = 0x0105
 	llkhfAltDown = 0x20 // KBDLLHOOKSTRUCT.Flags: зажат Alt
 
 	vkShift   = 0x10
@@ -2083,8 +2129,8 @@ const (
 	vkLWin    = 0x5B
 	vkRWin    = 0x5C
 
+	vkF2 = 0x71
 	vkF3 = 0x72
-	vkF4 = 0x73
 	vkF5 = 0x74
 	vkF7 = 0x76
 	vkF8 = 0x77
@@ -2119,6 +2165,28 @@ type kbdllHookStruct struct {
 	Flags       uint32
 	Time        uint32
 	DwExtraInfo uintptr
+}
+
+// vkToggleHotkeys с зажатым Ctrl включает/выключает хоткеи (Ctrl+F2).
+const vkToggleHotkeys = vkF2
+
+// hotkeysDisabled — хоткеи выключены по Ctrl+F2. Пишется только в hookProc,
+// читается там же и в тестах, поэтому атомарный.
+var hotkeysDisabled atomic.Bool
+
+// toggleKeyDown — Ctrl+F2 нажат и F2 ещё не отпущена (подавление
+// автоповтора). Используется только в hookProc, который Windows вызывает
+// последовательно в потоке хука, поэтому без синхронизации.
+var toggleKeyDown bool
+
+// toggleComboPressed сообщает, что нажата клавиша переключения хоткеев
+// вместе с Ctrl и без других модификаторов: Ctrl+Shift+F2 и т.п. уходят
+// программам.
+func toggleComboPressed(kb *kbdllHookStruct) bool {
+	if kb.VkCode != vkToggleHotkeys || kb.Flags&llkhfAltDown != 0 || !keyHeld(vkControl) {
+		return false
+	}
+	return !slices.ContainsFunc([]uintptr{vkShift, vkLWin, vkRWin}, keyHeld)
 }
 
 // hotkeys — обработчики перехватываемых клавиш по virtual-key коду.
@@ -2205,9 +2273,26 @@ func startHotkeys(handlers map[uint32]func()) (stop func() error, err error) {
 //
 // CallNextHookEx возвращает результат следующего хука в цепочке, а не
 // признак ошибки, поэтому третье значение Call здесь не нужно.
+//
+// Ctrl+F2 перехватывается всегда и включает/выключает остальные хоткеи;
+// выключенные хоткеи уходят программам как обычные клавиши.
 func hookProc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintptr {
+	if nCode >= 0 && kb.VkCode == vkToggleHotkeys && (wParam == wmKeyUp || wParam == wmSysKeyUp) {
+		toggleKeyDown = false
+	}
 	if nCode >= 0 && (wParam == wmKeyDown || wParam == wmSysKeyDown) {
-		if handler := hotkeys[kb.VkCode]; handler != nil && !modifierHeld(kb) {
+		if toggleComboPressed(kb) {
+			// Автоповтор зажатого Ctrl+F2 не переключает хоткеи туда-обратно:
+			// повторное переключение — только после отпускания F2.
+			if !toggleKeyDown {
+				toggleKeyDown = true
+				disabled := !hotkeysDisabled.Load()
+				hotkeysDisabled.Store(disabled)
+				go announceHotkeys(disabled)
+			}
+			return 1
+		}
+		if handler := hotkeys[kb.VkCode]; handler != nil && !hotkeysDisabled.Load() && !modifierHeld(kb) {
 			go handler()
 			return 1
 		}

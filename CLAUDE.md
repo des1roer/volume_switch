@@ -16,7 +16,7 @@ gofmt -l .                                                # должно быт�
 
 - Окружение: Windows, Go 1.27.1 (`go.mod`), cgo нужен (Fyne/GLFW, `-race`) — gcc должен быть в PATH. Bash-инструмент — Git Bash.
 - Программа одноэкземплярная (мьютекс `Local\volume_switch_single_instance`): второй запуск молча выходит. Перед проверкой новой сборки закрыть запущенную (иконка в трее → «Выход»), иначе запустится старая, а `go build -o volume_switch.exe` упадёт с access denied, пока exe занят.
-- `.env` и `volume_switch.log` берутся из рабочего каталога.
+- Лог — `%LOCALAPPDATA%\volume_switch\volume_switch.log` (`dataDir`); `.env` ищется в рабочем каталоге, рядом с exe и в том же `%LOCALAPPDATA%\volume_switch` (`dotEnvPaths`). Рабочий каталог для лога не годится: при автозапуске это `System32`, у пакетов — каталог пакета.
 
 ## Git, PR, релизы
 
@@ -25,6 +25,8 @@ gofmt -l .                                                # должно быт�
 - Работа через ветку + PR в `main` (`gh pr create`); мёрджит пользователь. Заголовок PR и коммита — по-английски в повелительном наклонении, описание PR — по-русски.
 - CI: `.github/workflows/tests.yml` — `go vet` + `go test -race` на `windows-latest` для PR и push в `main`. С холодным кешем ~11 мин (cgo-сборка GLFW), поэтому ждать прогон в фоне, а не блокирующим `gh run watch` (таймаут Bash — 10 мин).
 - Релиз: `.github/workflows/release.yml` на пуш тега `v*` собирает exe (`-H=windowsgui -s -w`) и прикрепляет к GitHub Release. Выпуск: `git tag vX.Y.Z && git push origin vX.Y.Z`. Тег публичный — ставить только по просьбе пользователя.
+- Версия вшивается через `-ldflags "-X main.version=…"` только в релизной сборке; локальная сборка — `dev`.
+- Пакеты обновляет тот же `release.yml` отдельными job'ами: Scoop (`bucket/volume_switch.json`, workflow сам коммитит версию и хеш в `main` — перед следующей работой сделать `git pull`), Chocolatey (`packaging/chocolatey`, плейсхолдеры `__VERSION__`/`__SHA256__` подставляет workflow; секрет `CHOCO_API_KEY`) и winget (`winget-releaser`, секрет `WINGET_TOKEN`; только обновления уже существующего пакета `des1roer.VolumeSwitch`). Без секрета шаг пропускается. Файлы пакетов — на английском (их читают модераторы).
 
 ## Соглашения по коду
 
@@ -56,6 +58,7 @@ gofmt -l .                                                # должно быт�
 
 - `startDetached` — запуск explorer/MPC-HC; в тестах `fakeStart(t, err)` записывает команды вместо запуска. Без подмены `toggleMPCPlayback`/`launchMPC`/клик по оверлею **реально запускают MPC-HC и проводник**.
 - `autostartRegistryPath`, `mpcRegistryPath` — только временные ключи из `tempRegistryKey(t)` (удаляются после теста). Настоящий `...\Run` не трогать.
+- `dataDir` — каталог лога и `.env`; в тестах — `t.TempDir()`, иначе `setupLogging` пишет в настоящий `%LOCALAPPDATA%\volume_switch`.
 - `windowTitle`, `volumeWindowTitle` — `setupUI` ставит уникальные заголовки, иначе `fixOverlayWindowChrome` найдёт по заголовку окна запущенной у пользователя программы.
 - `singleInstanceMutex`, `systrayClassName` — уникальные значения в тестах.
 - `setTrayTooltip`, `addTrayCheckbox` — вызовы systray вне `onReady`: без запущенного трея настоящий systray падает (nil внутри `SetTooltip`). `fakeTooltip(t)` заодно служит точкой синхронизации с горутинами меню: `announceSwitch` выставляет подсказку последней.

@@ -21,9 +21,27 @@
 - Клик левой кнопкой по полосе прогресса ставит воспроизведение на паузу/возобновляет его; если MPC-HC не запущен — запускает его (путь берётся из `MPC_EXE`, по умолчанию `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, а если такого файла нет — из `HKCU\Software\MPC-HC\MPC-HC\ExePath`, который MPC-HC пишет сам).
 - Необязательный файл `.env` для конфигурации; при отсутствии используются переменные окружения, затем флаги.
 
-## Скачать
+## Установка
 
-Готовый `volume_switch.exe` лежит в [релизах](https://github.com/des1roer/volume_switch/releases/latest) — собирать самому не обязательно.
+Через [Scoop](https://scoop.sh):
+
+```sh
+scoop bucket add volume_switch https://github.com/des1roer/volume_switch
+scoop install volume_switch
+```
+
+Через [winget](https://learn.microsoft.com/windows/package-manager/) или [Chocolatey](https://chocolatey.org) (пакеты появляются там после модерации, первая версия может проходить её несколько дней):
+
+```sh
+winget install des1roer.VolumeSwitch
+choco install volume-switch
+```
+
+Или вручную: готовый `volume_switch.exe` лежит в [релизах](https://github.com/des1roer/volume_switch/releases/latest). Программа переносная — достаточно положить exe куда угодно и запустить; собирать самому не обязательно.
+
+Лог и необязательный `.env` лежат в `%LOCALAPPDATA%\volume_switch` (см. «Конфигурация»), при удалении пакета они остаются.
+
+### Выпуск релиза
 
 Новый релиз публикуется автоматически (`.github/workflows/release.yml`) при пуше тега вида `vX.Y.Z`:
 
@@ -31,6 +49,16 @@
 git tag v1.2.3
 git push origin v1.2.3
 ```
+
+Workflow собирает exe с вшитой версией, создаёт GitHub Release и обновляет пакеты:
+
+- **Scoop** — манифест `bucket/volume_switch.json` (версия и хеш) коммитится в `main`;
+- **Chocolatey** — пакет из `packaging/chocolatey` отправляется на модерацию, если задан секрет `CHOCO_API_KEY` (API-ключ с community.chocolatey.org);
+- **winget** — PR в [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) через [winget-releaser](https://github.com/vedantmgoyal9/winget-releaser), если задан секрет `WINGET_TOKEN` (classic PAT со scope `public_repo`; нужен форк winget-pkgs у владельца репозитория). Работает только для обновлений — первая версия пакета отправляется в winget-pkgs вручную.
+
+## Лицензия
+
+[MIT](LICENSE).
 
 ## Требования
 
@@ -83,11 +111,11 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 | `-interval` | `MPC_INTERVAL`  | `500ms`                                | Интервал опроса для оверлея         |
 | —           | `MPC_EXE`       | `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe` | Путь к MPC-HC для запуска по клику  |
 
-Флаги переопределяют переменные окружения, те переопределяют файл `.env`, который переопределяет жёстко заданные значения по умолчанию. Файл `.env` (`KEY=VALUE` по строке, комментарии через `#` разрешены) в рабочем каталоге загружается при запуске, но никогда не переопределяет переменную, уже заданную в реальном окружении.
+Флаги переопределяют переменные окружения, те переопределяют файл `.env`, который переопределяет жёстко заданные значения по умолчанию. Файл `.env` (`KEY=VALUE` по строке, комментарии через `#` разрешены) загружается при запуске, но никогда не переопределяет переменную, уже заданную в реальном окружении. Он ищется в рабочем каталоге, рядом с exe и в `%LOCALAPPDATA%\volume_switch`; если файлов несколько, переменная берётся из первого по этому списку.
 
 ## Логирование
 
-- `-debug=false` (по умолчанию): логи пишутся в `volume_switch.log` в рабочем каталоге.
+- `-debug=false` (по умолчанию): логи пишутся в `%LOCALAPPDATA%\volume_switch\volume_switch.log`. Не в рабочий каталог: при автозапуске это `System32`, а при установке пакетным менеджером — каталог пакета.
 - `-debug=true`: логи выводятся в подключённую/выделенную консоль.
 
 ## Для ИИ-ассистентов (обзор архитектуры)
@@ -97,7 +125,7 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 **Структура файла** (по порядку, каждая часть помечена заголовком секции `// ---...---` в `main.go`):
 
 1. Логирование (`ensureConsole`, `setupLogging`)
-2. Загрузка `.env` (`loadDotEnv`)
+2. Загрузка `.env` (`dotEnvPaths`, `loadDotEnv`)
 3. Парсинг `variables.html` MPC-HC (на регулярках, `fetchState`/`MPCState`)
 4. Хелперы Win32: монитор под курсором и высота заголовка окна (`screenLayout`, `titleBarHeight`)
 5. Переключение аудиоустройств и шаг громкости через WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
@@ -145,9 +173,27 @@ Written for my own use as a Volume² replacement on Windows 11: its overlay and 
 - A left click on the progress bar pauses/resumes playback; if MPC-HC is not running, it launches it (the path comes from `MPC_EXE`, by default `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, and if that file doesn't exist — from `HKCU\Software\MPC-HC\MPC-HC\ExePath`, which MPC-HC writes itself).
 - An optional `.env` file for configuration; environment variables and then flags take precedence over it.
 
-## Download
+## Installation
 
-A prebuilt `volume_switch.exe` is available in [releases](https://github.com/des1roer/volume_switch/releases/latest) — no need to build it yourself.
+With [Scoop](https://scoop.sh):
+
+```sh
+scoop bucket add volume_switch https://github.com/des1roer/volume_switch
+scoop install volume_switch
+```
+
+With [winget](https://learn.microsoft.com/windows/package-manager/) or [Chocolatey](https://chocolatey.org) (packages appear there after moderation; the first version may take several days):
+
+```sh
+winget install des1roer.VolumeSwitch
+choco install volume-switch
+```
+
+Or manually: a prebuilt `volume_switch.exe` is available in [releases](https://github.com/des1roer/volume_switch/releases/latest). The program is portable — just put the exe anywhere and run it; no need to build it yourself.
+
+The log and the optional `.env` live in `%LOCALAPPDATA%\volume_switch` (see "Configuration"); they are kept when the package is uninstalled.
+
+### Cutting a release
 
 A new release is published automatically (`.github/workflows/release.yml`) when a `vX.Y.Z` tag is pushed:
 
@@ -155,6 +201,16 @@ A new release is published automatically (`.github/workflows/release.yml`) when 
 git tag v1.2.3
 git push origin v1.2.3
 ```
+
+The workflow builds the exe with the version embedded, creates a GitHub Release and updates the packages:
+
+- **Scoop**: the `bucket/volume_switch.json` manifest (version and hash) is committed to `main`;
+- **Chocolatey**: the package from `packaging/chocolatey` is submitted for moderation if the `CHOCO_API_KEY` secret is set (an API key from community.chocolatey.org);
+- **winget**: a PR to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) via [winget-releaser](https://github.com/vedantmgoyal9/winget-releaser) if the `WINGET_TOKEN` secret is set (a classic PAT with the `public_repo` scope; the repository owner needs a fork of winget-pkgs). This works only for updates: the first version of the package is submitted to winget-pkgs manually.
+
+## License
+
+[MIT](LICENSE).
 
 ## Requirements
 
@@ -206,11 +262,11 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 | `-interval` | `MPC_INTERVAL`  | `500ms`                                | Polling interval for the overlay    |
 | —           | `MPC_EXE`       | `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe` | Path to MPC-HC to launch on click   |
 
-Flags override environment variables, which override the `.env` file, which overrides the hard-coded defaults. The `.env` file (`KEY=VALUE` per line, `#` comments allowed) in the working directory is loaded at startup but never overrides a variable already set in the real environment.
+Flags override environment variables, which override the `.env` file, which overrides the hard-coded defaults. The `.env` file (`KEY=VALUE` per line, `#` comments allowed) is loaded at startup but never overrides a variable already set in the real environment. It is looked up in the working directory, next to the exe and in `%LOCALAPPDATA%\volume_switch`; if there are several files, a variable comes from the first one in this list.
 
 ## Logging
 
-- `-debug=false` (default): logs go to `volume_switch.log` in the working directory.
+- `-debug=false` (default): logs go to `%LOCALAPPDATA%\volume_switch\volume_switch.log`. Not to the working directory: on autostart it is `System32`, and when installed by a package manager it is the package directory.
 - `-debug=true`: logs go to an attached/allocated console.
 
 ## For AI assistants (architecture overview)
@@ -220,7 +276,7 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 **File layout** (in order, each part marked with a `// ---...---` section header in `main.go`):
 
 1. Logging (`ensureConsole`, `setupLogging`)
-2. `.env` loading (`loadDotEnv`)
+2. `.env` loading (`dotEnvPaths`, `loadDotEnv`)
 3. Parsing MPC-HC `variables.html` (regex-based, `fetchState`/`MPCState`)
 4. Win32 helpers: monitor under the cursor and window title bar height (`screenLayout`, `titleBarHeight`)
 5. Audio device switching and volume stepping via WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)

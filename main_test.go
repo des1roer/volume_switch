@@ -717,6 +717,28 @@ func TestScreenLayout(t *testing.T) {
 	}
 }
 
+func TestWindowScreenLayout(t *testing.T) {
+	title := uniqueTitle(t, "monitor")
+	newNativeWindow(t, title, 0)
+
+	// Окно стоит в (0,0) — это всегда основной монитор: его левый верхний
+	// угол и есть начало координат экрана.
+	work, monitor, err := windowScreenLayout(title)
+	if err != nil {
+		t.Fatalf("windowScreenLayout: %v", err)
+	}
+	if monitor.Left != 0 || monitor.Top != 0 || monitor.Right <= 0 || monitor.Bottom <= 0 {
+		t.Errorf("не основной монитор: %+v", monitor)
+	}
+	if work.Left < monitor.Left || work.Right > monitor.Right {
+		t.Errorf("рабочая область %+v выходит за монитор %+v", work, monitor)
+	}
+
+	if _, _, err := windowScreenLayout(uniqueTitle(t, "missing")); err == nil {
+		t.Error("нет ошибки для несуществующего окна")
+	}
+}
+
 func TestTitleBarHeight(t *testing.T) {
 	if h := titleBarHeight(); h <= 0 || h > 200 {
 		t.Errorf("titleBarHeight() = %d", h)

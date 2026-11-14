@@ -83,6 +83,7 @@ func TestMPCState(t *testing.T) {
 		StateString: "Воспроизведение",
 		File:        "movie.mkv",
 		FilePath:    `E:\movies\movie.mkv`,
+		Volume:      60,
 	}
 	if *st != want {
 		t.Errorf("got %+v\nwant %+v", *st, want)
@@ -1898,6 +1899,7 @@ func TestRemoteAPIStatus(t *testing.T) {
 		PositionMs:  61000,
 		DurationMs:  3600000,
 		RemainingMs: 3539000,
+		Volume:      60,
 	}
 	if st.Version != version || st.MPC != wantMPC {
 		t.Errorf("version=%q mpc=%+v\nwant mpc=%+v", st.Version, st.MPC, wantMPC)
@@ -1931,6 +1933,8 @@ func TestRemoteAPIMPCCommands(t *testing.T) {
 		{"/playpause", "889"},
 		{"/next", "920"},
 		{"/prev", "919"},
+		{"/mpc/volume/up", "907"},
+		{"/mpc/volume/down", "908"},
 	} {
 		st := decodeStatus(t, callAPI(h, http.MethodPost, tt.path))
 		if got := <-commands; got != tt.command {

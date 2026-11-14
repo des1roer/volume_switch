@@ -371,6 +371,8 @@ type MPCState struct {
 	StateString string `json:"stateString"`
 	Position    int64  `json:"position"`
 	Duration    int64  `json:"duration"`
+	Volume      int    `json:"volume"` // собственная громкость MPC-HC, 0..100
+	Muted       bool   `json:"muted"`
 }
 
 // mpcEndpoint строит URL страницы web-интерфейса MPC-HC из адреса MPC_URL:
@@ -456,9 +458,11 @@ func (c *mpcClient) State() (_ *MPCState, err error) {
 // command.html (их список с названиями — на его странице index.html).
 // Соседние с Play/Pause команды: 887 Play, 888 Pause, 890 Stop.
 const (
-	mpcPlayPauseCommand = 889 // ID_PLAY_PLAYPAUSE
-	mpcNextFileCommand  = 920 // «Следующий файл» — следующий в плейлисте/папке
-	mpcPrevFileCommand  = 919 // «Предыдущий файл»
+	mpcPlayPauseCommand  = 889 // ID_PLAY_PLAYPAUSE
+	mpcNextFileCommand   = 920 // «Следующий файл» — следующий в плейлисте/папке
+	mpcPrevFileCommand   = 919 // «Предыдущий файл»
+	mpcVolumeUpCommand   = 907 // «Повысить громкость» — шаг задаётся в настройках MPC-HC
+	mpcVolumeDownCommand = 908 // «Понизить громкость»
 )
 
 // Значения поля state в status.json.
@@ -2582,6 +2586,7 @@ const apiShutdownTimeout = 2 * time.Second
 //	POST /playpause                  как клик по оверлею: Play/Pause, а если MPC-HC не запущен — запуск
 //	POST /next, /prev                следующий/предыдущий файл в MPC-HC
 //	POST /volume/up, /volume/down    системная громкость, как F3/F2; ?step=N — шаг в процентах
+//	POST /mpc/volume/up, /down       собственная громкость MPC-HC, шагом из его настроек
 //
 // Команды отвечают тем же apiStatus, что и /status (сразу после команды
 // MPC-HC может ещё не успеть сменить состояние), ошибки — {"error": "..."}.
@@ -2606,6 +2611,8 @@ type apiMPC struct {
 	PositionMs  int64  `json:"position_ms"`
 	DurationMs  int64  `json:"duration_ms"`
 	RemainingMs int64  `json:"remaining_ms"`
+	Volume      int    `json:"volume"` // громкость самого MPC-HC, 0..100
+	Muted       bool   `json:"muted"`
 }
 
 type apiVolume struct {
@@ -2643,6 +2650,8 @@ func (api *remoteAPI) status() apiStatus {
 			PositionMs:  st.Position,
 			DurationMs:  st.Duration,
 			RemainingMs: max(st.Duration-st.Position, 0),
+			Volume:      st.Volume,
+			Muted:       st.Muted,
 		}
 	}
 
@@ -2674,6 +2683,8 @@ func (api *remoteAPI) handler() http.Handler {
 	mux.HandleFunc("POST /prev", api.mpcCommand(mpcPrevFileCommand))
 	mux.HandleFunc("POST /volume/up", api.stepVolume(1))
 	mux.HandleFunc("POST /volume/down", api.stepVolume(-1))
+	mux.HandleFunc("POST /mpc/volume/up", api.mpcCommand(mpcVolumeUpCommand))
+	mux.HandleFunc("POST /mpc/volume/down", api.mpcCommand(mpcVolumeDownCommand))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Опрос /status идёт раз в секунду и в лог не пишется.

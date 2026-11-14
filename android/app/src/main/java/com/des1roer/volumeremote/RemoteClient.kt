@@ -15,6 +15,8 @@ data class Status(
     val positionMs: Long,
     val durationMs: Long,
     val remainingMs: Long,
+    val mpcVolume: Int,
+    val mpcMuted: Boolean,
     val volumePercent: Int?,
     val muted: Boolean,
     val volumeError: String?,
@@ -36,6 +38,8 @@ class RemoteClient(server: String) {
     suspend fun prev(): Status = request("POST", "/prev")
 
     suspend fun volume(up: Boolean): Status = request("POST", if (up) "/volume/up" else "/volume/down")
+
+    suspend fun mpcVolume(up: Boolean): Status = request("POST", if (up) "/mpc/volume/up" else "/mpc/volume/down")
 
     private suspend fun request(method: String, path: String): Status = withContext(Dispatchers.IO) {
         val conn = URL(baseUrl + path).openConnection() as HttpURLConnection
@@ -79,6 +83,8 @@ fun parseStatus(body: String): Status {
         positionMs = mpc.optLong("position_ms"),
         durationMs = mpc.optLong("duration_ms"),
         remainingMs = mpc.optLong("remaining_ms"),
+        mpcVolume = mpc.optInt("volume"),
+        mpcMuted = mpc.optBoolean("muted"),
         volumePercent = volume?.optInt("percent"),
         muted = volume?.optBoolean("muted") ?: false,
         volumeError = root.optString("volume_error").ifEmpty { null },

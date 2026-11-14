@@ -27,13 +27,16 @@ class RemoteClientTest {
         val status = parseStatus(
             """
             {"version":"dev","mpc":{"online":true,"file":"movie.mkv","state":"playing","state_text":"Воспроизведение",
-            "position_ms":61000,"duration_ms":3600000,"remaining_ms":3539000},"volume":{"percent":42,"muted":true}}
+            "position_ms":61000,"duration_ms":3600000,"remaining_ms":3539000,"volume":70,"muted":false},
+            "volume":{"percent":42,"muted":true}}
             """.trimIndent(),
         )
         assertTrue(status.mpcOnline)
         assertTrue(status.playing)
         assertEquals("movie.mkv", status.file)
         assertEquals(3_539_000, status.remainingMs)
+        assertEquals(70, status.mpcVolume)
+        assertFalse(status.mpcMuted)
         assertEquals(42, status.volumePercent)
         assertTrue(status.muted)
         assertNull(status.mpcError)

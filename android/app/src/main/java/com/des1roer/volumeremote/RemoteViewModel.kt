@@ -43,6 +43,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     fun volume(up: Boolean) = launch { client.volume(up) }
 
+    fun mpcVolume(up: Boolean) = launch { client.mpcVolume(up) }
+
     fun setServer(server: String) {
         val value = server.trim()
         if (value.isEmpty() || value == state.server) return

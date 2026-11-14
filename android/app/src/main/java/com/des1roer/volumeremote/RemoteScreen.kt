@@ -97,7 +97,24 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
                 }
             }
 
-            Volume(status, onStep = viewModel::volume)
+            VolumeControl(
+                title = "Громкость ПК",
+                percent = status?.volumePercent,
+                muted = status?.muted == true,
+                enabled = status?.volumePercent != null,
+                hint = "Кнопки громкости телефона тоже меняют громкость ПК",
+                onStep = viewModel::volume,
+            )
+
+            val mpcOnline = status?.mpcOnline == true
+            VolumeControl(
+                title = "Громкость MPC",
+                percent = if (mpcOnline) status?.mpcVolume else null,
+                muted = status?.mpcMuted == true,
+                enabled = mpcOnline,
+                hint = null,
+                onStep = viewModel::mpcVolume,
+            )
         }
     }
 }
@@ -167,22 +184,32 @@ private fun Playback(status: Status?) {
 }
 
 @Composable
-private fun Volume(status: Status?, onStep: (Boolean) -> Unit) {
+private fun VolumeControl(
+    title: String,
+    percent: Int?,
+    muted: Boolean,
+    enabled: Boolean,
+    hint: String?,
+    onStep: (Boolean) -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(
-            text = "Громкость ПК",
+            text = title,
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
-            FilledTonalButton(onClick = { onStep(false) }, modifier = Modifier.size(width = 96.dp, height = 72.dp)) {
+            FilledTonalButton(
+                onClick = { onStep(false) },
+                enabled = enabled,
+                modifier = Modifier.size(width = 96.dp, height = 64.dp),
+            ) {
                 Text("−", fontSize = 32.sp)
             }
-            val percent = status?.volumePercent
             Text(
                 text = when {
                     percent == null -> "—"
-                    status?.muted == true -> "MUTE"
+                    muted -> "MUTE"
                     else -> "$percent%"
                 },
                 fontSize = 36.sp,
@@ -190,14 +217,20 @@ private fun Volume(status: Status?, onStep: (Boolean) -> Unit) {
                 textAlign = TextAlign.Center,
                 modifier = Modifier.weight(1f),
             )
-            FilledTonalButton(onClick = { onStep(true) }, modifier = Modifier.size(width = 96.dp, height = 72.dp)) {
+            FilledTonalButton(
+                onClick = { onStep(true) },
+                enabled = enabled,
+                modifier = Modifier.size(width = 96.dp, height = 64.dp),
+            ) {
                 Text("+", fontSize = 32.sp)
             }
         }
-        Text(
-            text = "Кнопки громкости телефона тоже меняют громкость ПК",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        hint?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }

@@ -125,14 +125,15 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 | Запрос | Что делает |
 |--------|------------|
-| `GET /status` | Состояние: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`) и системная громкость `volume` (`percent`, `muted`) |
+| `GET /status` | Состояние: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, собственная громкость MPC-HC `volume`/`muted`) и системная громкость `volume` (`percent`, `muted`) |
 | `POST /playpause` | Пауза/старт, как клик по оверлею; если MPC-HC не запущен — запускает его |
 | `POST /next`, `POST /prev` | Следующий/предыдущий файл в MPC-HC (следующая серия) |
 | `POST /volume/up`, `POST /volume/down` | Системная громкость, как F3/F2 (на ПК показывается оверлей); `?step=N` — шаг в процентах |
+| `POST /mpc/volume/up`, `POST /mpc/volume/down` | Громкость самого MPC-HC, шагом из его настроек (по умолчанию 5%) |
 
 Команды отвечают тем же JSON, что и `/status`; ошибки — `{"error": "..."}` с кодом 4xx/5xx.
 
-Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК). Адрес ПК вводится в самом приложении. Сборка и установка:
+Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК). Адрес ПК вводится в самом приложении. Сборка и установка:
 
 ```sh
 cd android
@@ -319,14 +320,15 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 | Request | What it does |
 |---------|--------------|
-| `GET /status` | State: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`) and the master volume `volume` (`percent`, `muted`) |
+| `GET /status` | State: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, MPC-HC's own volume `volume`/`muted`) and the master volume `volume` (`percent`, `muted`) |
 | `POST /playpause` | Pause/play, like a click on the overlay; launches MPC-HC if it isn't running |
 | `POST /next`, `POST /prev` | Next/previous file in MPC-HC (next episode) |
 | `POST /volume/up`, `POST /volume/down` | Master volume, like F3/F2 (the overlay is shown on the PC); `?step=N` sets the step in percent |
+| `POST /mpc/volume/up`, `POST /mpc/volume/down` | MPC-HC's own volume, by the step from its settings (5% by default) |
 
 Commands respond with the same JSON as `/status`; errors are `{"error": "..."}` with a 4xx/5xx code.
 
-The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode and the PC volume (while the app is open, the phone's volume keys change the PC volume too). The PC address is entered in the app. Build and install:
+The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (while the app is open, the phone's volume keys change the PC volume too). The PC address is entered in the app. Build and install:
 
 ```sh
 cd android

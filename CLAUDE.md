@@ -30,6 +30,8 @@ adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
 - Отдельный Gradle-проект (AGP 8.7.3, Gradle 8.9, Kotlin 2.0.21, Compose). Go-часть его не видит: `go vet ./...` и CI его не собирают.
 - Клиент повторяет формат `apiStatus` вручную (`parseStatus` в `RemoteClient.kt`): при изменении JSON API обновить и его, и `RemoteClientTest`.
 - HTTP без TLS в локальную сеть — поэтому в манифесте `usesCleartextTraffic="true"`.
+- Подробности клиента — `android/README.md`. Состояние и опрос — в синглтоне `Remote` (общий для экрана и `RemoteService`, опрос идёт, пока есть `acquire` без `release`): второй независимый опрос не заводить. Медиауведомление (шторка и экран блокировки) строится системой из `MediaSession` (`minSdk 33`), поэтому кнопки — это `PlaybackState` actions и custom actions, а не `Notification.addAction`.
+- Проверить уведомление на заблокированном телефоне: `adb shell input keyevent KEYCODE_WAKEUP` (включает экран, не разблокируя) и `adb exec-out screencap -p`; при выключенном экране снимок чёрный.
 
 ## Git, PR, релизы
 

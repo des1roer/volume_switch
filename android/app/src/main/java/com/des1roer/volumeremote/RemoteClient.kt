@@ -37,7 +37,8 @@ class RemoteClient(server: String) {
 
     suspend fun prev(): Status = request("POST", "/prev")
 
-    suspend fun volume(up: Boolean): Status = request("POST", if (up) "/volume/up" else "/volume/down")
+    suspend fun volume(up: Boolean, step: Int? = null): Status =
+        request("POST", (if (up) "/volume/up" else "/volume/down") + (step?.let { "?step=$it" } ?: ""))
 
     suspend fun mpcVolume(up: Boolean): Status = request("POST", if (up) "/mpc/volume/up" else "/mpc/volume/down")
 

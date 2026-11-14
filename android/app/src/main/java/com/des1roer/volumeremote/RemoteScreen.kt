@@ -39,8 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
-fun RemoteScreen(viewModel: RemoteViewModel) {
-    val ui = viewModel.state
+fun RemoteScreen(ui: UiState) {
     val status = ui.status
     Scaffold { padding ->
         Column(
@@ -51,7 +50,7 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
                 .padding(horizontal = 20.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            ServerField(ui.server, viewModel::setServer)
+            ServerField(ui.server, Remote::setServer)
 
             ui.error?.let {
                 Text(
@@ -64,7 +63,7 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
             Playback(status)
 
             Button(
-                onClick = viewModel::playPause,
+                onClick = Remote::playPause,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(96.dp),
@@ -78,7 +77,7 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 val online = status?.mpcOnline == true
                 OutlinedButton(
-                    onClick = viewModel::prev,
+                    onClick = Remote::prev,
                     enabled = online,
                     modifier = Modifier
                         .weight(1f)
@@ -87,7 +86,7 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
                     Text("⏮ Предыдущая")
                 }
                 Button(
-                    onClick = viewModel::next,
+                    onClick = Remote::next,
                     enabled = online,
                     modifier = Modifier
                         .weight(1f)
@@ -103,7 +102,7 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
                 muted = status?.muted == true,
                 enabled = status?.volumePercent != null,
                 hint = "Кнопки громкости телефона тоже меняют громкость ПК",
-                onStep = viewModel::volume,
+                onStep = { Remote.volume(up = it) },
             )
 
             val mpcOnline = status?.mpcOnline == true
@@ -113,7 +112,7 @@ fun RemoteScreen(viewModel: RemoteViewModel) {
                 muted = status?.mpcMuted == true,
                 enabled = mpcOnline,
                 hint = null,
-                onStep = viewModel::mpcVolume,
+                onStep = Remote::mpcVolume,
             )
         }
     }

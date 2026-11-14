@@ -2540,7 +2540,19 @@ func (h *hotkeyHook) proc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintpt
 // HTTP API пульта (приложение на телефоне в локальной сети)
 // ---------------------------------------------------------------------------
 
-const apiShutdownTimeout = 2 * time.Second
+const (
+	apiShutdownTimeout = 2 * time.Second
+
+	// eventsPollInterval — как часто общий опросчик (statusHub) читает
+	// состояние, пока есть подписчики /events.
+	eventsPollInterval = 500 * time.Millisecond
+	// eventsHeartbeat — пауза между комментариями-пингами в потоке /events:
+	// по ним клиент отличает тишину от оборванного соединения.
+	eventsHeartbeat = 25 * time.Second
+	// seekTolerance — насколько позиция может разойтись с ожидаемой (по ходу
+	// воспроизведения), прежде чем это считается перемоткой.
+	seekTolerance = 2 * time.Second
+)
 
 // remoteAPI — HTTP API пульта: состояние MPC-HC и системной громкости,
 // play/pause, следующий/предыдущий файл и шаг громкости. Авторизации и
@@ -2548,6 +2560,7 @@ const apiShutdownTimeout = 2 * time.Second
 // локальной сети задумано, поэтому API выключен, пока не задан API_LISTEN.
 //
 //	GET  /status                     состояние (apiStatus)
+//	GET  /events                     поток SSE: apiStatus сразу и затем при каждом значимом изменении (statusChanged)
 //	POST /playpause                  как клик по оверлею: Play/Pause, а если MPC-HC не запущен — запуск
 //	POST /next, /prev                следующий/предыдущий файл в MPC-HC
 //	POST /volume/up, /volume/down    системная громкость, как F3/F2; ?step=N — шаг в процентах
@@ -2558,6 +2571,11 @@ const apiShutdownTimeout = 2 * time.Second
 type remoteAPI struct {
 	mpc   *mpcClient
 	audio deviceSwitcher // nil, если аудио не инициализировалось
+
+	// Подменяются в тестах: источник тиков общего опросчика /events (nil —
+	// тикер на eventsPollInterval) и интервал пингов (0 — eventsHeartbeat).
+	ticks     func() (<-chan time.Time, func())
+	heartbeat time.Duration
 }
 
 type apiStatus struct {
@@ -2633,9 +2651,21 @@ func (api *remoteAPI) status() apiStatus {
 var errNoAudio = errors.New("аудио не инициализировано")
 
 func (api *remoteAPI) handler() http.Handler {
+	ticks := api.ticks
+	if ticks == nil {
+		ticks = func() (<-chan time.Time, func()) {
+			t := time.NewTicker(eventsPollInterval)
+			return t.C, t.Stop
+		}
+	}
+	hub := newStatusHub(api.status, ticks)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, api.status())
+	})
+	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
+		api.events(w, r, hub)
 	})
 	mux.HandleFunc("POST /playpause", func(w http.ResponseWriter, _ *http.Request) {
 		if _, err := api.mpc.TogglePlayback(); err != nil {
@@ -2652,7 +2682,8 @@ func (api *remoteAPI) handler() http.Handler {
 	mux.HandleFunc("POST /mpc/volume/down", api.mpcCommand(mpcVolumeDownCommand))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Опрос /status идёт раз в секунду и в лог не пишется.
+		// GET (/status и подключения /events) в лог не пишутся: /events
+		// пишет о подписчиках сам.
 		if r.Method != http.MethodGet {
 			log.Printf("api: %s %s от %s", r.Method, r.URL.RequestURI(), r.RemoteAddr)
 		}
@@ -2722,12 +2753,24 @@ func writeError(w http.ResponseWriter, status int, err error) {
 // горутине. Ошибка занятого порта возвращается сразу; остановка — через
 // Shutdown у возвращённого сервера, в его Addr — фактический адрес (с
 // портом, если в addr был :0).
+//
+// Shutdown сам не прерывает активные запросы, а поток /events не кончается
+// никогда — Shutdown ждал бы его до таймаута. Поэтому контекст всех запросов
+// отменяется в начале Shutdown (RegisterOnShutdown), и /events выходит по
+// r.Context(). WriteTimeout не ставится: он оборвал бы поток.
 func startRemoteAPI(addr string, h http.Handler) (*http.Server, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	srv := &http.Server{Addr: ln.Addr().String(), Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := &http.Server{
+		Addr:              ln.Addr().String(),
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+	srv.RegisterOnShutdown(cancel)
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("api: сервер остановился: %v", err)
@@ -2735,4 +2778,168 @@ func startRemoteAPI(addr string, h http.Handler) (*http.Server, error) {
 	}()
 	log.Printf("api: слушает http://%s", ln.Addr())
 	return srv, nil
+}
+
+// statusChanged сообщает, стоит ли рассылать подписчикам /events состояние
+// next, если прошлое разосланное — prev, а с тех пор прошло elapsed. Ход
+// воспроизведения изменением не считается: клиент досчитывает позицию сам, —
+// только перемотка, то есть расхождение позиции с ожидаемой больше
+// seekTolerance.
+func statusChanged(prev, next apiStatus, elapsed time.Duration) bool {
+	p, n := prev.MPC, next.MPC
+	if p.Online != n.Online || p.Error != n.Error || p.File != n.File || p.State != n.State ||
+		p.DurationMs != n.DurationMs || p.Volume != n.Volume || p.Muted != n.Muted {
+		return true
+	}
+	if prev.VolumeError != next.VolumeError || (prev.Volume == nil) != (next.Volume == nil) {
+		return true
+	}
+	if prev.Volume != nil && *prev.Volume != *next.Volume {
+		return true
+	}
+	expected := p.PositionMs
+	if p.State == "playing" {
+		expected += elapsed.Milliseconds()
+	}
+	drift := n.PositionMs - expected
+	return max(drift, -drift) > seekTolerance.Milliseconds()
+}
+
+// statusHub — общий опросчик состояния для всех подписчиков /events: пока
+// подписан хоть один, читает состояние по тикам и рассылает его всем, если
+// оно значимо изменилось (statusChanged). Без подписчиков ничего не
+// опрашивает: цикл завершается на первом же тике после ухода последнего.
+type statusHub struct {
+	read  func() apiStatus
+	ticks func() (<-chan time.Time, func())
+
+	mu      sync.Mutex
+	subs    map[chan apiStatus]struct{}
+	running bool
+	last    apiStatus // последнее разосланное состояние — изменения считаются от него
+	lastAt  time.Time
+}
+
+func newStatusHub(read func() apiStatus, ticks func() (<-chan time.Time, func())) *statusHub {
+	return &statusHub{read: read, ticks: ticks, subs: make(map[chan apiStatus]struct{})}
+}
+
+// subscribe добавляет подписчика и возвращает канал его событий и функцию
+// отписки. current — только что прочитанное состояние, которое подписчик
+// получает сам; если опросчик не работал, отсчёт изменений начинается с него.
+// В канале держится только последнее непрочитанное состояние.
+func (h *statusHub) subscribe(current apiStatus) (<-chan apiStatus, func()) {
+	ch := make(chan apiStatus, 1)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subs[ch] = struct{}{}
+	if !h.running {
+		h.running = true
+		h.last, h.lastAt = current, time.Now()
+		ticks, stop := h.ticks()
+		go h.run(ticks, stop)
+	}
+	return ch, func() {
+		h.mu.Lock()
+		delete(h.subs, ch)
+		h.mu.Unlock()
+	}
+}
+
+func (h *statusHub) run(ticks <-chan time.Time, stop func()) {
+	defer stop()
+	for range ticks {
+		if !h.active() {
+			return
+		}
+		h.publish(h.read(), time.Now())
+	}
+	h.mu.Lock()
+	h.running = false
+	h.mu.Unlock()
+}
+
+// active проверяет, остались ли подписчики; если нет — отмечает опросчик
+// остановленным под тем же мьютексом, чтобы следующий subscribe запустил
+// новый.
+func (h *statusHub) active() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.subs) == 0 {
+		h.running = false
+		return false
+	}
+	return true
+}
+
+func (h *statusHub) publish(st apiStatus, now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !statusChanged(h.last, st, now.Sub(h.lastAt)) {
+		return
+	}
+	h.last, h.lastAt = st, now
+	for ch := range h.subs {
+		// Канал на одно значение: непрочитанное старое состояние заменяется
+		// новым — медленный подписчик получает последнее, а не очередь.
+		select {
+		case <-ch:
+		default:
+		}
+		ch <- st
+	}
+}
+
+// events — поток Server-Sent Events (GET /events): сразу текущее состояние,
+// затем каждое значимое изменение (statusHub) и раз в heartbeat — строка
+// комментария ": ping". Заканчивается, когда клиент отключился или сервер
+// останавливается (Shutdown отменяет контекст запроса, см. startRemoteAPI).
+func (api *remoteAPI) events(w http.ResponseWriter, r *http.Request, hub *statusHub) {
+	rc := http.NewResponseController(w)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	current := api.status()
+	updates, unsubscribe := hub.subscribe(current)
+	defer unsubscribe()
+	log.Printf("api: /events: подключился %s", r.RemoteAddr)
+	defer log.Printf("api: /events: отключился %s", r.RemoteAddr)
+
+	heartbeat := api.heartbeat
+	if heartbeat <= 0 {
+		heartbeat = eventsHeartbeat
+	}
+	ping := time.NewTicker(heartbeat)
+	defer ping.Stop()
+
+	send := func(st apiStatus) error {
+		data, err := json.Marshal(st)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return err
+		}
+		return rc.Flush()
+	}
+	if err := send(current); err != nil {
+		return
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case st := <-updates:
+			if err := send(st); err != nil {
+				return
+			}
+		case <-ping.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		}
+	}
 }

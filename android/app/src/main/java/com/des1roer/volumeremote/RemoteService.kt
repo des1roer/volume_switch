@@ -20,6 +20,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
@@ -28,17 +29,23 @@ private const val NOTIFICATION_ID = 1
 private const val ACTION_VOLUME_DOWN = "volume_down"
 private const val ACTION_VOLUME_UP = "volume_up"
 private const val IDLE_STOP_MS = 30 * 60 * 1000L
+private const val MINUTE_MS = 60_000L
 
 class RemoteService : Service() {
     private val scope = MainScope()
     private lateinit var session: MediaSession
     private var idleSince = SystemClock.elapsedRealtime()
+    private var screenOn = true
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                Intent.ACTION_SCREEN_ON -> Remote.setScreenOn(true)
-                Intent.ACTION_SCREEN_OFF -> Remote.setScreenOn(false)
+                Intent.ACTION_SCREEN_ON -> {
+                    screenOn = true
+                    Remote.reconnect()
+                    render(Remote.state.value)
+                }
+                Intent.ACTION_SCREEN_OFF -> screenOn = false
             }
         }
     }
@@ -89,7 +96,7 @@ class RemoteService : Service() {
         }
         render(Remote.state.value)
         startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-        Remote.setScreenOn(getSystemService(PowerManager::class.java).isInteractive)
+        screenOn = getSystemService(PowerManager::class.java).isInteractive
         registerReceiver(
             screenReceiver,
             IntentFilter().apply {
@@ -100,6 +107,13 @@ class RemoteService : Service() {
         )
         Remote.acquire()
         scope.launch { Remote.state.collect { render(it) } }
+        scope.launch {
+            while (true) {
+                delay(MINUTE_MS)
+                val ui = Remote.state.value
+                if (screenOn && ui.status?.playing == true) render(ui) else checkIdle(ui.status?.playing == true)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
@@ -108,7 +122,6 @@ class RemoteService : Service() {
 
     override fun onDestroy() {
         unregisterReceiver(screenReceiver)
-        Remote.setScreenOn(true)
         scope.cancel()
         Remote.release()
         session.release()
@@ -119,6 +132,7 @@ class RemoteService : Service() {
         val status = ui.status
         val active = status != null && status.mpcOnline && status.file.isNotEmpty()
         val playing = status?.playing == true
+        val now = SystemClock.elapsedRealtime()
 
         val title = when {
             status == null -> "Подключение…"
@@ -128,7 +142,7 @@ class RemoteService : Service() {
         }
         val subtitle = listOfNotNull(
             if (ui.error != null) "Нет связи с ПК" else null,
-            if (active) "Осталось ${formatTime(status!!.remainingMs)}" else null,
+            if (active) "Осталось ${formatRemainingMinutes(status!!.remainingAt(now))}" else null,
             status?.volumePercent?.let { "ПК $it%" },
         ).joinToString(" · ")
 
@@ -149,9 +163,9 @@ class RemoteService : Service() {
                 .setActions(actions)
                 .setState(
                     if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
-                    if (active) status!!.positionMs else 0,
+                    if (active) status!!.positionAt(now) else 0,
                     if (playing) 1f else 0f,
-                    SystemClock.elapsedRealtime(),
+                    now,
                 )
                 .addCustomAction(ACTION_VOLUME_DOWN, "Тише (ПК)", R.drawable.ic_volume_down)
                 .addCustomAction(ACTION_VOLUME_UP, "Громче (ПК)", R.drawable.ic_volume_up)
@@ -159,7 +173,10 @@ class RemoteService : Service() {
         )
 
         status?.volumePercent?.let { volumeProvider.currentVolume = it }
+        checkIdle(playing)
+    }
 
+    private fun checkIdle(playing: Boolean) {
         val now = SystemClock.elapsedRealtime()
         if (playing) {
             idleSince = now

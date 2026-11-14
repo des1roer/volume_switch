@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,6 +19,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -2065,5 +2068,306 @@ func TestTrayAppStartAPI(t *testing.T) {
 	}
 	if !sw.closed {
 		t.Error("switcher не закрыт")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Поток /events (SSE)
+// ---------------------------------------------------------------------------
+
+func TestStatusChanged(t *testing.T) {
+	base := apiStatus{
+		MPC:    apiMPC{Online: true, File: "a.mkv", State: "playing", PositionMs: 60_000, DurationMs: 3_600_000, Volume: 70},
+		Volume: &apiVolume{Percent: 40},
+	}
+	with := func(f func(*apiStatus)) apiStatus {
+		s := base
+		v := *base.Volume
+		s.Volume = &v
+		f(&s)
+		return s
+	}
+	tests := []struct {
+		name    string
+		next    apiStatus
+		elapsed time.Duration
+		want    bool
+	}{
+		{"ничего не изменилось", with(func(*apiStatus) {}), 0, false},
+		{"обычный ход воспроизведения", with(func(s *apiStatus) { s.MPC.PositionMs += 10_000 }), 10 * time.Second, false},
+		{"небольшое расхождение хода", with(func(s *apiStatus) { s.MPC.PositionMs += 11_500 }), 10 * time.Second, false},
+		{"перемотка вперёд", with(func(s *apiStatus) { s.MPC.PositionMs += 30_000 }), time.Second, true},
+		{"перемотка назад", with(func(s *apiStatus) { s.MPC.PositionMs -= 5_000 }), time.Second, true},
+		{"пауза", with(func(s *apiStatus) { s.MPC.State = "paused" }), time.Second, true},
+		{"другой файл", with(func(s *apiStatus) { s.MPC.File = "b.mkv" }), 0, true},
+		{"другая длительность", with(func(s *apiStatus) { s.MPC.DurationMs = 1 }), 0, true},
+		{"MPC-HC закрыт", with(func(s *apiStatus) { s.MPC = apiMPC{State: "none", Error: "connection refused"} }), 0, true},
+		{"громкость MPC-HC", with(func(s *apiStatus) { s.MPC.Volume = 75 }), 0, true},
+		{"mute MPC-HC", with(func(s *apiStatus) { s.MPC.Muted = true }), 0, true},
+		{"системная громкость", with(func(s *apiStatus) { s.Volume.Percent = 42 }), 0, true},
+		{"системный mute", with(func(s *apiStatus) { s.Volume.Muted = true }), 0, true},
+		{"громкость не прочиталась", with(func(s *apiStatus) { s.Volume, s.VolumeError = nil, "COM" }), 0, true},
+	}
+	for _, tt := range tests {
+		if got := statusChanged(base, tt.next, tt.elapsed); got != tt.want {
+			t.Errorf("%s: statusChanged = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+
+	// На паузе позиция стоит: её сдвиг на стоящем плеере — перемотка.
+	paused := with(func(s *apiStatus) { s.MPC.State = "paused" })
+	moved := paused
+	moved.MPC.PositionMs += 10_000
+	if statusChanged(paused, paused, time.Minute) {
+		t.Error("пауза без изменений: событие не нужно")
+	}
+	if !statusChanged(paused, moved, 10*time.Second) {
+		t.Error("перемотка на паузе: нужно событие")
+	}
+}
+
+// manualTicks — источник тиков общего опросчика, которым управляет тест.
+// stopped закрывается, когда опросчик остановил свой источник тиков.
+type manualTicks struct {
+	ch      chan time.Time
+	started atomic.Int32
+	stopped chan struct{}
+}
+
+func newManualTicks() *manualTicks {
+	return &manualTicks{ch: make(chan time.Time), stopped: make(chan struct{}, 10)}
+}
+
+func (m *manualTicks) source() (<-chan time.Time, func()) {
+	m.started.Add(1)
+	return m.ch, func() { m.stopped <- struct{}{} }
+}
+
+// process отдаёт опросчику два тика: второй принимается только после того,
+// как первый обработан полностью.
+func (m *manualTicks) process(t *testing.T) {
+	t.Helper()
+	for range 2 {
+		select {
+		case m.ch <- time.Now():
+		case <-time.After(5 * time.Second):
+			t.Fatal("опросчик не принимает тики")
+		}
+	}
+}
+
+// tickUntilStopped шлёт тики, пока опросчик не остановится: он замечает
+// отсутствие подписчиков только на очередном тике, а какой из уже принятых
+// тиков это будет, зависит от планировщика.
+func (m *manualTicks) tickUntilStopped(t *testing.T) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case m.ch <- time.Now():
+		case <-m.stopped:
+			return
+		case <-deadline:
+			t.Fatal("опросчик не остановился")
+		}
+	}
+}
+
+func TestStatusHub(t *testing.T) {
+	var mu sync.Mutex
+	current := apiStatus{MPC: apiMPC{Online: true, File: "a.mkv", State: "paused", PositionMs: 1000}}
+	read := func() apiStatus {
+		mu.Lock()
+		defer mu.Unlock()
+		return current
+	}
+	set := func(f func(*apiStatus)) {
+		mu.Lock()
+		defer mu.Unlock()
+		f(&current)
+	}
+	ticks := newManualTicks()
+	hub := newStatusHub(read, ticks.source)
+
+	events, unsubscribe := hub.subscribe(read())
+	ticks.process(t)
+	if len(events) != 0 {
+		t.Fatalf("без изменений пришло событие: %+v", <-events)
+	}
+
+	set(func(s *apiStatus) { s.MPC.State = "playing" })
+	ticks.process(t)
+	select {
+	case st := <-events:
+		if st.MPC.State != "playing" {
+			t.Errorf("событие %+v, want playing", st.MPC)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("смена состояния не разослана")
+	}
+
+	// Второй подписчик не запускает второй опросчик.
+	_, unsubscribe2 := hub.subscribe(read())
+	if n := ticks.started.Load(); n != 1 {
+		t.Errorf("запущено опросчиков: %d, want 1", n)
+	}
+
+	unsubscribe()
+	unsubscribe2()
+	ticks.tickUntilStopped(t)
+
+	// После остановки новый подписчик запускает опросчик заново.
+	_, unsubscribe3 := hub.subscribe(read())
+	defer unsubscribe3()
+	if n := ticks.started.Load(); n != 2 {
+		t.Errorf("после остановки запущено опросчиков: %d, want 2", n)
+	}
+}
+
+func TestStatusHubTicksClosed(t *testing.T) {
+	hub := newStatusHub(func() apiStatus { return apiStatus{} }, func() (<-chan time.Time, func()) {
+		return ticksN(1), func() {}
+	})
+	_, unsubscribe := hub.subscribe(apiStatus{})
+	defer unsubscribe()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		hub.mu.Lock()
+		running := hub.running
+		hub.mu.Unlock()
+		if !running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("опросчик не остановился после закрытия канала тиков")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// switchableMPC — web-интерфейс MPC-HC, состояние которого тест меняет на
+// ходу (status.json отдаётся из atomic.Value).
+func switchableMPC(t *testing.T, status string) (*httptest.Server, *atomic.Value) {
+	t.Helper()
+	var body atomic.Value
+	body.Store(status)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body.Load().(string)))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &body
+}
+
+// readSSE читает из потока одно сообщение до пустой строки: либо событие
+// (data) с apiStatus, либо комментарий (ping=true).
+func readSSE(t *testing.T, r *bufio.Reader) (st apiStatus, ping bool) {
+	t.Helper()
+	var data strings.Builder
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("чтение потока: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		switch {
+		case line == "":
+			if data.Len() == 0 {
+				return apiStatus{}, true
+			}
+			if err := json.Unmarshal([]byte(data.String()), &st); err != nil {
+				t.Fatalf("разбор события %q: %v", data.String(), err)
+			}
+			return st, false
+		case strings.HasPrefix(line, ":"):
+		case strings.HasPrefix(line, "data: "):
+			data.WriteString(strings.TrimPrefix(line, "data: "))
+		default:
+			t.Fatalf("неожиданная строка потока: %q", line)
+		}
+	}
+}
+
+// openEvents подключается к /events и возвращает читатель потока и функцию
+// отключения.
+func openEvents(t *testing.T, url string) (*bufio.Reader, func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	if ct := resp.Header.Get("Content-Type"); resp.StatusCode != http.StatusOK || ct != "text/event-stream" {
+		t.Fatalf("GET /events: %s, Content-Type %q", resp.Status, ct)
+	}
+	return bufio.NewReader(resp.Body), func() {
+		cancel()
+		_ = resp.Body.Close()
+	}
+}
+
+func TestRemoteAPIEvents(t *testing.T) {
+	mpc, body := switchableMPC(t, sampleStatusJSON)
+	ticks := newManualTicks()
+	api := &remoteAPI{mpc: newMPCClient(mpc.URL), audio: &fakeSwitcher{volume: volumeReading{Level: 0.5}}, ticks: ticks.source}
+	srv := httptest.NewServer(api.handler())
+	defer srv.Close()
+
+	stream, disconnect := openEvents(t, srv.URL)
+	st, ping := readSSE(t, stream)
+	if ping || !st.MPC.Online || st.MPC.State != "playing" || st.Volume == nil || st.Volume.Percent != 50 {
+		t.Fatalf("первое событие: ping=%v %+v", ping, st)
+	}
+
+	// Пауза в MPC-HC — новое событие.
+	body.Store(strings.Replace(sampleStatusJSON, `"state":2`, `"state":1`, 1))
+	ticks.process(t)
+	if st, ping = readSSE(t, stream); ping || st.MPC.State != "paused" {
+		t.Fatalf("после паузы: ping=%v %+v", ping, st.MPC)
+	}
+
+	// Отключение клиента останавливает опросчик.
+	disconnect()
+	ticks.tickUntilStopped(t)
+}
+
+func TestRemoteAPIEventsHeartbeat(t *testing.T) {
+	mpc, _ := switchableMPC(t, sampleStatusJSON)
+	api := &remoteAPI{mpc: newMPCClient(mpc.URL), ticks: newManualTicks().source, heartbeat: 20 * time.Millisecond}
+	srv := httptest.NewServer(api.handler())
+	defer srv.Close()
+
+	stream, disconnect := openEvents(t, srv.URL)
+	defer disconnect()
+	if _, ping := readSSE(t, stream); ping {
+		t.Fatal("первым должно прийти состояние, а не пинг")
+	}
+	if _, ping := readSSE(t, stream); !ping {
+		t.Fatal("ожидался пинг")
+	}
+}
+
+func TestRemoteAPIEventsShutdown(t *testing.T) {
+	mpc, _ := switchableMPC(t, sampleStatusJSON)
+	api := &remoteAPI{mpc: newMPCClient(mpc.URL), ticks: newManualTicks().source}
+	srv, err := startRemoteAPI("127.0.0.1:0", api.handler())
+	if err != nil {
+		t.Fatalf("startRemoteAPI: %v", err)
+	}
+	stream, disconnect := openEvents(t, "http://"+srv.Addr)
+	defer disconnect()
+	readSSE(t, stream)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown с открытым /events: %v (через %v)", err, time.Since(start))
+	}
+	if _, err := stream.ReadString('\n'); err == nil {
+		t.Error("поток /events не закрылся после Shutdown")
 	}
 }

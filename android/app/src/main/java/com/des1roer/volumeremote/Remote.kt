@@ -2,6 +2,7 @@ package com.des1roer.volumeremote
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -13,9 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 const val DEFAULT_SERVER = "192.168.3.2:7778"
-private const val FAST_POLL_MS = 1_000L
-private const val SLOW_POLL_MS = 5_000L
-private const val SCREEN_OFF_POLL_MS = 30_000L
+private val RECONNECT_DELAYS_MS = longArrayOf(1_000, 2_000, 5_000, 10_000)
 
 data class UiState(
     val server: String,
@@ -31,9 +30,7 @@ object Remote {
     val state: StateFlow<UiState> = mutableState
 
     private var users = 0
-    private var uiVisible = false
-    private var screenOn = true
-    private var pollJob: Job? = null
+    private var streamJob: Job? = null
 
     fun init(context: Context) {
         if (::prefs.isInitialized) return
@@ -43,28 +40,21 @@ object Remote {
 
     fun acquire(ui: Boolean = false) {
         users++
-        if (ui) uiVisible = true
-        if (pollJob == null || ui) restartPoll()
+        if (streamJob == null || ui) reconnect()
     }
 
-    fun setScreenOn(on: Boolean) {
-        if (on == screenOn) return
-        screenOn = on
-        if (on && pollJob != null) restartPoll()
-    }
-
-    private fun restartPoll() {
-        pollJob?.cancel()
-        pollJob = scope.launch { poll() }
-    }
-
-    fun release(ui: Boolean = false) {
+    fun release() {
         users = maxOf(users - 1, 0)
-        if (ui) uiVisible = false
         if (users == 0) {
-            pollJob?.cancel()
-            pollJob = null
+            streamJob?.cancel()
+            streamJob = null
         }
+    }
+
+    fun reconnect() {
+        if (users == 0) return
+        streamJob?.cancel()
+        streamJob = scope.launch { stream() }
     }
 
     fun playPause() = command { it.playPause() }
@@ -82,41 +72,51 @@ object Remote {
         if (value.isEmpty() || value == mutableState.value.server) return
         prefs.edit().putString("server", value).apply()
         mutableState.value = UiState(server = value)
-        command { it.status() }
+        reconnect()
     }
 
-    private suspend fun poll() {
+    private suspend fun stream() {
+        var attempt = 0
         while (true) {
-            update { client().status() }
-            delay(pollInterval(screenOn, uiVisible, mutableState.value.status?.playing == true))
+            val server = mutableState.value.server
+            try {
+                RemoteClient(server).events().collect { status ->
+                    attempt = 0
+                    apply(server, status)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                fail(server, e)
+            }
+            delay(RECONNECT_DELAYS_MS[minOf(attempt, RECONNECT_DELAYS_MS.lastIndex)])
+            attempt++
         }
     }
 
     private fun command(block: suspend (RemoteClient) -> Status) {
-        scope.launch { update { block(client()) } }
-    }
-
-    private fun client() = RemoteClient(mutableState.value.server)
-
-    private suspend fun update(block: suspend () -> Status) {
-        val server = mutableState.value.server
-        try {
-            val status = block()
-            if (server == mutableState.value.server) {
-                mutableState.value = mutableState.value.copy(status = status, error = null)
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            if (server == mutableState.value.server) {
-                mutableState.value = mutableState.value.copy(error = e.message ?: e.javaClass.simpleName)
+        scope.launch {
+            val server = mutableState.value.server
+            try {
+                apply(server, block(RemoteClient(server)))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                fail(server, e)
             }
         }
     }
-}
 
-fun pollInterval(screenOn: Boolean, uiVisible: Boolean, playing: Boolean): Long = when {
-    !screenOn -> SCREEN_OFF_POLL_MS
-    uiVisible || playing -> FAST_POLL_MS
-    else -> SLOW_POLL_MS
+    private fun apply(server: String, status: Status) {
+        if (server != mutableState.value.server) return
+        mutableState.value = mutableState.value.copy(
+            status = status.copy(receivedAt = SystemClock.elapsedRealtime()),
+            error = null,
+        )
+    }
+
+    private fun fail(server: String, e: Exception) {
+        if (server != mutableState.value.server) return
+        mutableState.value = mutableState.value.copy(error = e.message ?: e.javaClass.simpleName)
+    }
 }

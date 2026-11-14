@@ -1,11 +1,17 @@
 package com.des1roer.volumeremote
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONException
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+
+private const val EVENTS_READ_TIMEOUT_MS = 60_000
 
 data class Status(
     val mpcOnline: Boolean,
@@ -20,8 +26,14 @@ data class Status(
     val volumePercent: Int?,
     val muted: Boolean,
     val volumeError: String?,
+    val receivedAt: Long = 0,
 ) {
     val playing: Boolean get() = state == "playing"
+
+    fun positionAt(now: Long): Long =
+        if (playing) minOf(positionMs + maxOf(now - receivedAt, 0), durationMs) else positionMs
+
+    fun remainingAt(now: Long): Long = maxOf(durationMs - positionAt(now), 0)
 }
 
 class ApiException(message: String) : Exception(message)
@@ -42,6 +54,37 @@ class RemoteClient(server: String) {
 
     suspend fun mpcVolume(up: Boolean): Status = request("POST", if (up) "/mpc/volume/up" else "/mpc/volume/down")
 
+    fun events(): Flow<Status> = channelFlow {
+        val conn = URL("$baseUrl/events").openConnection() as HttpURLConnection
+        conn.connectTimeout = 2_000
+        conn.readTimeout = EVENTS_READ_TIMEOUT_MS
+        conn.setRequestProperty("Accept", "text/event-stream")
+        val closer = launch {
+            try {
+                awaitCancellation()
+            } finally {
+                conn.disconnect()
+            }
+        }
+        withContext(Dispatchers.IO) {
+            val code = conn.responseCode
+            if (code == HttpURLConnection.HTTP_NOT_FOUND) {
+                throw ApiException("на ПК старый volume_switch без /events — обновите его")
+            }
+            if (code !in 200..299) {
+                throw ApiException("HTTP $code")
+            }
+            val parser = SseParser()
+            conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    parser.line(line)?.let { send(parseStatus(it)) }
+                }
+            }
+        }
+        closer.cancel()
+    }
+
     private suspend fun request(method: String, path: String): Status = withContext(Dispatchers.IO) {
         val conn = URL(baseUrl + path).openConnection() as HttpURLConnection
         conn.requestMethod = method
@@ -54,6 +97,30 @@ class RemoteClient(server: String) {
             throw ApiException(errorMessage(body) ?: "HTTP $code")
         }
         parseStatus(body)
+    }
+}
+
+class SseParser {
+    private val data = StringBuilder()
+    private var hasData = false
+
+    fun line(line: String): String? {
+        when {
+            line.isEmpty() -> {
+                if (!hasData) return null
+                val event = data.toString()
+                data.clear()
+                hasData = false
+                return event
+            }
+            line.startsWith(":") -> Unit
+            line.startsWith("data:") -> {
+                if (hasData) data.append('\n')
+                data.append(line.removePrefix("data:").removePrefix(" "))
+                hasData = true
+            }
+        }
+        return null
     }
 }
 
@@ -94,4 +161,12 @@ fun formatTime(ms: Long): String {
     val m = total % 3600 / 60
     val s = total % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+fun formatRemainingMinutes(ms: Long): String {
+    val minutes = (maxOf(ms, 0) + 59_999) / 60_000
+    return when {
+        minutes >= 60 -> "%d ч %02d мин".format(minutes / 60, minutes % 60)
+        else -> "$minutes мин"
+    }
 }

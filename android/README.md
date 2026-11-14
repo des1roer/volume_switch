@@ -11,7 +11,7 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 - «Предыдущая»/«Следующая» — соседний файл в MPC-HC (серия); кнопки неактивны, пока плеер выключен.
 - Громкость ПК и собственная громкость MPC-HC: кнопки −/+ и текущий уровень (`MUTE` при выключенном звуке).
 - Кнопки громкости телефона в открытом приложении меняют громкость ПК, а не телефона.
-- Медиауведомление (в шторке и на экране блокировки): название файла, сколько осталось, громкость ПК, кнопки пауза/старт, предыдущая/следующая и тише/громче ПК. Им управляет foreground-сервис `RemoteService` с `MediaSession`; громкость сессии объявлена удалённой (`setPlaybackToRemote`) и привязана к громкости ПК.
+- Медиауведомление (в шторке и на экране блокировки): название файла, сколько осталось (в минутах, обновляется раз в минуту и только при включённом экране), громкость ПК, кнопки пауза/старт, предыдущая/следующая и тише/громче ПК. Им управляет foreground-сервис `RemoteService` с `MediaSession`; громкость сессии объявлена удалённой (`setPlaybackToRemote`) и привязана к громкости ПК.
 - Сервис останавливается сам, если MPC-HC 30 минут ничего не воспроизводит; при следующем открытии приложения запускается снова.
 
 ## Требования
@@ -24,7 +24,7 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 
 Адрес ПК вводится в поле вверху экрана и сохраняется (`SharedPreferences`): `хост:порт` (`192.168.3.2:7778`, это же значение по умолчанию) или полный URL — без схемы подставляется `http://`. Если ПК не отвечает, под полем появляется «Нет связи с ПК» с текстом ошибки.
 
-Состояние опрашивается через `GET /status` раз в секунду, пока приложение на экране или идёт воспроизведение, раз в 5 секунд в остальное время и раз в 30 секунд при выключенном экране (полосу прогресса на экране блокировки система двигает сама; при включении экрана опрос сразу возобновляется). HTTP-соединение переиспользуется (keep-alive). Команды отвечают тем же JSON, что и `/status`, поэтому экран обновляется сразу после нажатия.
+Опроса нет: приложение держит поток `GET /events` (SSE), и ПК присылает состояние сам — сразу при подключении и затем только при значимых изменениях (пауза, перемотка, другой файл, громкость). Оставшееся время телефон досчитывает сам от момента получения события; на экране оно тикает раз в секунду, пока идёт воспроизведение и приложение открыто. При обрыве поток переподключается с паузой 1 → 2 → 5 → 10 с; при открытии приложения и включении экрана — сразу (после Doze соединение могло тихо умереть). Мёртвое соединение без пингов обнаруживается за 60 с (`readTimeout`). Сервер без `/events` (старый volume_switch) не поддерживается — приложение пишет, что его нужно обновить. Команды отвечают тем же JSON, что и `/status`, поэтому экран обновляется сразу после нажатия.
 
 ## Сборка и установка
 
@@ -61,7 +61,7 @@ Debug и release подписаны разными ключами: чтобы с
 | Файл | Что внутри |
 |------|------------|
 | `RemoteClient.kt` | HTTP-клиент API (`RemoteClient`), разбор ответа (`parseStatus` → `Status`), `normalizeServer`, `errorMessage`, `formatTime` |
-| `Remote.kt` | Синглтон `Remote`: адрес ПК, `StateFlow<UiState>`, опрос и команды. Опрос идёт, пока есть хотя бы один пользователь (`acquire`/`release`): экран и сервис |
+| `Remote.kt` | Синглтон `Remote`: адрес ПК, `StateFlow<UiState>`, поток `/events` и команды. Поток открыт, пока есть хотя бы один пользователь (`acquire`/`release`): экран и сервис |
 | `RemoteScreen.kt` | Экран на Compose |
 | `MainActivity.kt` | Активити: тема, кнопки громкости телефона, запрос разрешения на уведомления, запуск `RemoteService` |
 | `RemoteService.kt` | Foreground-сервис с `MediaSession` и медиауведомлением |
@@ -69,7 +69,7 @@ Debug и release подписаны разными ключами: чтобы с
 
 Клиент повторяет формат JSON `apiStatus` из `main.go` вручную: при изменении API обновить `parseStatus` и `RemoteClientTest`.
 
-Тесты (`app/src/test`, JUnit 4) покрывают чистые функции `RemoteClient.kt`: `parseStatus`, `normalizeServer`, `errorMessage`, `formatTime`.
+Тесты (`app/src/test`, JUnit 4) покрывают чистые функции `RemoteClient.kt`: `parseStatus`, `SseParser`, `Status.positionAt`/`remainingAt`, `normalizeServer`, `errorMessage`, `formatTime`, `formatRemainingMinutes`.
 
 Это отдельный Gradle-проект: Go-сборка и CI репозитория его не собирают и не тестируют.
 
@@ -88,7 +88,7 @@ A client for the [volume_switch](../README.md#phone-remote) phone remote HTTP AP
 - Previous/Next: the neighbouring file in MPC-HC (episode); disabled while the player is off.
 - The PC master volume and MPC-HC's own volume: −/+ buttons and the current level (`MUTE` when muted).
 - While the app is open, the phone's volume keys change the PC volume instead of the phone's.
-- A media notification (in the shade and on the lock screen): file name, time remaining, PC volume, play/pause, previous/next and PC volume down/up buttons. It is run by the `RemoteService` foreground service with a `MediaSession`; the session volume is declared remote (`setPlaybackToRemote`) and tied to the PC volume.
+- A media notification (in the shade and on the lock screen): file name, time remaining (in minutes, updated once a minute and only while the screen is on), PC volume, play/pause, previous/next and PC volume down/up buttons. It is run by the `RemoteService` foreground service with a `MediaSession`; the session volume is declared remote (`setPlaybackToRemote`) and tied to the PC volume.
 - The service stops itself after MPC-HC has been idle for 30 minutes; it starts again the next time the app is opened.
 
 ## Requirements
@@ -101,7 +101,7 @@ A client for the [volume_switch](../README.md#phone-remote) phone remote HTTP AP
 
 Enter the PC address in the field at the top of the screen; it is saved (`SharedPreferences`): `host:port` (`192.168.3.2:7778`, also the default) or a full URL; `http://` is added when there is no scheme. If the PC doesn't respond, "Нет связи с ПК" ("No connection to the PC") with the error text appears below the field.
 
-The state is polled with `GET /status` every second while the app is on screen or something is playing, every 5 seconds otherwise and every 30 seconds while the screen is off (the system moves the lock screen progress bar by itself; polling resumes right away when the screen turns on). The HTTP connection is reused (keep-alive). Commands respond with the same JSON as `/status`, so the screen updates right after a tap.
+There is no polling: the app keeps a `GET /events` (SSE) stream open and the PC pushes the state itself, right after connecting and then only on significant changes (pause, seek, another file, volume). The phone extrapolates the time remaining from the moment the event arrived; on screen it ticks every second while playing and the app is open. A dropped stream reconnects after 1 → 2 → 5 → 10 s; when the app opens or the screen turns on, right away (the connection may have died silently in Doze). A dead connection without pings is detected within 60 s (`readTimeout`). A server without `/events` (an old volume_switch) is not supported: the app says it needs updating. Commands respond with the same JSON as `/status`, so the screen updates right after a tap.
 
 ## Build and install
 
@@ -138,7 +138,7 @@ Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material
 | File | Contents |
 |------|----------|
 | `RemoteClient.kt` | The API HTTP client (`RemoteClient`), response parsing (`parseStatus` → `Status`), `normalizeServer`, `errorMessage`, `formatTime` |
-| `Remote.kt` | The `Remote` singleton: PC address, `StateFlow<UiState>`, polling and commands. Polling runs while there is at least one user (`acquire`/`release`): the screen and the service |
+| `Remote.kt` | The `Remote` singleton: PC address, `StateFlow<UiState>`, the `/events` stream and commands. The stream is open while there is at least one user (`acquire`/`release`): the screen and the service |
 | `RemoteScreen.kt` | The Compose screen |
 | `MainActivity.kt` | The activity: theme, phone volume keys, notification permission request, starting `RemoteService` |
 | `RemoteService.kt` | The foreground service with the `MediaSession` and the media notification |
@@ -146,6 +146,6 @@ Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material
 
 The client mirrors the `apiStatus` JSON format from `main.go` by hand: when the API changes, update `parseStatus` and `RemoteClientTest`.
 
-The tests (`app/src/test`, JUnit 4) cover the pure functions of `RemoteClient.kt`: `parseStatus`, `normalizeServer`, `errorMessage`, `formatTime`.
+The tests (`app/src/test`, JUnit 4) cover the pure functions of `RemoteClient.kt`: `parseStatus`, `SseParser`, `Status.positionAt`/`remainingAt`, `normalizeServer`, `errorMessage`, `formatTime`, `formatRemainingMinutes`.
 
 This is a separate Gradle project: the repository's Go build and CI don't build or test it.

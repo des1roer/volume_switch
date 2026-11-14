@@ -1,5 +1,6 @@
 package com.des1roer.volumeremote
 
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,6 +26,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -37,6 +39,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
 
 @Composable
 fun RemoteScreen(ui: UiState) {
@@ -158,28 +164,46 @@ private fun Playback(status: Status?) {
             overflow = TextOverflow.Ellipsis,
         )
         val active = status != null && status.mpcOnline && status.file.isNotEmpty()
+        val now = rememberPlaybackClock(status?.takeIf { it.playing })
+        val position = if (active) status!!.positionAt(now) else 0
         Text(
             text = "Осталось",
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            text = if (active) formatTime(status!!.remainingMs) else "--:--",
+            text = if (active) formatTime(status!!.remainingAt(now)) else "--:--",
             fontSize = 64.sp,
             fontWeight = FontWeight.Bold,
         )
         val progress = if (active && status!!.durationMs > 0) {
-            (status.positionMs.toFloat() / status.durationMs).coerceIn(0f, 1f)
+            (position.toFloat() / status.durationMs).coerceIn(0f, 1f)
         } else {
             0f
         }
         LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
         Row {
-            Text(if (active) formatTime(status!!.positionMs) else "")
+            Text(if (active) formatTime(position) else "")
             Spacer(Modifier.weight(1f))
             Text(if (active) formatTime(status!!.durationMs) else "")
         }
     }
+}
+
+@Composable
+private fun rememberPlaybackClock(playing: Status?): Long {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val now by produceState(SystemClock.elapsedRealtime(), playing, lifecycle) {
+        value = SystemClock.elapsedRealtime()
+        if (playing == null) return@produceState
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                value = SystemClock.elapsedRealtime()
+                delay(1_000 - (value - playing.receivedAt).mod(1_000L))
+            }
+        }
+    }
+    return now
 }
 
 @Composable

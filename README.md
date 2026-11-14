@@ -126,6 +126,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 | Запрос | Что делает |
 |--------|------------|
 | `GET /status` | Состояние: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, собственная громкость MPC-HC `volume`/`muted`) и системная громкость `volume` (`percent`, `muted`) |
+| `GET /events` | Поток [SSE](https://developer.mozilla.org/docs/Web/API/Server-sent_events) (`text/event-stream`): сразу текущее состояние (тот же JSON, что у `/status`), затем новое — только при значимом изменении: плеер запущен/закрыт, файл, пауза/воспроизведение, перемотка, громкость MPC-HC или системная. Ход воспроизведения событий не порождает — позицию клиент досчитывает сам. Раз в 25 с — комментарий `: ping`. Пока подписан хоть один клиент, volume_switch опрашивает MPC-HC и громкость раз в 500 мс, без подписчиков — не опрашивает |
 | `POST /playpause` | Пауза/старт, как клик по оверлею; если MPC-HC не запущен — запускает его |
 | `POST /next`, `POST /prev` | Следующий/предыдущий файл в MPC-HC (следующая серия) |
 | `POST /volume/up`, `POST /volume/down` | Системная громкость, как F3/F2 (на ПК показывается оверлей); `?step=N` — шаг в процентах |
@@ -176,7 +177,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 10. Автозапуск через реестр (`autostart`)
 11. Подключение systray + меню устройств (`main`, `trayApp`, `deviceMenu`)
 12. Глобальный низкоуровневый хук клавиатуры для F2/F3/F5/F7/F8 и Ctrl+F2 (`hotkeyHook`, `WH_KEYBOARD_LL`)
-13. HTTP API пульта для телефона (`remoteAPI`, `apiStatus`, `startRemoteAPI`)
+13. HTTP API пульта для телефона (`remoteAPI`, `apiStatus`, `startRemoteAPI`) и поток SSE `/events` (`statusHub` — общий опросчик для подписчиков, `statusChanged`)
 
 Android-клиент API — отдельный Gradle-проект в `android/`, к Go-программе не относится.
 
@@ -321,6 +322,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 | Request | What it does |
 |---------|--------------|
 | `GET /status` | State: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, MPC-HC's own volume `volume`/`muted`) and the master volume `volume` (`percent`, `muted`) |
+| `GET /events` | An [SSE](https://developer.mozilla.org/docs/Web/API/Server-sent_events) stream (`text/event-stream`): the current state right away (the same JSON as `/status`), then a new one only on a significant change: the player started/closed, the file, pause/play, a seek, the MPC-HC or master volume. Playback progress produces no events: the client extrapolates the position itself. A `: ping` comment every 25 s. While at least one client is subscribed, volume_switch polls MPC-HC and the volume every 500 ms; with no subscribers it doesn't poll |
 | `POST /playpause` | Pause/play, like a click on the overlay; launches MPC-HC if it isn't running |
 | `POST /next`, `POST /prev` | Next/previous file in MPC-HC (next episode) |
 | `POST /volume/up`, `POST /volume/down` | Master volume, like F3/F2 (the overlay is shown on the PC); `?step=N` sets the step in percent |
@@ -371,7 +373,7 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 10. Autostart via the registry (`autostart`)
 11. Systray wiring + device menu (`main`, `trayApp`, `deviceMenu`)
 12. Global low-level keyboard hook for F2/F3/F5/F7/F8 and Ctrl+F2 (`hotkeyHook`, `WH_KEYBOARD_LL`)
-13. Phone remote HTTP API (`remoteAPI`, `apiStatus`, `startRemoteAPI`)
+13. Phone remote HTTP API (`remoteAPI`, `apiStatus`, `startRemoteAPI`) and the `/events` SSE stream (`statusHub`, the shared poller for subscribers; `statusChanged`)
 
 The API's Android client is a separate Gradle project in `android/`, not part of the Go program.
 

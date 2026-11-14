@@ -60,12 +60,62 @@ class RemoteClientTest {
     }
 
     @Test
-    fun pollInterval() {
-        assertEquals(30_000, pollInterval(screenOn = false, uiVisible = true, playing = true))
-        assertEquals(1_000, pollInterval(screenOn = true, uiVisible = true, playing = false))
-        assertEquals(1_000, pollInterval(screenOn = true, uiVisible = false, playing = true))
-        assertEquals(5_000, pollInterval(screenOn = true, uiVisible = false, playing = false))
+    fun sseParser() {
+        val parser = SseParser()
+        val lines = listOf(
+            "data: {\"a\":1}",
+            "",
+            ": ping",
+            "",
+            "event: status",
+            "data: line1",
+            "data:line2",
+            "",
+            "",
+        )
+        val events = lines.mapNotNull { parser.line(it) }
+        assertEquals(listOf("{\"a\":1}", "line1\nline2"), events)
     }
+
+    @Test
+    fun positionAt() {
+        val playing = status(state = "playing", positionMs = 60_000, durationMs = 100_000, receivedAt = 1_000)
+        assertEquals(60_000, playing.positionAt(1_000))
+        assertEquals(70_000, playing.positionAt(11_000))
+        assertEquals(30_000, playing.remainingAt(11_000))
+        assertEquals(100_000, playing.positionAt(500_000))
+        assertEquals(0, playing.remainingAt(500_000))
+        assertEquals(60_000, playing.positionAt(0))
+
+        val paused = playing.copy(state = "paused")
+        assertEquals(60_000, paused.positionAt(11_000))
+        assertEquals(40_000, paused.remainingAt(11_000))
+    }
+
+    @Test
+    fun formatRemainingMinutes() {
+        assertEquals("0 мин", formatRemainingMinutes(0))
+        assertEquals("1 мин", formatRemainingMinutes(1))
+        assertEquals("1 мин", formatRemainingMinutes(60_000))
+        assertEquals("19 мин", formatRemainingMinutes(18 * 60_000 + 56_000))
+        assertEquals("1 ч 05 мин", formatRemainingMinutes(65 * 60_000))
+    }
+
+    private fun status(state: String, positionMs: Long, durationMs: Long, receivedAt: Long) = Status(
+        mpcOnline = true,
+        mpcError = null,
+        file = "a.mkv",
+        state = state,
+        positionMs = positionMs,
+        durationMs = durationMs,
+        remainingMs = durationMs - positionMs,
+        mpcVolume = 0,
+        mpcMuted = false,
+        volumePercent = null,
+        muted = false,
+        volumeError = null,
+        receivedAt = receivedAt,
+    )
 
     @Test
     fun errorMessage() {

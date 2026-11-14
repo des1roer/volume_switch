@@ -5,7 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.MediaMetadata
 import android.media.VolumeProvider
@@ -13,6 +16,7 @@ import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
@@ -29,6 +33,15 @@ class RemoteService : Service() {
     private val scope = MainScope()
     private lateinit var session: MediaSession
     private var idleSince = SystemClock.elapsedRealtime()
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_ON -> Remote.setScreenOn(true)
+                Intent.ACTION_SCREEN_OFF -> Remote.setScreenOn(false)
+            }
+        }
+    }
 
     private val volumeProvider = object : VolumeProvider(VOLUME_CONTROL_ABSOLUTE, 100, 0) {
         override fun onAdjustVolume(direction: Int) {
@@ -76,6 +89,15 @@ class RemoteService : Service() {
         }
         render(Remote.state.value)
         startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        Remote.setScreenOn(getSystemService(PowerManager::class.java).isInteractive)
+        registerReceiver(
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            },
+            RECEIVER_NOT_EXPORTED,
+        )
         Remote.acquire()
         scope.launch { Remote.state.collect { render(it) } }
     }
@@ -85,6 +107,8 @@ class RemoteService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        unregisterReceiver(screenReceiver)
+        Remote.setScreenOn(true)
         scope.cancel()
         Remote.release()
         session.release()

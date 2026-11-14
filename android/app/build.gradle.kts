@@ -12,13 +12,32 @@ android {
         applicationId = "com.des1roer.volumeremote"
         minSdk = 33
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        val keystore = providers.gradleProperty("volumeRemoteKeystore").orNull
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = providers.gradleProperty("volumeRemoteStorePassword").get()
+                keyAlias = providers.gradleProperty("volumeRemoteKeyAlias").get()
+                keyPassword = providers.gradleProperty("volumeRemoteKeyPassword").get()
+            }
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

@@ -60,6 +60,14 @@ class RemoteClientTest {
     }
 
     @Test
+    fun pollInterval() {
+        assertEquals(30_000, pollInterval(screenOn = false, uiVisible = true, playing = true))
+        assertEquals(1_000, pollInterval(screenOn = true, uiVisible = true, playing = false))
+        assertEquals(1_000, pollInterval(screenOn = true, uiVisible = false, playing = true))
+        assertEquals(5_000, pollInterval(screenOn = true, uiVisible = false, playing = false))
+    }
+
+    @Test
     fun errorMessage() {
         assertEquals("MPC-HC не отвечает", errorMessage("""{"error":"MPC-HC не отвечает"}"""))
         assertEquals("Method Not Allowed", errorMessage("Method Not Allowed\n"))

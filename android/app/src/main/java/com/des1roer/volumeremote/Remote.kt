@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 const val DEFAULT_SERVER = "192.168.3.2:7778"
 private const val FAST_POLL_MS = 1_000L
 private const val SLOW_POLL_MS = 5_000L
+private const val SCREEN_OFF_POLL_MS = 30_000L
 
 data class UiState(
     val server: String,
@@ -31,6 +32,7 @@ object Remote {
 
     private var users = 0
     private var uiVisible = false
+    private var screenOn = true
     private var pollJob: Job? = null
 
     fun init(context: Context) {
@@ -42,11 +44,18 @@ object Remote {
     fun acquire(ui: Boolean = false) {
         users++
         if (ui) uiVisible = true
-        if (pollJob == null) {
-            pollJob = scope.launch { poll() }
-        } else if (ui) {
-            command { it.status() }
-        }
+        if (pollJob == null || ui) restartPoll()
+    }
+
+    fun setScreenOn(on: Boolean) {
+        if (on == screenOn) return
+        screenOn = on
+        if (on && pollJob != null) restartPoll()
+    }
+
+    private fun restartPoll() {
+        pollJob?.cancel()
+        pollJob = scope.launch { poll() }
     }
 
     fun release(ui: Boolean = false) {
@@ -79,8 +88,7 @@ object Remote {
     private suspend fun poll() {
         while (true) {
             update { client().status() }
-            val fast = uiVisible || mutableState.value.status?.playing == true
-            delay(if (fast) FAST_POLL_MS else SLOW_POLL_MS)
+            delay(pollInterval(screenOn, uiVisible, mutableState.value.status?.playing == true))
         }
     }
 
@@ -105,4 +113,10 @@ object Remote {
             }
         }
     }
+}
+
+fun pollInterval(screenOn: Boolean, uiVisible: Boolean, playing: Boolean): Long = when {
+    !screenOn -> SCREEN_OFF_POLL_MS
+    uiVisible || playing -> FAST_POLL_MS
+    else -> SLOW_POLL_MS
 }

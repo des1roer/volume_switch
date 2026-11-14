@@ -22,10 +22,14 @@ gofmt -l .                                                # должно быт�
 
 ```sh
 cd android
-./gradlew testDebugUnitTest assembleDebug                  # JDK 17, Android SDK: C:\Android\Sdk (local.properties, не в git)
+./gradlew testReleaseUnitTest assembleRelease              # JDK 17, Android SDK: C:\Android\Sdk (local.properties, не в git)
 adb devices -l                                              # adb не в PATH: C:\Android\Sdk\platform-tools\adb.exe
-adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s <serial> install -r app/build/outputs/apk/release/app-release.apk
+adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote
 ```
+
+- На телефоне стоит **релизная** сборка, подписанная ключом `~/.android/volumeremote-release.jks` (пароли — в `~/.gradle/gradle.properties`, вне git). Debug-APK поверх неё не встанет (другая подпись) — для отладки ставить тоже release или удалять приложение.
+- HyperOS спрашивает подтверждение каждой установки через adb на самом телефоне; без него — `INSTALL_FAILED_USER_RESTRICTED`. Предупредить пользователя перед `adb install`.
 
 - Отдельный Gradle-проект (AGP 8.7.3, Gradle 8.9, Kotlin 2.0.21, Compose). Go-часть его не видит: `go vet ./...` и CI его не собирают.
 - Клиент повторяет формат `apiStatus` вручную (`parseStatus` в `RemoteClient.kt`): при изменении JSON API обновить и его, и `RemoteClientTest`.

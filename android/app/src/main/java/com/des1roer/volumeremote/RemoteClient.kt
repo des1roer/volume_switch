@@ -44,20 +44,16 @@ class RemoteClient(server: String) {
 
     private suspend fun request(method: String, path: String): Status = withContext(Dispatchers.IO) {
         val conn = URL(baseUrl + path).openConnection() as HttpURLConnection
-        try {
-            conn.requestMethod = method
-            conn.connectTimeout = 2_000
-            conn.readTimeout = 4_000
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) {
-                throw ApiException(errorMessage(body) ?: "HTTP $code")
-            }
-            parseStatus(body)
-        } finally {
-            conn.disconnect()
+        conn.requestMethod = method
+        conn.connectTimeout = 2_000
+        conn.readTimeout = 4_000
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        if (code !in 200..299) {
+            throw ApiException(errorMessage(body) ?: "HTTP $code")
         }
+        parseStatus(body)
     }
 }
 

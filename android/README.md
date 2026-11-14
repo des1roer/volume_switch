@@ -24,7 +24,7 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 
 Адрес ПК вводится в поле вверху экрана и сохраняется (`SharedPreferences`): `хост:порт` (`192.168.3.2:7778`, это же значение по умолчанию) или полный URL — без схемы подставляется `http://`. Если ПК не отвечает, под полем появляется «Нет связи с ПК» с текстом ошибки.
 
-Состояние опрашивается через `GET /status` раз в секунду, пока приложение на экране или идёт воспроизведение, и раз в 5 секунд в остальное время. Команды отвечают тем же JSON, что и `/status`, поэтому экран обновляется сразу после нажатия.
+Состояние опрашивается через `GET /status` раз в секунду, пока приложение на экране или идёт воспроизведение, раз в 5 секунд в остальное время и раз в 30 секунд при выключенном экране (полосу прогресса на экране блокировки система двигает сама; при включении экрана опрос сразу возобновляется). HTTP-соединение переиспользуется (keep-alive). Команды отвечают тем же JSON, что и `/status`, поэтому экран обновляется сразу после нажатия.
 
 ## Сборка и установка
 
@@ -34,13 +34,23 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 sdk.dir=C\:\\Android\\Sdk
 ```
 
-```sh
-./gradlew testDebugUnitTest assembleDebug
-adb devices -l
-adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
+Для повседневного использования — релизная сборка: R8 (минификация и удаление неиспользуемого кода и ресурсов), не отлаживаемая, только `arm64-v8a`, с базовыми профилями Compose. Она подписывается ключом из `~/.gradle/gradle.properties` (вне репозитория); без этих свойств — debug-ключом:
+
+```properties
+volumeRemoteKeystore=C:/Users/<user>/.android/volumeremote-release.jks
+volumeRemoteStorePassword=…
+volumeRemoteKeyAlias=volumeremote
+volumeRemoteKeyPassword=…
 ```
 
-APK — `app/build/outputs/apk/debug/app-debug.apk`. `adb` лежит в `platform-tools` Android SDK.
+```sh
+./gradlew testReleaseUnitTest assembleRelease
+adb devices -l
+adb -s <serial> install -r app/build/outputs/apk/release/app-release.apk
+adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote   # сразу AOT-компиляция под процессор устройства
+```
+
+Debug и release подписаны разными ключами: чтобы сменить одну на другую, приложение сначала удаляют (`adb uninstall com.des1roer.volumeremote`). Потеря релизного ключа означает то же самое для следующих обновлений. Debug-сборка — `./gradlew assembleDebug`, APK в `app/build/outputs/apk/debug/`. `adb` лежит в `platform-tools` Android SDK.
 
 Стек: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, динамические цвета), без сторонних HTTP/JSON-библиотек — `HttpURLConnection` и `org.json`.
 
@@ -91,7 +101,7 @@ A client for the [volume_switch](../README.md#phone-remote) phone remote HTTP AP
 
 Enter the PC address in the field at the top of the screen; it is saved (`SharedPreferences`): `host:port` (`192.168.3.2:7778`, also the default) or a full URL; `http://` is added when there is no scheme. If the PC doesn't respond, "Нет связи с ПК" ("No connection to the PC") with the error text appears below the field.
 
-The state is polled with `GET /status` every second while the app is on screen or something is playing, and every 5 seconds otherwise. Commands respond with the same JSON as `/status`, so the screen updates right after a tap.
+The state is polled with `GET /status` every second while the app is on screen or something is playing, every 5 seconds otherwise and every 30 seconds while the screen is off (the system moves the lock screen progress bar by itself; polling resumes right away when the screen turns on). The HTTP connection is reused (keep-alive). Commands respond with the same JSON as `/status`, so the screen updates right after a tap.
 
 ## Build and install
 
@@ -101,13 +111,23 @@ Requires JDK 17 and the Android SDK. The SDK path goes into `local.properties` (
 sdk.dir=C\:\\Android\\Sdk
 ```
 
-```sh
-./gradlew testDebugUnitTest assembleDebug
-adb devices -l
-adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
+For everyday use, build the release: R8 (minification, unused code and resource removal), not debuggable, `arm64-v8a` only, with the Compose baseline profiles. It is signed with a key from `~/.gradle/gradle.properties` (outside the repository); without these properties, with the debug key:
+
+```properties
+volumeRemoteKeystore=C:/Users/<user>/.android/volumeremote-release.jks
+volumeRemoteStorePassword=…
+volumeRemoteKeyAlias=volumeremote
+volumeRemoteKeyPassword=…
 ```
 
-The APK is `app/build/outputs/apk/debug/app-debug.apk`. `adb` is in the Android SDK's `platform-tools`.
+```sh
+./gradlew testReleaseUnitTest assembleRelease
+adb devices -l
+adb -s <serial> install -r app/build/outputs/apk/release/app-release.apk
+adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote   # full AOT compilation for the device CPU right away
+```
+
+The debug and release builds are signed with different keys: to switch between them, uninstall the app first (`adb uninstall com.des1roer.volumeremote`). Losing the release key means the same for future updates. Debug build: `./gradlew assembleDebug`, APK in `app/build/outputs/apk/debug/`. `adb` is in the Android SDK's `platform-tools`.
 
 Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, dynamic colors), no third-party HTTP/JSON libraries: `HttpURLConnection` and `org.json`.
 

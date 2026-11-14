@@ -46,7 +46,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        Remote.release(ui = true)
+        Remote.release()
         super.onStop()
     }
 

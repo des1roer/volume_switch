@@ -1,0 +1,31 @@
+@startuml remote-stream-states
+title Remote: жизненный цикл потока /events на телефоне
+
+[*] --> Idle
+
+state "Нет пользователей" as Idle
+state "Подключение" as Connecting : GET /events,\nconnectTimeout 2 с
+state "Поток открыт" as Streaming : события → StateFlow,\nreadTimeout 60 с\n(пинг сервера — раз в 25 с)
+state "Пауза перед повтором" as Backoff : 1 → 2 → 5 → 10 с\n(сброс после первого события)
+
+Idle --> Connecting : acquire()\n(экран или сервис)
+Connecting --> Streaming : первое событие
+Connecting --> Backoff : ошибка соединения,\n404 (старый volume_switch)
+Streaming --> Backoff : обрыв, EOF,\nтаймаут чтения
+Backoff --> Connecting : пауза истекла
+
+Streaming --> Connecting : reconnect():\nоткрыто приложение,\nвключился экран,\nсменён адрес ПК
+Backoff --> Connecting : reconnect()
+
+Connecting --> Idle : release() последнего\nпользователя
+Streaming --> Idle : release() последнего\nпользователя
+Backoff --> Idle : release() последнего\nпользователя
+
+note right of Streaming
+  Пользователи потока:
+  MainActivity (onStart/onStop)
+  и RemoteService (onCreate/onDestroy).
+  Сервис сам останавливается,
+  если 30 мин ничего не играет.
+end note
+@enduml

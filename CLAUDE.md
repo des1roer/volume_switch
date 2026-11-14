@@ -33,6 +33,7 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote
 
 - Отдельный Gradle-проект (AGP 8.7.3, Gradle 8.9, Kotlin 2.0.21, Compose). Go-часть его не видит: `go vet ./...` и CI его не собирают.
 - Клиент повторяет формат `apiStatus` вручную (`parseStatus` в `RemoteClient.kt`): при изменении JSON API обновить и его, и `RemoteClientTest`.
+- Схемы взаимодействия телефона и ПК — `docs/remote-pairing.md` (Mermaid) и `docs/plantuml/*.puml`; при изменении протокола, эндпоинтов или жизненного цикла потока обновить обе версии.
 - HTTP без TLS в локальную сеть — поэтому в манифесте `usesCleartextTraffic="true"`.
 - Подробности клиента — `android/README.md`. Состояние и опрос — в синглтоне `Remote` (общий для экрана и `RemoteService`, опрос идёт, пока есть `acquire` без `release`): второй независимый опрос не заводить. Медиауведомление (шторка и экран блокировки) строится системой из `MediaSession` (`minSdk 33`), поэтому кнопки — это `PlaybackState` actions и custom actions, а не `Notification.addAction`.
 - Проверить уведомление на заблокированном телефоне: `adb shell input keyevent KEYCODE_WAKEUP` (включает экран, не разблокируя) и `adb exec-out screencap -p`; при выключенном экране снимок чёрный.
@@ -71,6 +72,7 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote
 - `showNotification` завязан на внутренности `getlantern/systray` v1.2.2 (класс окна `SystrayClass`, ID иконки 100): при обновлении systray проверить, что баллоны ещё показываются.
 - **HTTP API пульта без авторизации — решение пользователя** (управлять с любого устройства в сети не страшно, важнее гибкость), поэтому он выключен, пока не задан `API_LISTEN`. Не включать его по умолчанию: программа ставится и пакетными менеджерами. Команды — только `POST`; запуск MPC-HC умеет только `/playpause`, `/next`/`/prev` при выключенном плеере отвечают 503.
 - API останавливается в `onExit` (`Shutdown`) до `switcher.Close()`: обработчик, обратившийся к закрытому `Switcher`, повис бы в `exec`.
+- **`/events` (SSE) и `Shutdown`.** `http.Server.Shutdown` не прерывает активные запросы, а поток `/events` бесконечный — без отмены `onExit` висел бы до `apiShutdownTimeout`. Поэтому `startRemoteAPI` даёт запросам отменяемый `BaseContext` и отменяет его через `RegisterOnShutdown`; обработчик выходит по `r.Context()`. `WriteTimeout` не ставить — оборвёт поток. Опрос для `/events` один на всех подписчиков (`statusHub`) и идёт, только пока они есть; что считать изменением — `statusChanged` (ход воспроизведения — нет, перемотка — да).
 
 ## Тесты
 
@@ -93,7 +95,7 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote
 - Дочерние процессы в тестах — с `CREATE_NO_WINDOW`: после `TestSetupLoggingToFile` (там `FreeConsole`) у тестового процесса нет консоли, и консольное приложение открыло бы окно.
 
 Прочее:
-- Циклы опроса (`progressOverlay.Poll`, `pollVolume`) принимают канал тиков — в тестах `ticksN(n)`: цикл делает n итераций и завершается.
+- Циклы опроса (`progressOverlay.Poll`, `pollVolume`) принимают канал тиков — в тестах `ticksN(n)`: цикл делает n итераций и завершается. Опросчику `/events` (`statusHub`) тики подаёт `manualTicks`: отправка тика завершается, когда тик *принят*, а не обработан, поэтому «обработан» = отправить ещё один (`process`), а остановку ждать через `tickUntilStopped`, а не одним тиком — иначе тест зависает.
 - Гонки: тесты гоняются с `-race` (как в CI). Если UI-код срабатывает по таймеру (скрытие оверлея громкости), в тестовом драйвере он выполняется в горутине таймера — синхронизироваться с ним через канал (см. `hideSpy`), а не через `time.Sleep`.
 - HTTP — через `httptest`. API пульта — `httptest`-запросами к `remoteAPI.handler()`; настоящий слушатель (`startRemoteAPI`, `trayApp.startAPI`) — только на `127.0.0.1:0`: адрес на всех интерфейсах вызвал бы запрос брандмауэра Windows.
 - Логику внутри COM/UI-кода, которую хочется проверить, выносить в чистую функцию (как `wrapIndex`, `volumeChanged`).

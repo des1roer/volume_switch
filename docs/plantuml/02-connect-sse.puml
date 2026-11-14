@@ -1,0 +1,52 @@
+@startuml remote-connect-sse
+title Подключение пульта и поток /events (SSE)
+
+autonumber
+participant "MainActivity /\nRemoteService" as ui
+participant "Remote" as remote
+participant "RemoteClient" as client
+participant "volume_switch\nremoteAPI.events" as api
+participant "statusHub" as hub
+participant "MPC-HC :7777" as mpc
+participant "Switcher (WASAPI)" as sw
+
+ui -> remote : acquire(ui = true)
+remote -> remote : reconnect(): отменить старый поток,\nзапустить stream()
+remote -> client : events()
+client -> api : GET /events\nAccept: text/event-stream
+api -> mpc : GET status.json
+api -> sw : CurrentVolume()
+api -> hub : subscribe(текущее состояние)
+alt первый подписчик
+  hub -> hub : запустить опросчик (тик 500 мс),\nбазовое состояние = текущее
+end
+api --> client : data: {apiStatus}\n(сразу после подключения)
+client --> remote : Status
+remote -> remote : receivedAt = elapsedRealtime(),\nerror = null
+remote --> ui : StateFlow<UiState>
+
+loop каждые 500 мс, пока есть подписчики
+  hub -> mpc : GET status.json
+  hub -> sw : CurrentVolume()
+  hub -> hub : statusChanged(last, new, elapsed)
+  alt значимое изменение\n(пауза/старт, файл, перемотка > 2 с,\nгромкость, MPC-HC запущен/закрыт)
+    hub --> api : apiStatus
+    api --> client : data: {apiStatus}
+    client --> remote : Status
+    remote --> ui : StateFlow<UiState>
+  else ход воспроизведения
+    hub -> hub : ничего не рассылать —\nпозицию телефон досчитывает сам
+  end
+end
+
+loop каждые 25 с
+  api --> client : ": ping"
+end
+
+note over ui
+  Экран тикает раз в секунду локально:
+  remaining = duration − (position + now − receivedAt).
+  Уведомление: «Осталось N мин» раз в минуту,
+  только при включённом экране.
+end note
+@enduml

@@ -19,6 +19,7 @@
 - **F5** показывает/скрывает окно-оверлей поверх всех окон (не забирая фокус), которое опрашивает JSON API веб-интерфейса MPC-HC (`status.json`) и отображает название/прогресс/прошедшее/оставшееся время.
 - Клик средней кнопкой мыши (колесом) по оверлею открывает в проводнике папку с текущим файлом (с выделением самого файла).
 - Клик левой кнопкой по полосе прогресса ставит воспроизведение на паузу/возобновляет его; если MPC-HC не запущен — запускает его (путь берётся из `MPC_EXE`, по умолчанию `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, а если такого файла нет — из `HKCU\Software\MPC-HC\MPC-HC\ExePath`, который MPC-HC пишет сам).
+- Пульт с телефона: необязательный HTTP API в локальной сети (`API_LISTEN`) и Android-приложение «Пульт MPC» (`android/`) — пауза/старт, сколько осталось, следующая/предыдущая серия и системная громкость (см. «Пульт с телефона»).
 - Необязательный файл `.env` для конфигурации; при отсутствии используются переменные окружения, затем флаги.
 
 ## Установка
@@ -110,8 +111,35 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 | `-url`      | `MPC_URL`       | `http://localhost:7777/`               | Адрес веб-интерфейса MPC-HC (корень или любая его страница — имя страницы заменяется на `status.json`/`command.html`) |
 | `-interval` | `MPC_INTERVAL`  | `500ms`                                | Интервал опроса для оверлея         |
 | —           | `MPC_EXE`       | `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe` | Путь к MPC-HC для запуска по клику  |
+| `-api`      | `API_LISTEN`    | — (выключен)                           | Адрес HTTP API пульта, например `:7778` (все интерфейсы) или `192.168.3.2:7778` |
 
 Флаги переопределяют переменные окружения, те переопределяют файл `.env`, который переопределяет жёстко заданные значения по умолчанию. Файл `.env` (`KEY=VALUE` по строке, комментарии через `#` разрешены) загружается при запуске, но никогда не переопределяет переменную, уже заданную в реальном окружении. Он ищется в рабочем каталоге, рядом с exe и в `%LOCALAPPDATA%\volume_switch`; если файлов несколько, переменная берётся из первого по этому списку.
+
+## Пульт с телефона
+
+Если задан `API_LISTEN` (например, строкой `API_LISTEN=:7778` в `%LOCALAPPDATA%\volume_switch\.env`), программа слушает HTTP API. Авторизации нет: управлять плеером может любое устройство в локальной сети — поэтому по умолчанию API выключен. Входящие подключения на этот порт нужно разрешить в брандмауэре Windows (для частной сети), например:
+
+```powershell
+netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow protocol=TCP localport=7778 profile=private
+```
+
+| Запрос | Что делает |
+|--------|------------|
+| `GET /status` | Состояние: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, собственная громкость MPC-HC `volume`/`muted`) и системная громкость `volume` (`percent`, `muted`) |
+| `POST /playpause` | Пауза/старт, как клик по оверлею; если MPC-HC не запущен — запускает его |
+| `POST /next`, `POST /prev` | Следующий/предыдущий файл в MPC-HC (следующая серия) |
+| `POST /volume/up`, `POST /volume/down` | Системная громкость, как F3/F2 (на ПК показывается оверлей); `?step=N` — шаг в процентах |
+| `POST /mpc/volume/up`, `POST /mpc/volume/down` | Громкость самого MPC-HC, шагом из его настроек (по умолчанию 5%) |
+
+Команды отвечают тем же JSON, что и `/status`; ошибки — `{"error": "..."}` с кодом 4xx/5xx.
+
+Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК). Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md). Сборка и установка:
+
+```sh
+cd android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
 ## Логирование
 
@@ -128,7 +156,8 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 - `deviceMenu` — пункты устройств в меню трея с галочкой на текущем;
 - `Switcher` — WASAPI/COM: список устройств, устройство по умолчанию, громкость;
 - `overlays` — приложение Fyne с двумя окнами: `progressOverlay` (прогресс MPC-HC по F5) и `volumeOverlay` (ползунок громкости);
-- `mpcClient` — web-интерфейс MPC-HC (`State`, `TogglePlayback`) и запуск самого плеера (`Launch`);
+- `mpcClient` — web-интерфейс MPC-HC (`State`, `Command`, `TogglePlayback`) и запуск самого плеера (`Launch`);
+- `remoteAPI` — HTTP API пульта (`handler`, запускается `startRemoteAPI` из `trayApp.startAPI`);
 - `hotkeyHook` — глобальный хук клавиатуры с обработчиками и выключателем Ctrl+F2;
 - `autostart` — значение автозапуска в `HKCU\...\Run`;
 - `config` — итоговые настройки (`resolveConfig`: флаги > окружение/`.env` > умолчания).
@@ -147,6 +176,9 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 10. Автозапуск через реестр (`autostart`)
 11. Подключение systray + меню устройств (`main`, `trayApp`, `deviceMenu`)
 12. Глобальный низкоуровневый хук клавиатуры для F2/F3/F5/F7/F8 и Ctrl+F2 (`hotkeyHook`, `WH_KEYBOARD_LL`)
+13. HTTP API пульта для телефона (`remoteAPI`, `apiStatus`, `startRemoteAPI`)
+
+Android-клиент API — отдельный Gradle-проект в `android/`, к Go-программе не относится.
 
 **Ключевые инварианты:**
 
@@ -183,6 +215,7 @@ Written for my own use as a Volume² replacement on Windows 11: its overlay and 
 - **F5** shows/hides an always-on-top overlay window (without stealing focus) that polls the MPC-HC web interface JSON API (`status.json`) and displays the title/progress/elapsed/remaining time.
 - A middle-click (wheel click) on the overlay opens the folder of the current file in Explorer, with the file itself selected.
 - A left click on the progress bar pauses/resumes playback; if MPC-HC is not running, it launches it (the path comes from `MPC_EXE`, by default `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, and if that file doesn't exist — from `HKCU\Software\MPC-HC\MPC-HC\ExePath`, which MPC-HC writes itself).
+- Phone remote: an optional HTTP API on the local network (`API_LISTEN`) and the "Пульт MPC" Android app (`android/`): pause/play, time remaining, next/previous episode and the master volume (see "Phone remote").
 - An optional `.env` file for configuration; environment variables and then flags take precedence over it.
 
 ## Installation
@@ -273,8 +306,35 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 | `-url`      | `MPC_URL`       | `http://localhost:7777/`               | MPC-HC web interface address (the root or any of its pages — the page name is replaced with `status.json`/`command.html`) |
 | `-interval` | `MPC_INTERVAL`  | `500ms`                                | Polling interval for the overlay    |
 | —           | `MPC_EXE`       | `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe` | Path to MPC-HC to launch on click   |
+| `-api`      | `API_LISTEN`    | — (off)                                | Phone remote HTTP API address, e.g. `:7778` (all interfaces) or `192.168.3.2:7778` |
 
 Flags override environment variables, which override the `.env` file, which overrides the hard-coded defaults. The `.env` file (`KEY=VALUE` per line, `#` comments allowed) is loaded at startup but never overrides a variable already set in the real environment. It is looked up in the working directory, next to the exe and in `%LOCALAPPDATA%\volume_switch`; if there are several files, a variable comes from the first one in this list.
+
+## Phone remote
+
+When `API_LISTEN` is set (e.g. an `API_LISTEN=:7778` line in `%LOCALAPPDATA%\volume_switch\.env`), the program serves an HTTP API. There is no authentication: any device on the local network can control the player, which is why the API is off by default. Allow inbound connections to the port in Windows Firewall (for the private network), for example:
+
+```powershell
+netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow protocol=TCP localport=7778 profile=private
+```
+
+| Request | What it does |
+|---------|--------------|
+| `GET /status` | State: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, MPC-HC's own volume `volume`/`muted`) and the master volume `volume` (`percent`, `muted`) |
+| `POST /playpause` | Pause/play, like a click on the overlay; launches MPC-HC if it isn't running |
+| `POST /next`, `POST /prev` | Next/previous file in MPC-HC (next episode) |
+| `POST /volume/up`, `POST /volume/down` | Master volume, like F3/F2 (the overlay is shown on the PC); `?step=N` sets the step in percent |
+| `POST /mpc/volume/up`, `POST /mpc/volume/down` | MPC-HC's own volume, by the step from its settings (5% by default) |
+
+Commands respond with the same JSON as `/status`; errors are `{"error": "..."}` with a 4xx/5xx code.
+
+The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (while the app is open, the phone's volume keys change the PC volume too). The PC address is entered in the app. More in [android/README.md](android/README.md#english). Build and install:
+
+```sh
+cd android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
 ## Logging
 
@@ -291,7 +351,8 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 - `deviceMenu` holds the device items of the tray menu with a checkmark on the current one;
 - `Switcher` is WASAPI/COM: the device list, the default device, the volume;
 - `overlays` is the Fyne application with two windows: `progressOverlay` (MPC-HC progress on F5) and `volumeOverlay` (the volume slider);
-- `mpcClient` is the MPC-HC web interface (`State`, `TogglePlayback`) plus launching the player itself (`Launch`);
+- `mpcClient` is the MPC-HC web interface (`State`, `Command`, `TogglePlayback`) plus launching the player itself (`Launch`);
+- `remoteAPI` is the phone remote HTTP API (`handler`, started by `startRemoteAPI` from `trayApp.startAPI`);
 - `hotkeyHook` is the global keyboard hook with its handlers and the Ctrl+F2 switch;
 - `autostart` is the autostart value in `HKCU\...\Run`;
 - `config` holds the resolved settings (`resolveConfig`: flags > environment/`.env` > defaults).
@@ -310,6 +371,9 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 10. Autostart via the registry (`autostart`)
 11. Systray wiring + device menu (`main`, `trayApp`, `deviceMenu`)
 12. Global low-level keyboard hook for F2/F3/F5/F7/F8 and Ctrl+F2 (`hotkeyHook`, `WH_KEYBOARD_LL`)
+13. Phone remote HTTP API (`remoteAPI`, `apiStatus`, `startRemoteAPI`)
+
+The API's Android client is a separate Gradle project in `android/`, not part of the Go program.
 
 **Key invariants:**
 

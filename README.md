@@ -134,7 +134,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 Команды отвечают тем же JSON, что и `/status`; ошибки — `{"error": "..."}` с кодом 4xx/5xx.
 
-Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК). Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md). Сборка и установка:
+Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК). Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
 
 ```sh
 cd android
@@ -330,7 +330,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 Commands respond with the same JSON as `/status`; errors are `{"error": "..."}` with a 4xx/5xx code.
 
-The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (while the app is open, the phone's volume keys change the PC volume too). The PC address is entered in the app. More in [android/README.md](android/README.md#english). Build and install:
+The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (while the app is open, the phone's volume keys change the PC volume too). The PC address is entered in the app. More in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
 
 ```sh
 cd android

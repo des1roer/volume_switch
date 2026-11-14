@@ -1,0 +1,33 @@
+@startuml remote-hub-shutdown
+title volume_switch: опросчик statusHub и остановка API
+
+autonumber
+participant "Клиент /events" as client
+participant "remoteAPI.events" as handler
+participant "statusHub" as hub
+participant "trayApp.onExit" as exit
+participant "http.Server" as srv
+participant "Switcher" as sw
+
+== Подписчики приходят и уходят ==
+client -> handler : GET /events
+handler -> hub : subscribe()
+note right of hub : первый подписчик запускает\nопросчик (тикер 500 мс)
+client -> handler : отключение
+handler -> hub : unsubscribe()
+hub -> hub : на следующем тике подписчиков нет →\nопросчик остановлен, тикер выключен
+
+== Выход из программы («Выход» в трее) ==
+exit -> srv : Shutdown(ctx, 2 с)
+srv -> srv : RegisterOnShutdown → cancel()\nотменяет BaseContext всех запросов
+srv --> handler : r.Context().Done()
+handler -> hub : unsubscribe()
+handler --> client : поток закрыт
+srv --> exit : Shutdown завершён (без ожидания таймаута)
+exit -> sw : Close()
+note over exit, sw
+  Порядок важен: API останавливается до switcher.Close(),
+  иначе обработчик, обратившийся к закрытому Switcher,
+  повис бы в exec.
+end note
+@enduml

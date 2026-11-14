@@ -1,0 +1,54 @@
+@startuml remote-components
+title Пульт MPC: компоненты телефона и ПК
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+
+node "Телефон (Android 13+)" as phone {
+  component "MainActivity\nRemoteScreen" as screen
+  component "RemoteService\n(foreground, mediaPlayback)" as service
+  component "MediaSession\nмедиауведомление:\nшторка и экран блокировки" as session
+  component "Remote\n(синглтон: StateFlow<UiState>,\nпоток /events, команды)" as remote
+  component "RemoteClient\nHttpURLConnection + SseParser" as client
+  database "SharedPreferences\nадрес ПК" as prefs
+}
+
+node "ПК (Windows)" as pc {
+  component "volume_switch" as vs {
+    component "remoteAPI.handler()\nHTTP :7778 (API_LISTEN)" as api
+    component "statusHub\nобщий опросчик 500 мс\n+ statusChanged" as hub
+    component "mpcClient" as mpc
+    component "Switcher\n(WASAPI/COM)" as sw
+    component "pollVolume →\nоверлей громкости" as overlay
+  }
+  component "MPC-HC\nweb-интерфейс :7777" as mpchc
+  component "Windows Audio\n(устройство по умолчанию)" as audio
+}
+
+screen --> remote : acquire(ui)/release,\nкоманды
+service --> remote : acquire/release,\nreconnect при включении экрана
+remote --> service : StateFlow
+remote --> screen : StateFlow
+service --> session : метаданные,\nPlaybackState
+session --> service : кнопки ⏮ ⏯ ⏭\nтише/громче
+remote --> prefs
+remote --> client
+client ..> api : GET /events (SSE)\nPOST команды\nWi-Fi, HTTP без TLS
+
+api --> hub : subscribe
+hub --> api : события apiStatus
+api --> mpc
+api --> sw
+hub --> mpc : State()
+hub --> sw : CurrentVolume()
+mpc --> mpchc : status.json\ncommand.html?wm_command=N
+sw --> audio
+overlay --> sw : CurrentVolume() каждые 120 мс
+
+note bottom of api
+  Брандмауэр Windows: правило
+  «volume_switch API», TCP 7778,
+  только частная сеть.
+  Авторизации нет.
+end note
+@enduml

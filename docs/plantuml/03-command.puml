@@ -1,0 +1,44 @@
+@startuml remote-command
+title Команда с телефона (на примере паузы)
+
+autonumber
+actor "Пользователь" as user
+participant "RemoteScreen /\nMediaSession" as ui
+participant "Remote" as remote
+participant "RemoteClient" as client
+participant "volume_switch\nremoteAPI" as api
+participant "mpcClient" as mpc
+participant "MPC-HC :7777" as mpchc
+participant "statusHub" as hub
+
+user -> ui : «Пауза» на экране,\nв шторке или на экране блокировки
+ui -> remote : playPause()
+remote -> client : playPause()
+client -> api : POST /playpause
+api -> mpc : TogglePlayback()
+mpc -> mpchc : GET command.html?wm_command=889
+alt MPC-HC не отвечает
+  mpc -> mpc : Launch() — запустить mpc-hc64.exe
+end
+api -> mpchc : GET status.json
+api --> client : 200 {apiStatus}
+client --> remote : Status
+remote --> ui : StateFlow — экран обновился сразу
+
+hub -> mpchc : очередной тик: GET status.json
+hub -> hub : statusChanged: state изменился
+hub --> client : data: {apiStatus} (по SSE)
+note right of hub
+  Так же доходят изменения,
+  сделанные на самом ПК (F5-оверлей,
+  клавиши, мышь в MPC-HC): за ~0,5 с.
+end note
+
+== Другие команды ==
+note over client, api
+  POST /next, /prev — wm_command 920/919 (503, если MPC-HC не запущен)
+  POST /volume/up, /down[?step=N] — системная громкость (на ПК — оверлей громкости)
+  POST /mpc/volume/up, /down — wm_command 907/908
+  Кнопки громкости телефона в открытом приложении → /volume/up|down
+end note
+@enduml

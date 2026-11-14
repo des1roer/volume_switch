@@ -119,9 +119,7 @@ var (
 	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 
 	procShowWindow          = user32.NewProc("ShowWindow")
-	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procMonitorFromPoint    = user32.NewProc("MonitorFromPoint")
-	procMonitorFromWindow   = user32.NewProc("MonitorFromWindow")
 	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procFindWindowW         = user32.NewProc("FindWindowW")
@@ -563,7 +561,7 @@ func formatTime(ms int64) string {
 }
 
 // ---------------------------------------------------------------------------
-// Win32-хелперы: монитор под курсором или под окном и высота заголовка окна
+// Win32-хелперы: основной монитор и высота заголовка окна
 // ---------------------------------------------------------------------------
 
 type winMonitorInfo struct {
@@ -574,37 +572,19 @@ type winMonitorInfo struct {
 }
 
 // screenLayout возвращает рабочую область (без панели задач) и полные границы
-// монитора, на котором сейчас находится курсор мыши.
+// основного монитора Windows. Оверлеи всегда показываются на нём, а не на
+// мониторе под курсором: мышь часто остаётся на другом экране, а громкость
+// меняют с беспроводной клавиатуры.
 func screenLayout() (work, monitor windows.Rect, err error) {
-	var pt struct{ X, Y int32 } // POINT
-	if r, _, errno := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r == 0 {
-		return work, monitor, win32Error("GetCursorPos", errno)
-	}
-
-	ptPacked := uintptr(uint32(pt.X)) | uintptr(uint32(pt.Y))<<32
-	// С MONITOR_DEFAULTTONEAREST MonitorFromPoint всегда возвращает монитор
-	// и ошибок не сообщает.
-	hMonitor, _, _ := procMonitorFromPoint.Call(ptPacked, monitorDefaultToNearest)
+	// Точка (0,0) — левый верхний угол основного монитора, он и есть начало
+	// координат экрана. С MONITOR_DEFAULTTOPRIMARY MonitorFromPoint всегда
+	// возвращает монитор и ошибок не сообщает.
+	hMonitor, _, _ := procMonitorFromPoint.Call(0, monitorDefaultToPrimary)
 	return monitorLayout(hMonitor)
 }
 
-// windowScreenLayout возвращает рабочую область и полные границы монитора,
-// на котором находится окно с заголовком title. Окно может быть скрытым —
-// монитор определяется по его последней позиции.
-func windowScreenLayout(title string) (work, monitor windows.Rect, err error) {
-	hwnd, err := findWindow(title)
-	if err != nil {
-		return work, monitor, err
-	}
-	// Как и MonitorFromPoint, с MONITOR_DEFAULTTONEAREST MonitorFromWindow
-	// всегда возвращает монитор.
-	hMonitor, _, _ := procMonitorFromWindow.Call(hwnd, monitorDefaultToNearest)
-	return monitorLayout(hMonitor)
-}
-
-// monitorDefaultToNearest — MONITOR_DEFAULTTONEAREST для MonitorFromPoint и
-// MonitorFromWindow.
-const monitorDefaultToNearest = 2
+// monitorDefaultToPrimary — MONITOR_DEFAULTTOPRIMARY для MonitorFromPoint.
+const monitorDefaultToPrimary = 1
 
 // monitorLayout возвращает рабочую область и полные границы монитора.
 func monitorLayout(hMonitor uintptr) (work, monitor windows.Rect, err error) {
@@ -1289,7 +1269,7 @@ type progressOverlay struct {
 func newProgressOverlay(a fyne.App, mpc *mpcClient) *progressOverlay {
 	p := &progressOverlay{window: a.NewWindow(windowTitle), mpc: mpc}
 
-	// --- Размер/позиция окна под монитор с курсором ---
+	// --- Размер/позиция окна на основном мониторе ---
 	windowWidth, windowHeight := float32(900), float32(170)
 	posX, posY := 0, 0
 	if work, monitor, err := screenLayout(); err != nil {
@@ -1788,14 +1768,12 @@ func (v *volumeOverlay) layout(width, height float32, level float64, muted bool)
 // меняют, когда активно другое окно (например, MPC-HC во весь экран), а
 // обычное окно фонового процесса Windows оставляет под активным.
 //
-// Монитор — тот же, где окно прогресса MPC-HC (см. overlayScreenLayout), а
-// не монитор под курсором: громкость часто меняют с беспроводной клавиатуры,
-// когда мышь осталась на другом экране (например, на экране с MPC-HC).
+// Монитор — основной монитор Windows (см. screenLayout).
 func (v *volumeOverlay) Show(level float64, muted bool) {
 	fyne.Do(func() {
 		width, height := volumeOverlayWidth, volumeOverlayHeight
 		x, y := 0, 0
-		if work, err := overlayScreenLayout(); err != nil {
+		if work, _, err := screenLayout(); err != nil {
 			log.Printf("volume overlay: не удалось определить монитор, размер по умолчанию: %v", err)
 		} else if work.Right > work.Left {
 			width = float32(work.Right-work.Left) / 2
@@ -1821,19 +1799,6 @@ func (v *volumeOverlay) Show(level float64, muted bool) {
 	v.hideTimer = time.AfterFunc(volumeOverlayDuration, func() {
 		fyne.Do(v.window.Hide)
 	})
-}
-
-// overlayScreenLayout возвращает рабочую область монитора, на котором стоит
-// окно прогресса MPC-HC (его туда ставит newProgressOverlay, пользователь
-// может перетащить), а если окно не найдено — монитора под курсором.
-func overlayScreenLayout() (windows.Rect, error) {
-	work, _, err := windowScreenLayout(windowTitle)
-	if err == nil {
-		return work, nil
-	}
-	log.Printf("volume overlay: монитор окна прогресса не определён, беру монитор под курсором: %v", err)
-	work, _, err = screenLayout()
-	return work, err
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@
 - Меню в трее содержит список всех активных устройств воспроизведения с галочкой на текущем устройстве по умолчанию; клик по любой записи переключает на неё напрямую.
 - Пункт меню «Запускать при входе в Windows» (с галочкой) включает/выключает автозапуск через `HKCU\...\Run`.
 - Всплывающее уведомление при каждом переключении с именем нового устройства.
-- Оверлей-ползунок уровня глобальной громкости в четверть экрана поверх всех окон, не забирая фокус (в левом нижнем углу монитора под курсором), с большим процентом/`MUTE` и шкалой-градацией 0—100 через каждые 10, при любом изменении громкости — клавишами, колесом мыши в системном микшере, аппаратными кнопками или сторонними программами. Изменение детектируется поллингом текущего уровня каждые 120 мс (`Switcher.CurrentVolume`, `pollVolume`), а не перехватом конкретных клавиш, поэтому ловится независимо от источника. Переключение default-устройства (F7/F8, трей, панель задач Windows) оверлей НЕ показывает, даже если у нового устройства другой сохранённый уровень громкости — поллер сравнивает уровень только в рамках одного и того же устройства (по ID). Гаснет сам примерно через 1.2 секунды после последнего изменения.
+- Оверлей-ползунок уровня глобальной громкости в четверть экрана поверх всех окон, не забирая фокус (в левом нижнем углу основного монитора), с большим процентом/`MUTE` и шкалой-градацией 0—100 через каждые 10, при любом изменении громкости — клавишами, колесом мыши в системном микшере, аппаратными кнопками или сторонними программами. Изменение детектируется поллингом текущего уровня каждые 120 мс (`Switcher.CurrentVolume`, `pollVolume`), а не перехватом конкретных клавиш, поэтому ловится независимо от источника. Переключение default-устройства (F7/F8, трей, панель задач Windows) оверлей НЕ показывает, даже если у нового устройства другой сохранённый уровень громкости — поллер сравнивает уровень только в рамках одного и того же устройства (по ID). Гаснет сам примерно через 1.2 секунды после последнего изменения.
 - **F5** показывает/скрывает окно-оверлей поверх всех окон (не забирая фокус), которое опрашивает JSON API веб-интерфейса MPC-HC (`status.json`) и отображает название/прогресс/прошедшее/оставшееся время.
 - Клик средней кнопкой мыши (колесом) по оверлею открывает в проводнике папку с текущим файлом (с выделением самого файла).
 - Клик левой кнопкой по полосе прогресса ставит воспроизведение на паузу/возобновляет его; если MPC-HC не запущен — запускает его (путь берётся из `MPC_EXE`, по умолчанию `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, а если такого файла нет — из `HKCU\Software\MPC-HC\MPC-HC\ExePath`, который MPC-HC пишет сам).
@@ -138,7 +138,7 @@ $off = [BitConverter]::ToInt32($b, 0x3C) + 0x5C
 1. Логирование (`ensureConsole`, `setupLogging`)
 2. Загрузка `.env` и настройки (`dotEnvPaths`, `loadDotEnv`, `config`, `resolveConfig`)
 3. MPC-HC: состояние через JSON API веб-интерфейса, команды и запуск плеера (`mpcClient`, `MPCState`, `mpcEndpoint`)
-4. Хелперы Win32: монитор под курсором и высота заголовка окна (`screenLayout`, `titleBarHeight`)
+4. Хелперы Win32: основной монитор и высота заголовка окна (`screenLayout`, `titleBarHeight`)
 5. Переключение аудиоустройств и шаг громкости через WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
 6. Монитор глобальной громкости поллингом (`Switcher.CurrentVolume`, `pollVolume`)
 7. Всплывающие уведомления (`showNotification` — находит скрытое окно systray и вызывает `Shell_NotifyIconW` напрямую; публичного API systray для этого нет)
@@ -179,7 +179,7 @@ Written for my own use as a Volume² replacement on Windows 11: its overlay and 
 - The tray menu lists all active playback devices with a checkmark on the current default; clicking any entry switches to it directly.
 - The "Запускать при входе в Windows" ("Run at Windows sign-in") menu item, with a checkmark, enables/disables autostart via `HKCU\...\Run`.
 - A balloon notification with the new device name on every switch.
-- A quarter-screen always-on-top master volume slider overlay that doesn't steal focus (in the bottom-left corner of the monitor under the cursor) with a large percentage/`MUTE` and a 0—100 scale marked every 10, shown on any volume change — by hotkeys, the mouse wheel in the system mixer, hardware buttons or third-party programs. Changes are detected by polling the current level every 120 ms (`Switcher.CurrentVolume`, `pollVolume`) rather than by intercepting specific keys, so they are caught regardless of the source. Switching the default device (F7/F8, tray, Windows taskbar) does NOT show the overlay, even if the new device has a different saved volume level — the poller compares levels only within the same device (by ID). It fades out by itself about 1.2 seconds after the last change.
+- A quarter-screen always-on-top master volume slider overlay that doesn't steal focus (in the bottom-left corner of the primary monitor) with a large percentage/`MUTE` and a 0—100 scale marked every 10, shown on any volume change — by hotkeys, the mouse wheel in the system mixer, hardware buttons or third-party programs. Changes are detected by polling the current level every 120 ms (`Switcher.CurrentVolume`, `pollVolume`) rather than by intercepting specific keys, so they are caught regardless of the source. Switching the default device (F7/F8, tray, Windows taskbar) does NOT show the overlay, even if the new device has a different saved volume level — the poller compares levels only within the same device (by ID). It fades out by itself about 1.2 seconds after the last change.
 - **F5** shows/hides an always-on-top overlay window (without stealing focus) that polls the MPC-HC web interface JSON API (`status.json`) and displays the title/progress/elapsed/remaining time.
 - A middle-click (wheel click) on the overlay opens the folder of the current file in Explorer, with the file itself selected.
 - A left click on the progress bar pauses/resumes playback; if MPC-HC is not running, it launches it (the path comes from `MPC_EXE`, by default `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, and if that file doesn't exist — from `HKCU\Software\MPC-HC\MPC-HC\ExePath`, which MPC-HC writes itself).
@@ -301,7 +301,7 @@ This is intentionally a **single-file Go program** (`main.go`, `package main`, n
 1. Logging (`ensureConsole`, `setupLogging`)
 2. `.env` loading and settings (`dotEnvPaths`, `loadDotEnv`, `config`, `resolveConfig`)
 3. MPC-HC: state via the web interface JSON API, commands and launching the player (`mpcClient`, `MPCState`, `mpcEndpoint`)
-4. Win32 helpers: monitor under the cursor and window title bar height (`screenLayout`, `titleBarHeight`)
+4. Win32 helpers: primary monitor and window title bar height (`screenLayout`, `titleBarHeight`)
 5. Audio device switching and volume stepping via WASAPI/COM (`Device`, `Switcher`, `Switcher.StepVolume`)
 6. Master volume monitoring by polling (`Switcher.CurrentVolume`, `pollVolume`)
 7. Balloon notifications (`showNotification` finds the hidden systray window and calls `Shell_NotifyIconW` directly; systray has no public API for this)

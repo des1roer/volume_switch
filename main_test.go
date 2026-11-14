@@ -706,36 +706,14 @@ func TestWin32Error(t *testing.T) {
 func TestScreenLayout(t *testing.T) {
 	work, monitor, err := screenLayout()
 	if err != nil {
-		// Без интерактивного рабочего стола (CI) курсора может не быть.
-		t.Skipf("screenLayout: %v", err)
+		t.Fatalf("screenLayout: %v", err)
 	}
-	if work.Right <= work.Left || monitor.Right <= monitor.Left {
-		t.Errorf("пустые границы: work=%+v monitor=%+v", work, monitor)
-	}
-	if work.Left < monitor.Left || work.Right > monitor.Right {
-		t.Errorf("рабочая область %+v выходит за монитор %+v", work, monitor)
-	}
-}
-
-func TestWindowScreenLayout(t *testing.T) {
-	title := uniqueTitle(t, "monitor")
-	newNativeWindow(t, title, 0)
-
-	// Окно стоит в (0,0) — это всегда основной монитор: его левый верхний
-	// угол и есть начало координат экрана.
-	work, monitor, err := windowScreenLayout(title)
-	if err != nil {
-		t.Fatalf("windowScreenLayout: %v", err)
-	}
+	// Левый верхний угол основного монитора — начало координат экрана.
 	if monitor.Left != 0 || monitor.Top != 0 || monitor.Right <= 0 || monitor.Bottom <= 0 {
 		t.Errorf("не основной монитор: %+v", monitor)
 	}
-	if work.Left < monitor.Left || work.Right > monitor.Right {
+	if work.Right <= work.Left || work.Left < monitor.Left || work.Right > monitor.Right {
 		t.Errorf("рабочая область %+v выходит за монитор %+v", work, monitor)
-	}
-
-	if _, _, err := windowScreenLayout(uniqueTitle(t, "missing")); err == nil {
-		t.Error("нет ошибки для несуществующего окна")
 	}
 }
 

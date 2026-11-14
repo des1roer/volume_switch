@@ -16,7 +16,20 @@ gofmt -l .                                                # должно быт�
 
 - Окружение: Windows, Go 1.27.1 (`go.mod`), cgo нужен (Fyne/GLFW, `-race`) — gcc должен быть в PATH. Bash-инструмент — Git Bash.
 - Программа одноэкземплярная (мьютекс `Local\volume_switch_single_instance`): второй запуск молча выходит. Перед проверкой новой сборки закрыть запущенную (иконка в трее → «Выход»), иначе запустится старая, а `go build -o volume_switch.exe` упадёт с access denied, пока exe занят.
-- Лог — `%LOCALAPPDATA%\volume_switch\volume_switch.log` (`dataDir`); `.env` ищется в рабочем каталоге, рядом с exe и в том же `%LOCALAPPDATA%\volume_switch` (`dotEnvPaths`). Рабочий каталог для лога не годится: при автозапуске это `System32`, у пакетов — каталог пакета.
+- Лог — `%LOCALAPPDATA%\volume_switch\volume_switch.log` (`dataDir`); `.env` ищется в рабочем каталоге, рядом с exe и в том же `%LOCALAPPDATA%\volume_switch` (`dotEnvPaths`). Рабочий каталог для лога не годится: при автозапуске это `System32`, у пакетов — каталог пакета. `.env` не класть в корень репозитория — он не в `.gitignore`.
+
+### Android-пульт (`android/`)
+
+```sh
+cd android
+./gradlew testDebugUnitTest assembleDebug                  # JDK 17, Android SDK: C:\Android\Sdk (local.properties, не в git)
+adb devices -l                                              # adb не в PATH: C:\Android\Sdk\platform-tools\adb.exe
+adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+- Отдельный Gradle-проект (AGP 8.7.3, Gradle 8.9, Kotlin 2.0.21, Compose). Go-часть его не видит: `go vet ./...` и CI его не собирают.
+- Клиент повторяет формат `apiStatus` вручную (`parseStatus` в `RemoteClient.kt`): при изменении JSON API обновить и его, и `RemoteClientTest`.
+- HTTP без TLS в локальную сеть — поэтому в манифесте `usesCleartextTraffic="true"`.
 
 ## Git, PR, релизы
 
@@ -50,6 +63,8 @@ gofmt -l .                                                # должно быт�
 - Устройство может округлять громкость до своих аппаратных шагов (выставили 0.44 — прочитали 0.439453125 = 225/512). Не сравнивать уровни на точное равенство.
 - Push-уведомления громкости WASAPI здесь не работают — поэтому поллинг (README). Не пытаться вернуть push-модель.
 - `showNotification` завязан на внутренности `getlantern/systray` v1.2.2 (класс окна `SystrayClass`, ID иконки 100): при обновлении systray проверить, что баллоны ещё показываются.
+- **HTTP API пульта без авторизации — решение пользователя** (управлять с любого устройства в сети не страшно, важнее гибкость), поэтому он выключен, пока не задан `API_LISTEN`. Не включать его по умолчанию: программа ставится и пакетными менеджерами. Команды — только `POST`; запуск MPC-HC умеет только `/playpause`, `/next`/`/prev` при выключенном плеере отвечают 503.
+- API останавливается в `onExit` (`Shutdown`) до `switcher.Close()`: обработчик, обратившийся к закрытому `Switcher`, повис бы в `exec`.
 
 ## Тесты
 
@@ -74,5 +89,5 @@ gofmt -l .                                                # должно быт�
 Прочее:
 - Циклы опроса (`progressOverlay.Poll`, `pollVolume`) принимают канал тиков — в тестах `ticksN(n)`: цикл делает n итераций и завершается.
 - Гонки: тесты гоняются с `-race` (как в CI). Если UI-код срабатывает по таймеру (скрытие оверлея громкости), в тестовом драйвере он выполняется в горутине таймера — синхронизироваться с ним через канал (см. `hideSpy`), а не через `time.Sleep`.
-- HTTP — через `httptest`.
+- HTTP — через `httptest`. API пульта — `httptest`-запросами к `remoteAPI.handler()`; настоящий слушатель (`startRemoteAPI`, `trayApp.startAPI`) — только на `127.0.0.1:0`: адрес на всех интерфейсах вызвал бы запрос брандмауэра Windows.
 - Логику внутри COM/UI-кода, которую хочется проверить, выносить в чистую функцию (как `wrapIndex`, `volumeChanged`).

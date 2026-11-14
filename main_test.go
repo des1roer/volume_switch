@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image/png"
@@ -78,6 +79,7 @@ func TestMPCState(t *testing.T) {
 	want := MPCState{
 		Position:    61000,
 		Duration:    3600000,
+		State:       mpcStatePlaying,
 		StateString: "Воспроизведение",
 		File:        "movie.mkv",
 		FilePath:    `E:\movies\movie.mkv`,
@@ -369,27 +371,29 @@ func TestDotEnvPaths(t *testing.T) {
 func TestResolveConfig(t *testing.T) {
 	t.Setenv("MPC_URL", "")
 	t.Setenv("MPC_INTERVAL", "")
+	t.Setenv("API_LISTEN", "")
 	want := config{mpcURL: defaultURL, interval: defaultInterval}
-	if got := resolveConfig(false, "", 0); got != want {
+	if got := resolveConfig(false, "", 0, ""); got != want {
 		t.Errorf("умолчания: %+v, want %+v", got, want)
 	}
 
 	t.Setenv("MPC_URL", "http://env:1/")
 	t.Setenv("MPC_INTERVAL", "1s")
-	want = config{debug: true, mpcURL: "http://env:1/", interval: time.Second}
-	if got := resolveConfig(true, "", 0); got != want {
+	t.Setenv("API_LISTEN", ":7778")
+	want = config{debug: true, mpcURL: "http://env:1/", interval: time.Second, apiListen: ":7778"}
+	if got := resolveConfig(true, "", 0, ""); got != want {
 		t.Errorf("из окружения: %+v, want %+v", got, want)
 	}
 
-	want = config{mpcURL: "http://flag:2/", interval: 2 * time.Second}
-	if got := resolveConfig(false, "http://flag:2/", 2*time.Second); got != want {
+	want = config{mpcURL: "http://flag:2/", interval: 2 * time.Second, apiListen: "127.0.0.1:9000"}
+	if got := resolveConfig(false, "http://flag:2/", 2*time.Second, "127.0.0.1:9000"); got != want {
 		t.Errorf("флаги поверх окружения: %+v, want %+v", got, want)
 	}
 
 	// Неразбираемый или неположительный интервал — значение по умолчанию.
 	for _, v := range []string{"abc", "-1s", "0"} {
 		t.Setenv("MPC_INTERVAL", v)
-		if got := resolveConfig(false, "", 0).interval; got != defaultInterval {
+		if got := resolveConfig(false, "", 0, "").interval; got != defaultInterval {
 			t.Errorf("MPC_INTERVAL=%q: %v, want %v", v, got, defaultInterval)
 		}
 	}
@@ -957,7 +961,9 @@ func TestMPCLaunch(t *testing.T) {
 	c := newMPCClient(defaultURL)
 
 	started := fakeStart(t, nil)
-	c.Launch()
+	if err := c.Launch(); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
 	if len(*started) != 1 {
 		t.Fatalf("запущено %d процессов, want 1", len(*started))
 	}
@@ -966,7 +972,9 @@ func TestMPCLaunch(t *testing.T) {
 	}
 
 	fakeStart(t, errors.New("boom"))
-	c.Launch() // ошибка только логируется
+	if err := c.Launch(); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("ошибка запуска: %v", err)
+	}
 }
 
 func TestOpenContainingFolder(t *testing.T) {
@@ -994,14 +1002,15 @@ func TestMPCTogglePlaybackFallbacks(t *testing.T) {
 	started := fakeStart(t, nil)
 	t.Setenv("MPC_EXE", `D:\MPC\mpc-hc64.exe`)
 
-	newMPCClient("").TogglePlayback()
-	if len(*started) != 0 {
-		t.Fatal("без URL ничего запускаться не должно")
+	if launched, err := newMPCClient("").TogglePlayback(); launched || err == nil || len(*started) != 0 {
+		t.Fatalf("без URL: launched=%v err=%v, запущено %d — ничего запускаться не должно", launched, err, len(*started))
 	}
 
 	srv := httptest.NewServer(http.NotFoundHandler())
 	srv.Close()
-	newMPCClient(srv.URL + "/variables.html").TogglePlayback()
+	if launched, err := newMPCClient(srv.URL + "/variables.html").TogglePlayback(); !launched || err != nil {
+		t.Errorf("MPC-HC недоступен: launched=%v err=%v", launched, err)
+	}
 	if len(*started) != 1 || (*started)[0].Path != `D:\MPC\mpc-hc64.exe` {
 		t.Fatalf("MPC-HC недоступен — ожидался запуск MPC-HC, запущено: %v", *started)
 	}
@@ -1010,7 +1019,9 @@ func TestMPCTogglePlaybackFallbacks(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	defer rejected.Close()
-	newMPCClient(rejected.URL + "/variables.html").TogglePlayback()
+	if launched, err := newMPCClient(rejected.URL + "/variables.html").TogglePlayback(); launched || err == nil {
+		t.Errorf("отказ web-интерфейса: launched=%v err=%v", launched, err)
+	}
 	if len(*started) != 1 {
 		t.Error("отказ web-интерфейса не должен запускать MPC-HC")
 	}
@@ -1551,6 +1562,8 @@ type fakeSwitcher struct {
 	cycleDev Device
 	cycleErr error
 	stepErr  error
+	volume   volumeReading
+	volErr   error
 
 	setIDs []string
 	cycles []int
@@ -1572,6 +1585,8 @@ func (s *fakeSwitcher) Cycle(direction int) (Device, error) {
 	s.cycles = append(s.cycles, direction)
 	return s.cycleDev, s.cycleErr
 }
+
+func (s *fakeSwitcher) CurrentVolume() (volumeReading, error) { return s.volume, s.volErr }
 
 func (s *fakeSwitcher) Close() { s.closed = true }
 
@@ -1795,5 +1810,278 @@ func TestKeyHeld(t *testing.T) {
 	const vkF24 = 0x87
 	if keyHeld(vkF24) {
 		t.Error("F24 считается зажатой")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HTTP API пульта
+// ---------------------------------------------------------------------------
+
+// fakeMPCServer — web-интерфейс MPC-HC: отдаёт status.json и пересылает в
+// канал номера пришедших команд.
+func fakeMPCServer(t *testing.T) (*httptest.Server, <-chan string) {
+	t.Helper()
+	commands := make(chan string, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status.json":
+			_, _ = w.Write([]byte(sampleStatusJSON))
+		case "/command.html":
+			commands <- r.URL.Query().Get("wm_command")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, commands
+}
+
+// closedServerURL возвращает адрес, на котором уже никто не слушает, —
+// как web-интерфейс незапущенного MPC-HC.
+func closedServerURL() string {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	return srv.URL
+}
+
+func callAPI(h http.Handler, method, target string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(method, target, nil))
+	return rec
+}
+
+func decodeStatus(t *testing.T, rec *httptest.ResponseRecorder) apiStatus {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", rec.Code, rec.Body)
+	}
+	var st apiStatus
+	if err := json.NewDecoder(rec.Body).Decode(&st); err != nil {
+		t.Fatalf("разбор ответа: %v", err)
+	}
+	return st
+}
+
+func TestMPCStateName(t *testing.T) {
+	tests := []struct {
+		st   MPCState
+		want string
+	}{
+		{MPCState{File: "a.mkv", State: mpcStatePlaying}, "playing"},
+		{MPCState{File: "a.mkv", State: mpcStatePaused}, "paused"},
+		{MPCState{File: "a.mkv", State: mpcStateStopped}, "stopped"},
+		{MPCState{File: "a.mkv", State: -1}, "none"},
+		{MPCState{State: mpcStatePlaying}, "none"},
+	}
+	for _, tt := range tests {
+		if got := mpcStateName(&tt.st); got != tt.want {
+			t.Errorf("mpcStateName(%+v) = %q, want %q", tt.st, got, tt.want)
+		}
+	}
+}
+
+func TestRemoteAPIStatus(t *testing.T) {
+	srv, _ := fakeMPCServer(t)
+	sw := &fakeSwitcher{volume: volumeReading{Level: 0.419999, Muted: true}}
+	h := (&remoteAPI{mpc: newMPCClient(srv.URL), audio: sw}).handler()
+
+	rec := callAPI(h, http.MethodGet, "/status")
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q", got)
+	}
+	st := decodeStatus(t, rec)
+	wantMPC := apiMPC{
+		Online:      true,
+		File:        "movie.mkv",
+		State:       "playing",
+		StateText:   "Воспроизведение",
+		PositionMs:  61000,
+		DurationMs:  3600000,
+		RemainingMs: 3539000,
+	}
+	if st.Version != version || st.MPC != wantMPC {
+		t.Errorf("version=%q mpc=%+v\nwant mpc=%+v", st.Version, st.MPC, wantMPC)
+	}
+	if st.Volume == nil || *st.Volume != (apiVolume{Percent: 42, Muted: true}) || st.VolumeError != "" {
+		t.Errorf("volume=%+v volume_error=%q", st.Volume, st.VolumeError)
+	}
+
+	// MPC-HC не запущен, аудио не инициализировано.
+	h = (&remoteAPI{mpc: newMPCClient(closedServerURL())}).handler()
+	st = decodeStatus(t, callAPI(h, http.MethodGet, "/status"))
+	if st.MPC.Online || st.MPC.State != "none" || st.MPC.Error == "" {
+		t.Errorf("MPC-HC не запущен: %+v", st.MPC)
+	}
+	if st.Volume != nil || st.VolumeError != errNoAudio.Error() {
+		t.Errorf("без аудио: volume=%+v volume_error=%q", st.Volume, st.VolumeError)
+	}
+
+	h = (&remoteAPI{mpc: newMPCClient(srv.URL), audio: &fakeSwitcher{volErr: errors.New("COM")}}).handler()
+	st = decodeStatus(t, callAPI(h, http.MethodGet, "/status"))
+	if st.Volume != nil || st.VolumeError != "COM" {
+		t.Errorf("ошибка чтения громкости: volume=%+v volume_error=%q", st.Volume, st.VolumeError)
+	}
+}
+
+func TestRemoteAPIMPCCommands(t *testing.T) {
+	srv, commands := fakeMPCServer(t)
+	h := (&remoteAPI{mpc: newMPCClient(srv.URL), audio: &fakeSwitcher{}}).handler()
+
+	for _, tt := range []struct{ path, command string }{
+		{"/playpause", "889"},
+		{"/next", "920"},
+		{"/prev", "919"},
+	} {
+		st := decodeStatus(t, callAPI(h, http.MethodPost, tt.path))
+		if got := <-commands; got != tt.command {
+			t.Errorf("POST %s: команда %s, want %s", tt.path, got, tt.command)
+		}
+		if !st.MPC.Online {
+			t.Errorf("POST %s: в ответе нет состояния MPC-HC: %+v", tt.path, st)
+		}
+	}
+
+	// Команды меняют состояние — только POST.
+	if rec := callAPI(h, http.MethodGet, "/next"); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /next: HTTP %d, want 405", rec.Code)
+	}
+	if len(commands) != 0 {
+		t.Error("GET /next отправил команду в MPC-HC")
+	}
+}
+
+func TestRemoteAPIMPCErrors(t *testing.T) {
+	started := fakeStart(t, nil)
+	t.Setenv("MPC_EXE", `D:\MPC\mpc-hc64.exe`)
+
+	// MPC-HC не запущен: «следующий файл» некуда отправить, а play/pause
+	// запускает плеер, как клик по оверлею.
+	h := (&remoteAPI{mpc: newMPCClient(closedServerURL())}).handler()
+	if rec := callAPI(h, http.MethodPost, "/next"); rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Errorf("POST /next без MPC-HC: HTTP %d %s, want 503", rec.Code, rec.Body)
+	}
+	if len(*started) != 0 {
+		t.Fatal("POST /next не должен запускать MPC-HC")
+	}
+	if rec := callAPI(h, http.MethodPost, "/playpause"); rec.Code != http.StatusOK || len(*started) != 1 {
+		t.Errorf("POST /playpause без MPC-HC: HTTP %d, запущено %d, want запуск", rec.Code, len(*started))
+	}
+
+	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer rejected.Close()
+	h = (&remoteAPI{mpc: newMPCClient(rejected.URL)}).handler()
+	for _, path := range []string{"/next", "/playpause"} {
+		if rec := callAPI(h, http.MethodPost, path); rec.Code != http.StatusBadGateway {
+			t.Errorf("POST %s при отказе MPC-HC: HTTP %d, want 502", path, rec.Code)
+		}
+	}
+}
+
+func TestRemoteAPIVolume(t *testing.T) {
+	srv, _ := fakeMPCServer(t)
+	sw := &fakeSwitcher{volume: volumeReading{Level: 0.5}}
+	h := (&remoteAPI{mpc: newMPCClient(srv.URL), audio: sw}).handler()
+
+	st := decodeStatus(t, callAPI(h, http.MethodPost, "/volume/up"))
+	if st.Volume == nil || st.Volume.Percent != 50 {
+		t.Errorf("в ответе нет громкости: %+v", st.Volume)
+	}
+	decodeStatus(t, callAPI(h, http.MethodPost, "/volume/down?step=5"))
+	if fmt.Sprint(sw.steps) != "[0.02 -0.05]" {
+		t.Errorf("StepVolume вызван с %v", sw.steps)
+	}
+
+	for _, step := range []string{"0", "101", "abc", "-2"} {
+		if rec := callAPI(h, http.MethodPost, "/volume/up?step="+step); rec.Code != http.StatusBadRequest {
+			t.Errorf("step=%s: HTTP %d, want 400", step, rec.Code)
+		}
+	}
+	if len(sw.steps) != 2 {
+		t.Errorf("неверный шаг всё-таки изменил громкость: %v", sw.steps)
+	}
+
+	sw.stepErr = errors.New("COM")
+	if rec := callAPI(h, http.MethodPost, "/volume/up"); rec.Code != http.StatusBadGateway {
+		t.Errorf("ошибка StepVolume: HTTP %d, want 502", rec.Code)
+	}
+
+	h = (&remoteAPI{mpc: newMPCClient(srv.URL)}).handler()
+	if rec := callAPI(h, http.MethodPost, "/volume/down"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("без аудио: HTTP %d, want 503", rec.Code)
+	}
+}
+
+func TestStartRemoteAPI(t *testing.T) {
+	mpc, _ := fakeMPCServer(t)
+	h := (&remoteAPI{mpc: newMPCClient(mpc.URL)}).handler()
+
+	// Только loopback: тест не открывает порт в сеть и не вызывает запрос
+	// брандмауэра.
+	srv, err := startRemoteAPI("127.0.0.1:0", h)
+	if err != nil {
+		t.Fatalf("startRemoteAPI: %v", err)
+	}
+	resp, err := http.Get("http://" + srv.Addr + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /status: %s", resp.Status)
+	}
+
+	if _, err := startRemoteAPI(srv.Addr, h); err == nil {
+		t.Error("порт уже занят: ожидалась ошибка")
+	}
+
+	if err := srv.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if _, err := http.Get("http://" + srv.Addr + "/status"); err == nil {
+		t.Error("после Shutdown API всё ещё отвечает")
+	}
+}
+
+func TestTrayAppStartAPI(t *testing.T) {
+	mpc, _ := fakeMPCServer(t)
+	ui := setupUI(t, mpc.URL)
+
+	off := &trayApp{ui: ui}
+	off.startAPI()
+	if off.api != nil {
+		t.Fatal("без API_LISTEN API запускаться не должен")
+	}
+
+	bad := &trayApp{ui: ui, apiListen: "no-port"}
+	bad.startAPI()
+	if bad.api != nil {
+		t.Fatal("неверный адрес: API не должен запуститься")
+	}
+
+	sw := &fakeSwitcher{volume: volumeReading{Level: 0.3}}
+	a := &trayApp{ui: ui, apiListen: "127.0.0.1:0", switcher: sw}
+	a.startAPI()
+	if a.api == nil {
+		t.Fatal("API не запущен")
+	}
+	resp, err := http.Get("http://" + a.api.Addr + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	var st apiStatus
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	_ = resp.Body.Close()
+	if err != nil || st.Volume == nil || st.Volume.Percent != 30 {
+		t.Errorf("ответ: %+v, err=%v", st, err)
+	}
+
+	a.onExit()
+	if _, err := http.Get("http://" + a.api.Addr + "/status"); err == nil {
+		t.Error("после onExit API всё ещё отвечает")
+	}
+	if !sw.closed {
+		t.Error("switcher не закрыт")
 	}
 }

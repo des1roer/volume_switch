@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -317,16 +319,22 @@ func loadDotEnv(path string) {
 
 // config — итоговые настройки программы.
 type config struct {
-	debug    bool
-	mpcURL   string        // адрес web-интерфейса MPC-HC
-	interval time.Duration // интервал опроса MPC-HC для оверлея
+	debug     bool
+	mpcURL    string        // адрес web-интерфейса MPC-HC
+	interval  time.Duration // интервал опроса MPC-HC для оверлея
+	apiListen string        // адрес HTTP API пульта (например ":7778"); "" — API выключен
 }
 
 // resolveConfig собирает настройки по приоритету: флаги, затем окружение (к
 // этому моменту в нём уже и значения из .env), затем умолчания. Пустой флаг
-// (urlFlag == "", intervalFlag <= 0) означает «не задан».
-func resolveConfig(debug bool, urlFlag string, intervalFlag time.Duration) config {
+// (urlFlag == "", intervalFlag <= 0, apiFlag == "") означает «не задан».
+func resolveConfig(debug bool, urlFlag string, intervalFlag time.Duration, apiFlag string) config {
 	cfg := config{debug: debug, mpcURL: defaultURL, interval: defaultInterval}
+
+	cfg.apiListen = os.Getenv("API_LISTEN")
+	if apiFlag != "" {
+		cfg.apiListen = apiFlag
+	}
 
 	if v := os.Getenv("MPC_URL"); v != "" {
 		cfg.mpcURL = v
@@ -354,11 +362,12 @@ func resolveConfig(debug bool, urlFlag string, intervalFlag time.Duration) confi
 // ---------------------------------------------------------------------------
 
 // MPCState — ответ /status.json web-интерфейса MPC-HC. Из JSON берутся только
-// поля, нужные оверлею; позиция и длительность — в миллисекундах. Без
-// открытого файла MPC-HC отдаёт пустые строки и нули.
+// поля, нужные оверлею и пульту; позиция и длительность — в миллисекундах.
+// Без открытого файла MPC-HC отдаёт пустые строки и нули.
 type MPCState struct {
 	File        string `json:"file"`
 	FilePath    string `json:"path"`
+	State       int    `json:"state"` // mpcStatePlaying и т.д.
 	StateString string `json:"stateString"`
 	Position    int64  `json:"position"`
 	Duration    int64  `json:"duration"`
@@ -443,10 +452,25 @@ func (c *mpcClient) State() (_ *MPCState, err error) {
 	return &st, nil
 }
 
-// mpcPlayPauseCommand — WM_COMMAND ID пункта «Play/Pause» в MPC-HC
-// (ID_PLAY_PLAYPAUSE). Соседние команды: 887 Play, 888 Pause, 890 Stop — те
-// же номера принимает web-интерфейс в command.html.
-const mpcPlayPauseCommand = 889
+// WM_COMMAND ID пунктов меню MPC-HC — те же номера принимает web-интерфейс в
+// command.html (их список с названиями — на его странице index.html).
+// Соседние с Play/Pause команды: 887 Play, 888 Pause, 890 Stop.
+const (
+	mpcPlayPauseCommand = 889 // ID_PLAY_PLAYPAUSE
+	mpcNextFileCommand  = 920 // «Следующий файл» — следующий в плейлисте/папке
+	mpcPrevFileCommand  = 919 // «Предыдущий файл»
+)
+
+// Значения поля state в status.json.
+const (
+	mpcStateStopped = 0
+	mpcStatePaused  = 1
+	mpcStatePlaying = 2
+)
+
+// errMPCOffline — web-интерфейс MPC-HC не ответил вовсе (обычно плеер не
+// запущен), в отличие от ответа с ошибкой.
+var errMPCOffline = errors.New("MPC-HC не отвечает")
 
 // mpcCommandURL строит URL команды web-интерфейса MPC-HC (command.html, номер
 // команды — параметром wm_command) из адреса MPC_URL, см. mpcEndpoint.
@@ -456,38 +480,51 @@ func mpcCommandURL(baseURL string, command int) string {
 	return mpcEndpoint(baseURL, fmt.Sprintf("command.html?wm_command=%d", command))
 }
 
+// Command отправляет в web-интерфейс MPC-HC команду с номером command (см.
+// mpcPlayPauseCommand и соседние). Если web-интерфейс не ответил, ошибка
+// оборачивает errMPCOffline.
+func (c *mpcClient) Command(command int) (err error) {
+	cmdURL := mpcCommandURL(c.baseURL, command)
+	if cmdURL == "" {
+		return fmt.Errorf("некорректный адрес web-интерфейса %q", c.baseURL)
+	}
+
+	resp, err := c.http.Get(cmdURL)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errMPCOffline, err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("закрытие ответа: %w", cerr)
+		}
+	}()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return fmt.Errorf("чтение ответа: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("команда %d отклонена: HTTP %s", command, resp.Status)
+	}
+	log.Printf("mpc command: %d -> %s (%s)", command, cmdURL, resp.Status)
+	return nil
+}
+
 // TogglePlayback отправляет в web-интерфейс MPC-HC команду «Play/Pause»,
 // то есть ставит воспроизведение на паузу либо возобновляет его — в
 // зависимости от текущего состояния плеера. Состояние заранее не
 // запрашивается: команда сама по себе переключающая, а лишний опрос добавил
 // бы только гонку между чтением состояния и его изменением. Если
-// web-интерфейс не отвечает (MPC-HC не запущен), запускает MPC-HC.
-func (c *mpcClient) TogglePlayback() {
-	cmdURL := mpcCommandURL(c.baseURL, mpcPlayPauseCommand)
-	if cmdURL == "" {
-		log.Printf("mpc command: адрес web-интерфейса неизвестен, команда не отправлена")
-		return
+// web-интерфейс не отвечает (MPC-HC не запущен), запускает MPC-HC и
+// возвращает launched=true.
+func (c *mpcClient) TogglePlayback() (launched bool, err error) {
+	err = c.Command(mpcPlayPauseCommand)
+	switch {
+	case errors.Is(err, errMPCOffline):
+		log.Printf("mpc command: play/pause: %v — запускаю MPC-HC", err)
+		return true, c.Launch()
+	case err != nil:
+		log.Printf("mpc command: play/pause: %v", err)
 	}
-
-	resp, err := c.http.Get(cmdURL)
-	if err != nil {
-		log.Printf("mpc command: не удалось отправить %s: %v — запускаю MPC-HC", cmdURL, err)
-		c.Launch()
-		return
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Printf("mpc command: закрытие ответа: %v", err)
-		}
-	}()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		log.Printf("mpc command: чтение ответа: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("mpc command: play/pause -> %s отклонена: %s", cmdURL, resp.Status)
-		return
-	}
-	log.Printf("mpc command: play/pause -> %s (%s)", cmdURL, resp.Status)
+	return false, err
 }
 
 // Где по умолчанию искать MPC-HC (см. mpcClient.exePath).
@@ -537,15 +574,16 @@ func (c *mpcClient) exeFromRegistry() string {
 // Launch запускает MPC-HC. Повторный запуск при уже открытом плеере
 // безвреден: MPC-HC по умолчанию работает в режиме одного экземпляра и просто
 // выводит своё окно на передний план.
-func (c *mpcClient) Launch() {
+func (c *mpcClient) Launch() error {
 	exe := c.exePath()
 	cmd := exec.Command(exe)
 	cmd.Dir = filepath.Dir(exe)
 	if err := startDetached(cmd); err != nil {
 		log.Printf("mpc launch: не удалось запустить %s: %v", exe, err)
-		return
+		return fmt.Errorf("запуск %s: %w", exe, err)
 	}
 	log.Printf("mpc launch: запущен %s", exe)
+	return nil
 }
 
 func formatTime(ms int64) string {
@@ -1926,12 +1964,14 @@ func (a autostart) Set(enable bool) (err error) {
 // systray + аудиоустройства
 // ---------------------------------------------------------------------------
 
-// deviceSwitcher — то, что меню трея и хоткеи используют от *Switcher;
-// интерфейс нужен, чтобы их можно было проверить без COM и аудиоустройств.
+// deviceSwitcher — то, что меню трея, хоткеи и HTTP API используют от
+// *Switcher; интерфейс нужен, чтобы их можно было проверить без COM и
+// аудиоустройств.
 type deviceSwitcher interface {
 	SetDefault(id string) error
 	Cycle(direction int) (Device, error)
 	StepVolume(delta float64) error
+	CurrentVolume() (volumeReading, error)
 	Close()
 }
 
@@ -1989,6 +2029,7 @@ func main() {
 	debug := flag.Bool("debug", false, "Показывать консоль с дебаг-логами")
 	urlFlag := flag.String("url", "", "адрес web-интерфейса MPC-HC (перекрывает MPC_URL)")
 	intervalFlag := flag.Duration("interval", 0, "Интервал опроса (перекрывает MPC_INTERVAL)")
+	apiFlag := flag.String("api", "", "адрес HTTP API пульта, например :7778 (перекрывает API_LISTEN)")
 	flag.Parse()
 
 	closeLog := setupLogging(*debug)
@@ -2009,8 +2050,8 @@ func main() {
 	for _, path := range dotEnvPaths() {
 		loadDotEnv(path)
 	}
-	cfg := resolveConfig(*debug, *urlFlag, *intervalFlag)
-	log.Printf("config: url=%s interval=%s debug=%v", cfg.mpcURL, cfg.interval, cfg.debug)
+	cfg := resolveConfig(*debug, *urlFlag, *intervalFlag, *apiFlag)
+	log.Printf("config: url=%s interval=%s api=%q debug=%v", cfg.mpcURL, cfg.interval, cfg.apiListen, cfg.debug)
 
 	// Fyne 2.8+ требует, чтобы app.New/NewWindow/Run вызывались на горутине main()
 	// (см. https://docs.fyne.io/started/goroutines) — именно она закреплена за
@@ -2020,7 +2061,7 @@ func main() {
 	// всегда находят готовые окна.
 	runtime.LockOSThread()
 	ui := newOverlays(app.New(), newMPCClient(cfg.mpcURL))
-	tray := &trayApp{debug: cfg.debug, ui: ui}
+	tray := &trayApp{debug: cfg.debug, ui: ui, apiListen: cfg.apiListen}
 	go func() {
 		runtime.LockOSThread()
 		log.Printf("systray: запуск")
@@ -2037,11 +2078,13 @@ func main() {
 // switcher и hotkeys выставляются в onReady до того, как запускаются
 // горутины меню и хук клавиатуры, которые их читают, поэтому без мьютекса.
 type trayApp struct {
-	debug bool
-	ui    *overlays
+	debug     bool
+	ui        *overlays
+	apiListen string // адрес HTTP API пульта; "" — API выключен
 
 	switcher deviceSwitcher // nil, если аудио не инициализировалось
 	hotkeys  *hotkeyHook    // nil, если хук не установлен
+	api      *http.Server   // nil, если API выключен или не запустился
 	devices  deviceMenu
 }
 
@@ -2063,6 +2106,7 @@ func (a *trayApp) onReady() {
 	if err != nil {
 		log.Printf("audio: ошибка инициализации: %v", err)
 		systray.SetTooltip("Volume Switch: audio init failed")
+		a.startAPI()
 		return
 	}
 	a.switcher = sw
@@ -2074,6 +2118,7 @@ func (a *trayApp) onReady() {
 	a.addAutostartItem(autostart{key: autostartRunKey})
 	a.addQuitItem()
 	a.startHotkeys()
+	a.startAPI()
 
 	// Колбэк вызывается из горутины поллера; вся работа с UI внутри Show
 	// идёт через fyne.Do.
@@ -2088,6 +2133,17 @@ func (a *trayApp) onExit() {
 		} else {
 			log.Printf("onExit: хук снят")
 		}
+	}
+	// API останавливается до закрытия switcher: обработчики запросов к нему
+	// обращаются.
+	if a.api != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), apiShutdownTimeout)
+		if err := a.api.Shutdown(ctx); err != nil {
+			log.Printf("onExit: остановка API: %v", err)
+		} else {
+			log.Printf("onExit: API остановлен")
+		}
+		cancel()
 	}
 	if a.ui != nil {
 		a.ui.Quit()
@@ -2183,6 +2239,22 @@ func (a *trayApp) startHotkeys() {
 	}
 	a.hotkeys = hk
 	log.Printf("hotkey: хук установлен (F2/F3/F5/F7/F8, Ctrl+F2 — вкл/выкл)")
+}
+
+// startAPI запускает HTTP API пульта, если он включён (API_LISTEN или -api).
+// Вызывается после создания switcher: API читает его без мьютекса.
+func (a *trayApp) startAPI() {
+	if a.apiListen == "" {
+		log.Printf("api: выключен (API_LISTEN не задан)")
+		return
+	}
+	api := &remoteAPI{mpc: a.ui.progress.mpc, audio: a.switcher}
+	srv, err := startRemoteAPI(a.apiListen, api.handler())
+	if err != nil {
+		log.Printf("api: не удалось запустить на %s: %v", a.apiListen, err)
+		return
+	}
+	a.api = srv
 }
 
 // selectDevice делает dev устройством по умолчанию (клик по пункту меню).
@@ -2493,4 +2565,198 @@ func (h *hotkeyHook) proc(nCode int, wParam uintptr, kb *kbdllHookStruct) uintpt
 	}
 	r, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(unsafe.Pointer(kb)))
 	return r
+}
+
+// ---------------------------------------------------------------------------
+// HTTP API пульта (приложение на телефоне в локальной сети)
+// ---------------------------------------------------------------------------
+
+const apiShutdownTimeout = 2 * time.Second
+
+// remoteAPI — HTTP API пульта: состояние MPC-HC и системной громкости,
+// play/pause, следующий/предыдущий файл и шаг громкости. Авторизации и
+// ограничений по источнику нет — управлять плеером с любого устройства в
+// локальной сети задумано, поэтому API выключен, пока не задан API_LISTEN.
+//
+//	GET  /status                     состояние (apiStatus)
+//	POST /playpause                  как клик по оверлею: Play/Pause, а если MPC-HC не запущен — запуск
+//	POST /next, /prev                следующий/предыдущий файл в MPC-HC
+//	POST /volume/up, /volume/down    системная громкость, как F3/F2; ?step=N — шаг в процентах
+//
+// Команды отвечают тем же apiStatus, что и /status (сразу после команды
+// MPC-HC может ещё не успеть сменить состояние), ошибки — {"error": "..."}.
+type remoteAPI struct {
+	mpc   *mpcClient
+	audio deviceSwitcher // nil, если аудио не инициализировалось
+}
+
+type apiStatus struct {
+	Version     string     `json:"version"`
+	MPC         apiMPC     `json:"mpc"`
+	Volume      *apiVolume `json:"volume"` // nil, если громкость не прочиталась
+	VolumeError string     `json:"volume_error,omitempty"`
+}
+
+type apiMPC struct {
+	Online      bool   `json:"online"` // web-интерфейс MPC-HC ответил
+	Error       string `json:"error,omitempty"`
+	File        string `json:"file"`
+	State       string `json:"state"`      // playing, paused, stopped или none (файл не открыт)
+	StateText   string `json:"state_text"` // как его пишет сам MPC-HC, на языке его интерфейса
+	PositionMs  int64  `json:"position_ms"`
+	DurationMs  int64  `json:"duration_ms"`
+	RemainingMs int64  `json:"remaining_ms"`
+}
+
+type apiVolume struct {
+	Percent int  `json:"percent"`
+	Muted   bool `json:"muted"`
+}
+
+// mpcStateName переводит state из status.json в значение apiMPC.State.
+func mpcStateName(st *MPCState) string {
+	if st.File == "" {
+		return "none"
+	}
+	switch st.State {
+	case mpcStatePlaying:
+		return "playing"
+	case mpcStatePaused:
+		return "paused"
+	case mpcStateStopped:
+		return "stopped"
+	}
+	return "none"
+}
+
+func (api *remoteAPI) status() apiStatus {
+	s := apiStatus{Version: version}
+
+	if st, err := api.mpc.State(); err != nil {
+		s.MPC = apiMPC{State: "none", Error: err.Error()}
+	} else {
+		s.MPC = apiMPC{
+			Online:      true,
+			File:        st.File,
+			State:       mpcStateName(st),
+			StateText:   st.StateString,
+			PositionMs:  st.Position,
+			DurationMs:  st.Duration,
+			RemainingMs: max(st.Duration-st.Position, 0),
+		}
+	}
+
+	if api.audio == nil {
+		s.VolumeError = errNoAudio.Error()
+	} else if v, err := api.audio.CurrentVolume(); err != nil {
+		s.VolumeError = err.Error()
+	} else {
+		s.Volume = &apiVolume{Percent: int(math.Round(v.Level * 100)), Muted: v.Muted}
+	}
+	return s
+}
+
+var errNoAudio = errors.New("аудио не инициализировано")
+
+func (api *remoteAPI) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, api.status())
+	})
+	mux.HandleFunc("POST /playpause", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := api.mpc.TogglePlayback(); err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, api.status())
+	})
+	mux.HandleFunc("POST /next", api.mpcCommand(mpcNextFileCommand))
+	mux.HandleFunc("POST /prev", api.mpcCommand(mpcPrevFileCommand))
+	mux.HandleFunc("POST /volume/up", api.stepVolume(1))
+	mux.HandleFunc("POST /volume/down", api.stepVolume(-1))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Опрос /status идёт раз в секунду и в лог не пишется.
+		if r.Method != http.MethodGet {
+			log.Printf("api: %s %s от %s", r.Method, r.URL.RequestURI(), r.RemoteAddr)
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// mpcCommand отправляет в MPC-HC команду command; если плеер не отвечает —
+// 503, а не запуск: запускает его только /playpause.
+func (api *remoteAPI) mpcCommand(command int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if err := api.mpc.Command(command); err != nil {
+			status := http.StatusBadGateway
+			if errors.Is(err, errMPCOffline) {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, api.status())
+	}
+}
+
+// stepVolume меняет системную громкость на шаг ?step=N процентов (по
+// умолчанию — как F2/F3) в направлении sign; оверлей громкости на ПК
+// поднимет pollVolume.
+func (api *remoteAPI) stepVolume(sign float64) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if api.audio == nil {
+			writeError(w, http.StatusServiceUnavailable, errNoAudio)
+			return
+		}
+		step := volumeKeyStep
+		if v := r.URL.Query().Get("step"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 100 {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("step=%q: нужно целое число процентов от 1 до 100", v))
+				return
+			}
+			step = float64(n) / 100
+		}
+		if err := api.audio.StepVolume(sign * step); err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, api.status())
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		log.Printf("api: запись ответа: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	log.Printf("api: ошибка %d: %v", status, err)
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+// startRemoteAPI начинает слушать addr и обслуживает запросы в отдельной
+// горутине. Ошибка занятого порта возвращается сразу; остановка — через
+// Shutdown у возвращённого сервера, в его Addr — фактический адрес (с
+// портом, если в addr был :0).
+func startRemoteAPI(addr string, h http.Handler) (*http.Server, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	srv := &http.Server{Addr: ln.Addr().String(), Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("api: сервер остановился: %v", err)
+		}
+	}()
+	log.Printf("api: слушает http://%s", ln.Addr())
+	return srv, nil
 }

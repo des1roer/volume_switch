@@ -2561,6 +2561,7 @@ const (
 //
 //	GET  /status                     состояние (apiStatus)
 //	GET  /events                     поток SSE: apiStatus сразу и затем при каждом значимом изменении (statusChanged)
+//	GET  /media[?file=имя]           файл, открытый сейчас в MPC-HC, с поддержкой Range — для просмотра на планшете
 //	POST /playpause                  как клик по оверлею: Play/Pause, а если MPC-HC не запущен — запуск
 //	POST /next, /prev                следующий/предыдущий файл в MPC-HC
 //	POST /volume/up, /volume/down    системная громкость, как F3/F2; ?step=N — шаг в процентах
@@ -2667,6 +2668,7 @@ func (api *remoteAPI) handler() http.Handler {
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		api.events(w, r, hub)
 	})
+	mux.HandleFunc("GET /media", api.media)
 	mux.HandleFunc("POST /playpause", func(w http.ResponseWriter, _ *http.Request) {
 		if _, err := api.mpc.TogglePlayback(); err != nil {
 			writeError(w, http.StatusBadGateway, err)
@@ -2690,6 +2692,49 @@ func (api *remoteAPI) handler() http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		mux.ServeHTTP(w, r)
 	})
+}
+
+// media отдаёт файл, который сейчас открыт в MPC-HC (GET /media), — чтобы
+// смотреть его параллельно на планшете. Перемотка — HTTP Range
+// (http.ServeContent). Отдаётся только текущий файл плеера: путь берётся из
+// status.json, от клиента пути не принимаются. ?file=имя защищает от гонки
+// со сменой серии: если в MPC-HC уже другой файл — 409, и клиент
+// переоткрывает поток по свежему состоянию.
+func (api *remoteAPI) media(w http.ResponseWriter, r *http.Request) {
+	st, err := api.mpc.State()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	if st.FilePath == "" {
+		writeError(w, http.StatusNotFound, errors.New("в MPC-HC не открыт файл"))
+		return
+	}
+	if want := r.URL.Query().Get("file"); want != "" && want != st.File {
+		writeError(w, http.StatusConflict, fmt.Errorf("в MPC-HC открыт другой файл: %q", st.File))
+		return
+	}
+	f, err := os.Open(st.FilePath)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err)
+		return
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Printf("api: /media: закрытие %s: %v", st.FilePath, err)
+		}
+	}()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	log.Printf("api: /media: %s (Range %q) → %s", st.File, r.Header.Get("Range"), r.RemoteAddr)
+	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 }
 
 // mpcCommand отправляет в MPC-HC команду command; если плеер не отвечает —

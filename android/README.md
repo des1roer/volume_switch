@@ -10,9 +10,10 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 - Крупно — сколько осталось до конца файла, ниже полоса прогресса с прошедшим временем и длительностью.
 - «Предыдущая»/«Следующая» — соседний файл в MPC-HC (серия); кнопки неактивны, пока плеер выключен.
 - Громкость ПК и собственная громкость MPC-HC: кнопки −/+ и текущий уровень (`MUTE` при выключенном звуке).
-- Кнопки громкости телефона в открытом приложении меняют громкость ПК, а не телефона.
+- Настройка «Кнопки громкости управляют ПК» (на телефоне по умолчанию включена, на планшете — выключена, `smallestScreenWidthDp ≥ 600`). Включена — кнопки громкости в приложении, в шторке и на экране блокировки меняют громкость ПК (медиасессия объявляет удалённую громкость, `setPlaybackToRemote`). Выключена — они меняют громкость самого устройства (`setPlaybackToLocal`). Кнопки «тише/громче (ПК)» в уведомлении управляют ПК всегда.
 - Медиауведомление (в шторке и на экране блокировки): название файла, сколько осталось (в минутах, обновляется раз в минуту и только при включённом экране), громкость ПК, кнопки пауза/старт, предыдущая/следующая и тише/громче ПК. Им управляет foreground-сервис `RemoteService` с `MediaSession`; громкость сессии объявлена удалённой (`setPlaybackToRemote`) и привязана к громкости ПК.
 - Сервис останавливается сам, если MPC-HC 30 минут ничего не воспроизводит; при следующем открытии приложения запускается снова.
+- «Смотреть на этом устройстве» (`PlayerActivity`, Media3/ExoPlayer): тот же файл, что открыт в MPC-HC, проигрывается на планшете или телефоне синхронно с ПК — файл берётся с ПК по `GET /media` без перекодирования, позиция/пауза/серия — из потока `/events`. Расхождение больше 1,5 с исправляется перемоткой, меньшее — скоростью 0,95–1,05× (`syncAction`). Звук на устройстве по умолчанию выключен (кнопка «Звук на планшете»), экран не гаснет, ориентация — альбомная.
 
 ## Требования
 
@@ -52,7 +53,11 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote 
 
 Debug и release подписаны разными ключами: чтобы сменить одну на другую, приложение сначала удаляют (`adb uninstall com.des1roer.volumeremote`). Потеря релизного ключа означает то же самое для следующих обновлений. Debug-сборка — `./gradlew assembleDebug`, APK в `app/build/outputs/apk/debug/`. `adb` лежит в `platform-tools` Android SDK.
 
-Стек: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, динамические цвета), без сторонних HTTP/JSON-библиотек — `HttpURLConnection` и `org.json`.
+Стек: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, динамические цвета), Media3/ExoPlayer 1.5.0, без сторонних HTTP/JSON-библиотек — `HttpURLConnection` и `org.json`.
+
+**Звук AC3/E-AC3 и лицензия.** У многих Android-устройств (например, POCO Pad) нет декодера Dolby Digital/Digital Plus, а в WEB-DL-релизах звук почти всегда такой. Поэтому плеер подключает программный декодер FFmpeg — готовую сборку `org.jellyfin.media3:media3-ffmpeg-decoder` (используется, только если системного декодера нет, `EXTENSION_RENDERER_MODE_ON`). Она распространяется под **GPLv3**, поэтому собранный APK тоже распространяется на условиях GPLv3; исходный код в этом репозитории остаётся под MIT. Версия декодера должна совпадать с версией Media3.
+
+На экране плеера кнопки громкости меняют громкость самого устройства (а не ПК, как на главном экране); если звук в плеере выключен, «громче» его включает.
 
 ## Устройство кода
 
@@ -66,6 +71,8 @@ Debug и release подписаны разными ключами: чтобы с
 | `MainActivity.kt` | Активити: тема, кнопки громкости телефона, запрос разрешения на уведомления, запуск `RemoteService` |
 | `RemoteService.kt` | Foreground-сервис с `MediaSession` и медиауведомлением |
 | `VolumeRemoteApp.kt` | `Application`: инициализирует `Remote` |
+| `PlayerActivity.kt` | Просмотр фильма на устройстве: ExoPlayer, синхронизация с MPC-HC |
+| `VideoSync.kt` | Чистые функции синхронизации: `syncAction`, `mediaUrl` |
 
 Клиент повторяет формат JSON `apiStatus` из `main.go` вручную: при изменении API обновить `parseStatus` и `RemoteClientTest`.
 
@@ -87,9 +94,10 @@ A client for the [volume_switch](../README.md#phone-remote) phone remote HTTP AP
 - The time remaining in large type, with a progress bar, elapsed time and duration below.
 - Previous/Next: the neighbouring file in MPC-HC (episode); disabled while the player is off.
 - The PC master volume and MPC-HC's own volume: −/+ buttons and the current level (`MUTE` when muted).
-- While the app is open, the phone's volume keys change the PC volume instead of the phone's.
+- The "Кнопки громкости управляют ПК" ("Volume keys control the PC") setting: on by default on phones, off on tablets (`smallestScreenWidthDp ≥ 600`). When on, the volume keys in the app, the shade and on the lock screen change the PC volume (the media session declares remote volume, `setPlaybackToRemote`); when off, they change the device's own volume (`setPlaybackToLocal`). The PC volume down/up buttons in the notification always control the PC.
 - A media notification (in the shade and on the lock screen): file name, time remaining (in minutes, updated once a minute and only while the screen is on), PC volume, play/pause, previous/next and PC volume down/up buttons. It is run by the `RemoteService` foreground service with a `MediaSession`; the session volume is declared remote (`setPlaybackToRemote`) and tied to the PC volume.
 - The service stops itself after MPC-HC has been idle for 30 minutes; it starts again the next time the app is opened.
+- "Смотреть на этом устройстве" ("Watch on this device", `PlayerActivity`, Media3/ExoPlayer): the file open in MPC-HC plays on the tablet or phone in sync with the PC. The file comes from the PC via `GET /media` without transcoding; position, pause and episode come from the `/events` stream. Drift over 1.5 s is fixed by seeking, smaller drift by playing at 0.95–1.05× (`syncAction`). Sound on the device is off by default (the "Звук на планшете" button), the screen stays on, landscape orientation.
 
 ## Requirements
 
@@ -129,7 +137,11 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote 
 
 The debug and release builds are signed with different keys: to switch between them, uninstall the app first (`adb uninstall com.des1roer.volumeremote`). Losing the release key means the same for future updates. Debug build: `./gradlew assembleDebug`, APK in `app/build/outputs/apk/debug/`. `adb` is in the Android SDK's `platform-tools`.
 
-Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, dynamic colors), no third-party HTTP/JSON libraries: `HttpURLConnection` and `org.json`.
+Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, dynamic colors), Media3/ExoPlayer 1.5.0, no third-party HTTP/JSON libraries: `HttpURLConnection` and `org.json`.
+
+**AC3/E-AC3 audio and licensing.** Many Android devices (e.g. the POCO Pad) have no Dolby Digital/Digital Plus decoder, while WEB-DL releases almost always use it. So the player adds a software FFmpeg decoder, the prebuilt `org.jellyfin.media3:media3-ffmpeg-decoder` (used only when there is no system decoder, `EXTENSION_RENDERER_MODE_ON`). It is licensed under **GPLv3**, so the built APK is distributed under GPLv3 terms as well; the source code in this repository stays MIT. The decoder version must match the Media3 version.
+
+On the player screen the volume keys change the device's own volume (not the PC's, as on the main screen); if the player's sound is off, volume up turns it on.
 
 ## Code layout
 
@@ -143,6 +155,8 @@ Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material
 | `MainActivity.kt` | The activity: theme, phone volume keys, notification permission request, starting `RemoteService` |
 | `RemoteService.kt` | The foreground service with the `MediaSession` and the media notification |
 | `VolumeRemoteApp.kt` | The `Application`: initializes `Remote` |
+| `PlayerActivity.kt` | Watching the movie on the device: ExoPlayer, sync with MPC-HC |
+| `VideoSync.kt` | Pure sync functions: `syncAction`, `mediaUrl` |
 
 The client mirrors the `apiStatus` JSON format from `main.go` by hand: when the API changes, update `parseStatus` and `RemoteClientTest`.
 

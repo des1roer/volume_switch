@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 
 const val DEFAULT_SERVER = "192.168.3.2:7778"
 private val RECONNECT_DELAYS_MS = longArrayOf(1_000, 2_000, 5_000, 10_000)
+private const val TABLET_MIN_WIDTH_DP = 600
 
 data class UiState(
     val server: String,
@@ -29,6 +30,9 @@ object Remote {
     private val mutableState = MutableStateFlow(UiState(server = DEFAULT_SERVER))
     val state: StateFlow<UiState> = mutableState
 
+    private val mutableVolumeKeysToPc = MutableStateFlow(true)
+    val volumeKeysToPc: StateFlow<Boolean> = mutableVolumeKeysToPc
+
     private var users = 0
     private var streamJob: Job? = null
 
@@ -36,6 +40,13 @@ object Remote {
         if (::prefs.isInitialized) return
         prefs = context.applicationContext.getSharedPreferences("remote", Context.MODE_PRIVATE)
         mutableState.value = UiState(server = prefs.getString("server", null) ?: DEFAULT_SERVER)
+        val tablet = context.resources.configuration.smallestScreenWidthDp >= TABLET_MIN_WIDTH_DP
+        mutableVolumeKeysToPc.value = prefs.getBoolean("volumeKeysToPc", !tablet)
+    }
+
+    fun setVolumeKeysToPc(value: Boolean) {
+        prefs.edit().putBoolean("volumeKeysToPc", value).apply()
+        mutableVolumeKeysToPc.value = value
     }
 
     fun acquire(ui: Boolean = false) {

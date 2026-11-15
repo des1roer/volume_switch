@@ -1,5 +1,6 @@
 package com.des1roer.volumeremote
 
+import android.content.Intent
 import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -21,9 +22,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -31,6 +34,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -102,14 +106,42 @@ fun RemoteScreen(ui: UiState) {
                 }
             }
 
+            val context = LocalContext.current
+            OutlinedButton(
+                onClick = { context.startActivity(Intent(context, PlayerActivity::class.java)) },
+                enabled = status?.mpcOnline == true && status.file.isNotEmpty(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            ) {
+                Text("Смотреть на этом устройстве")
+            }
+
             VolumeControl(
                 title = "Громкость ПК",
                 percent = status?.volumePercent,
                 muted = status?.muted == true,
                 enabled = status?.volumePercent != null,
-                hint = "Кнопки громкости телефона тоже меняют громкость ПК",
+                hint = null,
                 onStep = { Remote.volume(up = it) },
             )
+
+            val volumeKeysToPc by Remote.volumeKeysToPc.collectAsState()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Кнопки громкости управляют ПК", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        text = if (volumeKeysToPc) {
+                            "Кнопки громкости этого устройства меняют громкость ПК"
+                        } else {
+                            "Кнопки громкости меняют громкость этого устройства"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = volumeKeysToPc, onCheckedChange = Remote::setVolumeKeysToPc)
+            }
 
             val mpcOnline = status?.mpcOnline == true
             VolumeControl(

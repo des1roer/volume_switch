@@ -202,3 +202,49 @@ sequenceDiagram
 
     Note over exit, sw: API останавливается до switcher.Close():<br/>иначе обработчик, обратившийся к закрытому Switcher, повис бы в exec.
 ```
+
+## 6. Просмотр фильма на планшете
+
+Кнопка «Смотреть на этом устройстве» открывает `PlayerActivity`: планшет (или телефон) сам проигрывает тот же файл, что открыт в MPC-HC, — volume_switch отдаёт его по `GET /media` как есть, без перекодирования, с поддержкой HTTP Range для перемотки. Позиция, пауза и смена серии берутся из того же потока `/events`. Звук на планшете по умолчанию выключен (звук идёт с ПК), включается кнопкой.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor user as Пользователь
+    participant player as PlayerActivity (ExoPlayer)
+    participant remote as Remote
+    participant api as volume_switch remoteAPI
+    participant mpchc as MPC-HC :7777
+    participant file as Файл на диске ПК
+
+    user->>player: «Смотреть на этом устройстве»
+    player->>remote: acquire(ui = true)
+    remote->>api: GET /events
+    api-->>remote: data: apiStatus (file, position, state)
+    remote-->>player: StateFlow
+    player->>api: GET /media?file=имя (Range: bytes=…)
+    api->>mpchc: GET status.json — путь текущего файла
+    alt в MPC-HC уже другой файл
+        api-->>player: 409 — переоткрыть по свежему состоянию
+    else тот же файл
+        api->>file: open + http.ServeContent
+        api-->>player: 200/206 — файл как есть
+    end
+    player->>player: seek на позицию MPC-HC, playWhenReady = MPC-HC играет
+
+    loop раз в секунду
+        player->>player: syncAction(ожидаемая позиция, фактическая)
+        alt расхождение больше 1,5 с (не чаще раза в 5 с)
+            player->>api: seek — новый GET /media с Range
+        else расхождение больше 150 мс
+            player->>player: скорость 0,95× или 1,05×
+        else
+            player->>player: скорость 1×
+        end
+    end
+
+    api-->>remote: data: apiStatus (пауза, перемотка, следующая серия)
+    remote-->>player: пауза/старт, seek, новый файл — новый /media
+```
+
+`/media` отдаёт только файл, открытый сейчас в MPC-HC (путь из `status.json`), — произвольные пути от клиента не принимаются. Видео декодирует сам планшет; дорожки, которые он не поддерживает (например, AC3-звук), ExoPlayer пропускает, а Dolby Vision при отсутствии декодера играется как обычный HEVC (`setEnableDecoderFallback`).

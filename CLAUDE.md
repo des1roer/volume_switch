@@ -28,13 +28,15 @@ adb -s <serial> install -r app/build/outputs/apk/release/app-release.apk
 adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote
 ```
 
-- На телефоне стоит **релизная** сборка, подписанная ключом `~/.android/volumeremote-release.jks` (пароли — в `~/.gradle/gradle.properties`, вне git). Debug-APK поверх неё не встанет (другая подпись) — для отладки ставить тоже release или удалять приложение.
+- На телефоне и планшете стоит **релизная** сборка, подписанная ключом `~/.android/volumeremote-release.jks` (пароли — в `~/.gradle/gradle.properties`, вне git). Тот же ключ лежит в секретах репозитория (`VOLUMEREMOTE_KEYSTORE_BASE64`, `VOLUMEREMOTE_STORE_PASSWORD`, `VOLUMEREMOTE_KEY_PASSWORD`, `VOLUMEREMOTE_KEY_ALIAS`): job `android` в `release.yml` сам собирает и прикрепляет APK к релизу, вручную загружать не нужно. `versionName` в `android/app/build.gradle.kts` задаёт имя файла — поднимать его при изменениях клиента. Debug-APK поверх неё не встанет (другая подпись) — для отладки ставить тоже release или удалять приложение.
 - HyperOS спрашивает подтверждение каждой установки через adb на самом телефоне; без него — `INSTALL_FAILED_USER_RESTRICTED`. Предупредить пользователя перед `adb install`.
 
 - Отдельный Gradle-проект (AGP 8.7.3, Gradle 8.9, Kotlin 2.0.21, Compose). Go-часть его не видит: `go vet ./...` и CI его не собирают.
 - Клиент повторяет формат `apiStatus` вручную (`parseStatus` в `RemoteClient.kt`): при изменении JSON API обновить и его, и `RemoteClientTest`.
 - Схемы взаимодействия телефона и ПК — `docs/remote-pairing.md` (Mermaid) и `docs/plantuml/*.puml`; при изменении протокола, эндпоинтов или жизненного цикла потока обновить обе версии.
 - HTTP без TLS в локальную сеть — поэтому в манифесте `usesCleartextTraffic="true"`.
+- Звук AC3/E-AC3 на устройствах без декодера Dolby (POCO Pad) играет программный `org.jellyfin.media3:media3-ffmpeg-decoder` (GPLv3 — выбор пользователя; APK из-за него распространяется на условиях GPLv3). Его версия обязана совпадать с версией `androidx.media3` — поднимать их вместе.
+- Кнопки громкости: настройка `Remote.volumeKeysToPc` (prefs `volumeKeysToPc`, по умолчанию выключена на планшетах). От неё зависят `MainActivity.onKeyDown` и тип громкости медиасессии в `RemoteService` (`setPlaybackToRemote`/`setPlaybackToLocal`) — без этого сессия забирала бы кнопки громкости и на заблокированном экране. В `PlayerActivity` кнопки громкости всегда меняют громкость устройства (`onKeyDown`).
 - Подробности клиента — `android/README.md`. Состояние и опрос — в синглтоне `Remote` (общий для экрана и `RemoteService`, опрос идёт, пока есть `acquire` без `release`): второй независимый опрос не заводить. Медиауведомление (шторка и экран блокировки) строится системой из `MediaSession` (`minSdk 33`), поэтому кнопки — это `PlaybackState` actions и custom actions, а не `Notification.addAction`.
 - Проверить уведомление на заблокированном телефоне: `adb shell input keyevent KEYCODE_WAKEUP` (включает экран, не разблокируя) и `adb exec-out screencap -p`; при выключенном экране снимок чёрный.
 

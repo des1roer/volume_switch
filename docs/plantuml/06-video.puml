@@ -1,0 +1,47 @@
+@startuml remote-video
+title Просмотр фильма на планшете параллельно с ПК
+
+autonumber
+actor "Пользователь" as user
+participant "PlayerActivity\n(ExoPlayer)" as player
+participant "Remote" as remote
+participant "volume_switch\nremoteAPI" as api
+participant "MPC-HC :7777" as mpchc
+database "Файл фильма\nна диске ПК" as file
+
+user -> player : «Смотреть на этом устройстве»
+player -> remote : acquire(ui = true)
+remote -> api : GET /events
+api --> remote : data: apiStatus (file, position, state)
+remote --> player : StateFlow
+player -> api : GET /media?file=<имя>\n(Range: bytes=…)
+api -> mpchc : GET status.json — путь текущего файла
+alt в MPC-HC другой файл
+  api --> player : 409 — переоткрыть по свежему состоянию
+else тот же файл
+  api -> file : open + http.ServeContent
+  api --> player : 200/206, поток файла как есть\n(без перекодирования)
+end
+player -> player : seek на позицию MPC-HC,\nplayWhenReady = MPC-HC играет
+
+loop раз в секунду
+  player -> player : syncAction(ожидаемая позиция,\nфактическая)
+  alt расхождение > 1,5 с (не чаще раза в 5 с)
+    player -> api : seek → новый GET /media с Range
+  else расхождение > 150 мс
+    player -> player : скорость 0,95× или 1,05×
+  else
+    player -> player : скорость 1×
+  end
+end
+
+api --> remote : data: apiStatus (пауза, перемотка,\nследующая серия)
+remote --> player : пауза/старт, seek,\nновый файл → новый /media
+
+note over player
+  Звук на планшете по умолчанию выключен
+  (кнопка «Звук на планшете»): звук идёт с ПК.
+  Видео декодирует сам планшет; дорожки,
+  которые он не умеет (например, AC3), пропускаются.
+end note
+@enduml

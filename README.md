@@ -53,6 +53,7 @@ git push origin v1.2.3
 
 Workflow собирает exe с вшитой версией, создаёт GitHub Release и обновляет пакеты:
 
+- **Android-пульт** — релизный APK `volume-remote-<версия>.apk` собирается из `android/`, подписывается ключом из секретов `VOLUMEREMOTE_*` и прикрепляется к тому же релизу (без секрета ключа шаг пропускается);
 - **Scoop** — манифест `bucket/volume_switch.json` (версия и хеш) коммитится в `main`;
 - **Chocolatey** — пакет из `packaging/chocolatey` отправляется на модерацию, если задан секрет `CHOCO_API_KEY` (API-ключ с community.chocolatey.org);
 - **winget** — PR в [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) через [winget-releaser](https://github.com/vedantmgoyal9/winget-releaser), если задан секрет `WINGET_TOKEN` (classic PAT со scope `public_repo`; нужен форк winget-pkgs у владельца репозитория). Работает только для обновлений — первая версия пакета отправляется в winget-pkgs вручную.
@@ -127,6 +128,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 |--------|------------|
 | `GET /status` | Состояние: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, собственная громкость MPC-HC `volume`/`muted`) и системная громкость `volume` (`percent`, `muted`) |
 | `GET /events` | Поток [SSE](https://developer.mozilla.org/docs/Web/API/Server-sent_events) (`text/event-stream`): сразу текущее состояние (тот же JSON, что у `/status`), затем новое — только при значимом изменении: плеер запущен/закрыт, файл, пауза/воспроизведение, перемотка, громкость MPC-HC или системная. Ход воспроизведения событий не порождает — позицию клиент досчитывает сам. Раз в 25 с — комментарий `: ping`. Пока подписан хоть один клиент, volume_switch опрашивает MPC-HC и громкость раз в 500 мс, без подписчиков — не опрашивает |
+| `GET /media` | Файл, открытый сейчас в MPC-HC, как есть, с поддержкой HTTP Range — чтобы смотреть его параллельно на планшете. Только текущий файл плеера; `?file=имя` — 409, если в MPC-HC уже другой файл |
 | `POST /playpause` | Пауза/старт, как клик по оверлею; если MPC-HC не запущен — запускает его |
 | `POST /next`, `POST /prev` | Следующий/предыдущий файл в MPC-HC (следующая серия) |
 | `POST /volume/up`, `POST /volume/down` | Системная громкость, как F3/F2 (на ПК показывается оверлей); `?step=N` — шаг в процентах |
@@ -134,7 +136,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 Команды отвечают тем же JSON, что и `/status`; ошибки — `{"error": "..."}` с кодом 4xx/5xx.
 
-Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК). Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
+Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (кнопки громкости телефона в открытом приложении тоже меняют громкость ПК), а также «Смотреть на этом устройстве» — тот же фильм на планшете синхронно с MPC-HC. Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
 
 ```sh
 cd android
@@ -250,6 +252,7 @@ git push origin v1.2.3
 
 The workflow builds the exe with the version embedded, creates a GitHub Release and updates the packages:
 
+- **Android remote**: the release APK `volume-remote-<version>.apk` is built from `android/`, signed with the key from the `VOLUMEREMOTE_*` secrets and attached to the same release (skipped without the key secret);
 - **Scoop**: the `bucket/volume_switch.json` manifest (version and hash) is committed to `main`;
 - **Chocolatey**: the package from `packaging/chocolatey` is submitted for moderation if the `CHOCO_API_KEY` secret is set (an API key from community.chocolatey.org);
 - **winget**: a PR to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) via [winget-releaser](https://github.com/vedantmgoyal9/winget-releaser) if the `WINGET_TOKEN` secret is set (a classic PAT with the `public_repo` scope; the repository owner needs a fork of winget-pkgs). This works only for updates: the first version of the package is submitted to winget-pkgs manually.
@@ -323,6 +326,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 |---------|--------------|
 | `GET /status` | State: `mpc` (`online`, `file`, `state` — `playing`/`paused`/`stopped`/`none`, `position_ms`, `duration_ms`, `remaining_ms`, MPC-HC's own volume `volume`/`muted`) and the master volume `volume` (`percent`, `muted`) |
 | `GET /events` | An [SSE](https://developer.mozilla.org/docs/Web/API/Server-sent_events) stream (`text/event-stream`): the current state right away (the same JSON as `/status`), then a new one only on a significant change: the player started/closed, the file, pause/play, a seek, the MPC-HC or master volume. Playback progress produces no events: the client extrapolates the position itself. A `: ping` comment every 25 s. While at least one client is subscribed, volume_switch polls MPC-HC and the volume every 500 ms; with no subscribers it doesn't poll |
+| `GET /media` | The file currently open in MPC-HC, as is, with HTTP Range support, to watch it on a tablet at the same time. Only the player's current file; `?file=name` returns 409 if MPC-HC has another file open |
 | `POST /playpause` | Pause/play, like a click on the overlay; launches MPC-HC if it isn't running |
 | `POST /next`, `POST /prev` | Next/previous file in MPC-HC (next episode) |
 | `POST /volume/up`, `POST /volume/down` | Master volume, like F3/F2 (the overlay is shown on the PC); `?step=N` sets the step in percent |
@@ -330,7 +334,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 Commands respond with the same JSON as `/status`; errors are `{"error": "..."}` with a 4xx/5xx code.
 
-The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (while the app is open, the phone's volume keys change the PC volume too). The PC address is entered in the app. More in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
+The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (while the app is open, the phone's volume keys change the PC volume too), plus "Смотреть на этом устройстве" ("Watch on this device"): the same movie on a tablet, in sync with MPC-HC. The PC address is entered in the app. More in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
 
 ```sh
 cd android

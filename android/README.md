@@ -13,6 +13,7 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 - Кнопки громкости телефона в открытом приложении меняют громкость ПК, а не телефона.
 - Медиауведомление (в шторке и на экране блокировки): название файла, сколько осталось (в минутах, обновляется раз в минуту и только при включённом экране), громкость ПК, кнопки пауза/старт, предыдущая/следующая и тише/громче ПК. Им управляет foreground-сервис `RemoteService` с `MediaSession`; громкость сессии объявлена удалённой (`setPlaybackToRemote`) и привязана к громкости ПК.
 - Сервис останавливается сам, если MPC-HC 30 минут ничего не воспроизводит; при следующем открытии приложения запускается снова.
+- «Смотреть на этом устройстве» (`PlayerActivity`, Media3/ExoPlayer): тот же файл, что открыт в MPC-HC, проигрывается на планшете или телефоне синхронно с ПК — файл берётся с ПК по `GET /media` без перекодирования, позиция/пауза/серия — из потока `/events`. Расхождение больше 1,5 с исправляется перемоткой, меньшее — скоростью 0,95–1,05× (`syncAction`). Звук на устройстве по умолчанию выключен (кнопка «Звук на планшете»), экран не гаснет, ориентация — альбомная.
 
 ## Требования
 
@@ -66,6 +67,8 @@ Debug и release подписаны разными ключами: чтобы с
 | `MainActivity.kt` | Активити: тема, кнопки громкости телефона, запрос разрешения на уведомления, запуск `RemoteService` |
 | `RemoteService.kt` | Foreground-сервис с `MediaSession` и медиауведомлением |
 | `VolumeRemoteApp.kt` | `Application`: инициализирует `Remote` |
+| `PlayerActivity.kt` | Просмотр фильма на устройстве: ExoPlayer, синхронизация с MPC-HC |
+| `VideoSync.kt` | Чистые функции синхронизации: `syncAction`, `mediaUrl` |
 
 Клиент повторяет формат JSON `apiStatus` из `main.go` вручную: при изменении API обновить `parseStatus` и `RemoteClientTest`.
 
@@ -90,6 +93,7 @@ A client for the [volume_switch](../README.md#phone-remote) phone remote HTTP AP
 - While the app is open, the phone's volume keys change the PC volume instead of the phone's.
 - A media notification (in the shade and on the lock screen): file name, time remaining (in minutes, updated once a minute and only while the screen is on), PC volume, play/pause, previous/next and PC volume down/up buttons. It is run by the `RemoteService` foreground service with a `MediaSession`; the session volume is declared remote (`setPlaybackToRemote`) and tied to the PC volume.
 - The service stops itself after MPC-HC has been idle for 30 minutes; it starts again the next time the app is opened.
+- "Смотреть на этом устройстве" ("Watch on this device", `PlayerActivity`, Media3/ExoPlayer): the file open in MPC-HC plays on the tablet or phone in sync with the PC. The file comes from the PC via `GET /media` without transcoding; position, pause and episode come from the `/events` stream. Drift over 1.5 s is fixed by seeking, smaller drift by playing at 0.95–1.05× (`syncAction`). Sound on the device is off by default (the "Звук на планшете" button), the screen stays on, landscape orientation.
 
 ## Requirements
 
@@ -143,6 +147,8 @@ Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material
 | `MainActivity.kt` | The activity: theme, phone volume keys, notification permission request, starting `RemoteService` |
 | `RemoteService.kt` | The foreground service with the `MediaSession` and the media notification |
 | `VolumeRemoteApp.kt` | The `Application`: initializes `Remote` |
+| `PlayerActivity.kt` | Watching the movie on the device: ExoPlayer, sync with MPC-HC |
+| `VideoSync.kt` | Pure sync functions: `syncAction`, `mediaUrl` |
 
 The client mirrors the `apiStatus` JSON format from `main.go` by hand: when the API changes, update `parseStatus` and `RemoteClientTest`.
 

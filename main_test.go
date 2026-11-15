@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2369,5 +2370,58 @@ func TestRemoteAPIEventsShutdown(t *testing.T) {
 	}
 	if _, err := stream.ReadString('\n'); err == nil {
 		t.Error("поток /events не закрылся после Shutdown")
+	}
+}
+
+func TestRemoteAPIMedia(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Серия 01.mkv")
+	content := []byte("0123456789abcdef")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	statusFor := func(file, path string) string {
+		b, err := json.Marshal(map[string]any{"file": file, "path": path, "state": 2, "position": 1000, "duration": 60000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	mpc, body := switchableMPC(t, statusFor("Серия 01.mkv", path))
+	h := (&remoteAPI{mpc: newMPCClient(mpc.URL)}).handler()
+
+	rec := callAPI(h, http.MethodGet, "/media")
+	if rec.Code != http.StatusOK || rec.Body.String() != string(content) {
+		t.Fatalf("GET /media: HTTP %d, %q", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Accept-Ranges") != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want bytes", rec.Header().Get("Accept-Ranges"))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/media?file="+url.QueryEscape("Серия 01.mkv"), nil)
+	req.Header.Set("Range", "bytes=10-")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcdef" {
+		t.Errorf("Range bytes=10-: HTTP %d, %q", rec.Code, rec.Body)
+	}
+
+	if rec := callAPI(h, http.MethodGet, "/media?file="+url.QueryEscape("Серия 02.mkv")); rec.Code != http.StatusConflict {
+		t.Errorf("другой файл: HTTP %d, want 409", rec.Code)
+	}
+
+	body.Store(statusFor("", ""))
+	if rec := callAPI(h, http.MethodGet, "/media"); rec.Code != http.StatusNotFound {
+		t.Errorf("файл не открыт: HTTP %d, want 404", rec.Code)
+	}
+
+	body.Store(statusFor("gone.mkv", filepath.Join(dir, "gone.mkv")))
+	if rec := callAPI(h, http.MethodGet, "/media"); rec.Code != http.StatusNotFound {
+		t.Errorf("файла нет на диске: HTTP %d, want 404", rec.Code)
+	}
+
+	offline := (&remoteAPI{mpc: newMPCClient(closedServerURL())}).handler()
+	if rec := callAPI(offline, http.MethodGet, "/media"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("MPC-HC не запущен: HTTP %d, want 503", rec.Code)
 	}
 }

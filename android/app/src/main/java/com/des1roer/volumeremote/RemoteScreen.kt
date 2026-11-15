@@ -1,5 +1,6 @@
 package com.des1roer.volumeremote
 
+import android.content.Intent
 import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -31,6 +32,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -100,6 +102,17 @@ fun RemoteScreen(ui: UiState) {
                 ) {
                     Text("Следующая ⏭")
                 }
+            }
+
+            val context = LocalContext.current
+            OutlinedButton(
+                onClick = { context.startActivity(Intent(context, PlayerActivity::class.java)) },
+                enabled = status?.mpcOnline == true && status.file.isNotEmpty(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            ) {
+                Text("Смотреть на этом устройстве")
             }
 
             VolumeControl(

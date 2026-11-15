@@ -54,6 +54,56 @@ jobs:
             gh release create "$TAG" dist/volume_switch.exe --title "$TAG" --generate-notes
           fi
 
+  # Android-пульт (android/): собирается релизный APK, подписанный ключом из
+  # секретов VOLUMEREMOTE_*, и прикрепляется к тому же релизу как
+  # volume-remote-<versionName>.apk. Без секрета ключа шаг пропускается —
+  # неподписанный debug-ключом APK поверх установленного не встанет.
+  android:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.VOLUMEREMOTE_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v5
+        if: env.KEYSTORE_BASE64 != ''
+
+      - uses: actions/setup-java@v4
+        if: env.KEYSTORE_BASE64 != ''
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: android/**/*.gradle.kts
+
+      - name: Build signed APK
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: android
+        shell: bash
+        env:
+          STORE_PASSWORD: ${{ secrets.VOLUMEREMOTE_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.VOLUMEREMOTE_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.VOLUMEREMOTE_KEY_ALIAS }}
+        run: |
+          keystore="$RUNNER_TEMP/volumeremote-release.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+          ./gradlew --no-daemon testReleaseUnitTest assembleRelease \
+            -PvolumeRemoteKeystore="$keystore" \
+            -PvolumeRemoteStorePassword="$STORE_PASSWORD" \
+            -PvolumeRemoteKeyAlias="$KEY_ALIAS" \
+            -PvolumeRemoteKeyPassword="$KEY_PASSWORD"
+          rm -f "$keystore"
+          version=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts)
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/volume-remote-$version.apk"
+          echo "APK=$RUNNER_TEMP/volume-remote-$version.apk" >> "$GITHUB_ENV"
+
+      - name: Attach APK to release
+        if: env.KEYSTORE_BASE64 != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" "$APK" --clobber
+
   # Манифест Scoop живёт в bucket/ этого репозитория: обновляем версию и хеш
   # и коммитим в main. Пуш с GITHUB_TOKEN не запускает другие workflow.
   scoop:

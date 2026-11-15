@@ -40,6 +40,20 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote
 - Подробности клиента — `android/README.md`. Состояние и опрос — в синглтоне `Remote` (общий для экрана и `RemoteService`, опрос идёт, пока есть `acquire` без `release`): второй независимый опрос не заводить. Медиауведомление (шторка и экран блокировки) строится системой из `MediaSession` (`minSdk 33`), поэтому кнопки — это `PlaybackState` actions и custom actions, а не `Notification.addAction`.
 - Проверить уведомление на заблокированном телефоне: `adb shell input keyevent KEYCODE_WAKEUP` (включает экран, не разблокируя) и `adb exec-out screencap -p`; при выключенном экране снимок чёрный.
 
+### Пульт для часов Zepp OS (`zepp/`)
+
+```sh
+cd zepp
+npm install && npm test                  # тесты общей логики shared/remote.js (node --test)
+zeus login                               # аккаунт Zepp пользователя — вход делает он сам в браузере
+zeus preview -t "Amazfit Balance 3"      # сборка + загрузка, печатает QR-код в терминал
+```
+
+- Часы в сеть не ходят: HTTP к API делает side service (`app-side/index.js`) в приложении Zepp на телефоне, часы общаются с ним по Bluetooth (`this.request` из zml). SSE там нет — страница опрашивает `/status` раз в 2 с, пока открыта. Новые эндпоинты API для часов — добавить в `COMMANDS` в `shared/remote.js` и в его тест.
+- `zeus preview` (и даже `--local`) требует `zeus login`. QR-код печатается символами в терминал, пользователь его не видит: перевести вывод в PNG (блоки `█▀▄` = светлые модули, по две строки на символ) и открыть на экране ПК. Сканировать только сканером Zepp: Устройство → «Основные» → «Режим разработчика» → «+» → «Scan» (сам режим включается 7 нажатиями на логотип в Профиль → Настройки → «О приложении»). Камера/Google Lens ссылку `zpkd1://` не откроют.
+- Ресурсы — в `assets/<цель>.<st>` (`assets/round.r`), иначе `zeus build` не находит иконку. `dist/` и `node_modules/` в git не идут.
+- В CI и `release.yml` часы не собираются; `go vet ./...` каталог не видит.
+
 ## Git, PR, релизы
 
 - **`volume_switch.exe` хранится в репозитории намеренно** — не убирать из git и не добавлять в `.gitignore`. При изменении кода пересобрать (`-H=windowsgui`) и закоммитить exe вместе с кодом.

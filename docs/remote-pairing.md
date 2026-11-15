@@ -141,6 +141,7 @@ sequenceDiagram
 | Запрос | Что делает на ПК |
 |--------|------------------|
 | `POST /next`, `POST /prev` | `wm_command` 920/919 — следующий/предыдущий файл; 503, если MPC-HC не запущен |
+| `POST /overlay/toggle` | `progressOverlay.Toggle` — показать/скрыть оверлей прогресса, как F5; 503, если оверлея нет |
 | `POST /seek?position_ms=N`, `POST /seek?offset_ms=±N` | Позиция и длина — из `status.json`, затем `command.html?wm_command=-1&position=ЧЧ:ММ:СС.мс`; 409, если файл не открыт. Ползунок, кнопки ±10 с/±1 мин и полоса прогресса в шторке (`ACTION_SEEK_TO`). Телефон показывает новую позицию сразу, а при ошибке переподключает поток `/events` |
 | `POST /volume/up`, `POST /volume/down` (`?step=N`) | Системная громкость через `Switcher.StepVolume`; на ПК показывается оверлей громкости. Сюда же — кнопки громкости телефона в открытом приложении и тише/громче в уведомлении |
 | `POST /mpc/volume/up`, `POST /mpc/volume/down` | `wm_command` 907/908 — громкость самого MPC-HC |

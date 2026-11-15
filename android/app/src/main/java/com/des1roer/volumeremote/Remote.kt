@@ -74,6 +74,8 @@ object Remote {
 
     fun prev() = command { it.prev() }
 
+    fun toggleOverlay() = command { it.toggleOverlay() }
+
     fun seekTo(positionMs: Long) = seek(positionMs) { it.seekTo(positionMs) }
 
     fun seekBy(offsetMs: Long) {

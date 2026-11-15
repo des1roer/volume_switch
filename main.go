@@ -1376,15 +1376,16 @@ func newProgressOverlay(a fyne.App, mpc *mpcClient) *progressOverlay {
 	return p
 }
 
-// Toggle показывает окно, если оно скрыто, и прячет, если показано.
+// Toggle показывает окно, если оно скрыто, и прячет, если показано (F5,
+// пункт меню трея и POST /overlay/toggle с телефона).
 func (p *progressOverlay) Toggle() {
 	fyne.Do(func() {
 		if p.visible {
 			p.window.Hide()
-			log.Printf("F5: окно скрыто")
+			log.Printf("overlay: прогресс скрыт")
 		} else {
 			showOverlay(p.window, true)
-			log.Printf("F5: окно показано поверх всех окон")
+			log.Printf("overlay: прогресс показан поверх всех окон")
 		}
 		p.visible = !p.visible
 	})
@@ -2243,7 +2244,7 @@ func (a *trayApp) startAPI() {
 		log.Printf("api: выключен (API_LISTEN не задан)")
 		return
 	}
-	api := &remoteAPI{mpc: a.ui.progress.mpc, audio: a.switcher}
+	api := &remoteAPI{mpc: a.ui.progress.mpc, audio: a.switcher, toggleOverlay: a.ui.progress.Toggle}
 	srv, err := startRemoteAPI(a.apiListen, api.handler())
 	if err != nil {
 		log.Printf("api: не удалось запустить на %s: %v", a.apiListen, err)
@@ -2590,6 +2591,7 @@ const (
 //	GET  /media[?file=имя]           файл, открытый сейчас в MPC-HC, с поддержкой Range — для просмотра на планшете
 //	POST /playpause                  как клик по оверлею: Play/Pause, а если MPC-HC не запущен — запуск
 //	POST /next, /prev                следующий/предыдущий файл в MPC-HC
+//	POST /overlay/toggle             показать/скрыть оверлей прогресса на ПК, как F5
 //	POST /seek?position_ms=N         перемотка на N мс от начала; ?offset_ms=±N — на N мс от текущей позиции
 //	POST /volume/up, /volume/down    системная громкость, как F3/F2; ?step=N — шаг в процентах
 //	POST /mpc/volume/up, /down       собственная громкость MPC-HC, шагом из его настроек
@@ -2599,6 +2601,10 @@ const (
 type remoteAPI struct {
 	mpc   *mpcClient
 	audio deviceSwitcher // nil, если аудио не инициализировалось
+
+	// toggleOverlay показывает/скрывает оверлей прогресса, как F5; nil —
+	// оверлея нет, /overlay/toggle отвечает 503.
+	toggleOverlay func()
 
 	// Подменяются в тестах: источник тиков общего опросчика /events (nil —
 	// тикер на eventsPollInterval) и интервал пингов (0 — eventsHeartbeat).
@@ -2676,7 +2682,10 @@ func (api *remoteAPI) status() apiStatus {
 	return s
 }
 
-var errNoAudio = errors.New("аудио не инициализировано")
+var (
+	errNoAudio   = errors.New("аудио не инициализировано")
+	errNoOverlay = errors.New("оверлей прогресса недоступен")
+)
 
 func (api *remoteAPI) handler() http.Handler {
 	ticks := api.ticks
@@ -2706,6 +2715,14 @@ func (api *remoteAPI) handler() http.Handler {
 	mux.HandleFunc("POST /next", api.mpcCommand(mpcNextFileCommand))
 	mux.HandleFunc("POST /prev", api.mpcCommand(mpcPrevFileCommand))
 	mux.HandleFunc("POST /seek", api.seek)
+	mux.HandleFunc("POST /overlay/toggle", func(w http.ResponseWriter, _ *http.Request) {
+		if api.toggleOverlay == nil {
+			writeError(w, http.StatusServiceUnavailable, errNoOverlay)
+			return
+		}
+		api.toggleOverlay()
+		writeJSON(w, http.StatusOK, api.status())
+	})
 	mux.HandleFunc("POST /volume/up", api.stepVolume(1))
 	mux.HandleFunc("POST /volume/down", api.stepVolume(-1))
 	mux.HandleFunc("POST /mpc/volume/up", api.mpcCommand(mpcVolumeUpCommand))

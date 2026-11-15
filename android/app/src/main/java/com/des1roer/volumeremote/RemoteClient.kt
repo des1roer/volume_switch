@@ -54,6 +54,8 @@ class RemoteClient(server: String) {
 
     suspend fun prev(): Status = request("POST", "/prev")
 
+    suspend fun toggleOverlay(): Status = request("POST", "/overlay/toggle")
+
     suspend fun seekTo(positionMs: Long): Status = request("POST", "/seek?position_ms=$positionMs")
 
     suspend fun seekBy(offsetMs: Long): Status = request("POST", "/seek?offset_ms=$offsetMs")

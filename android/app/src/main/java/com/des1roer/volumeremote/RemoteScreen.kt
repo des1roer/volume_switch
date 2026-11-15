@@ -119,6 +119,16 @@ fun RemoteScreen(ui: UiState) {
                 Text("Смотреть на этом устройстве")
             }
 
+            OutlinedButton(
+                onClick = Remote::toggleOverlay,
+                enabled = status != null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            ) {
+                Text("Статус-бар на ПК (F5)")
+            }
+
             VolumeControl(
                 title = "Громкость ПК",
                 percent = status?.volumePercent,

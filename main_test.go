@@ -2033,6 +2033,27 @@ func TestRemoteAPISeek(t *testing.T) {
 	}
 }
 
+func TestRemoteAPIOverlayToggle(t *testing.T) {
+	srv, _ := fakeMPCServer(t)
+	toggled := 0
+	h := (&remoteAPI{mpc: newMPCClient(srv.URL), toggleOverlay: func() { toggled++ }}).handler()
+
+	for want := 1; want <= 2; want++ {
+		st := decodeStatus(t, callAPI(h, http.MethodPost, "/overlay/toggle"))
+		if toggled != want || !st.MPC.Online {
+			t.Errorf("POST /overlay/toggle #%d: переключений %d, mpc=%+v", want, toggled, st.MPC)
+		}
+	}
+	if rec := callAPI(h, http.MethodGet, "/overlay/toggle"); rec.Code != http.StatusMethodNotAllowed || toggled != 2 {
+		t.Errorf("GET /overlay/toggle: HTTP %d, переключений %d, want 405 и 2", rec.Code, toggled)
+	}
+
+	h = (&remoteAPI{mpc: newMPCClient(srv.URL)}).handler()
+	if rec := callAPI(h, http.MethodPost, "/overlay/toggle"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("без оверлея: HTTP %d, want 503", rec.Code)
+	}
+}
+
 func TestRemoteAPISeekErrors(t *testing.T) {
 	h := (&remoteAPI{mpc: newMPCClient(closedServerURL())}).handler()
 	if rec := callAPI(h, http.MethodPost, "/seek?position_ms=1000"); rec.Code != http.StatusServiceUnavailable {

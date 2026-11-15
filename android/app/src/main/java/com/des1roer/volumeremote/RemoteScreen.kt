@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,11 +18,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -30,6 +31,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -197,33 +199,80 @@ private fun Playback(status: Status?) {
         )
         val active = status != null && status.mpcOnline && status.file.isNotEmpty()
         val now = rememberPlaybackClock(status?.takeIf { it.playing })
-        val position = if (active) status!!.positionAt(now) else 0
+        var dragMs by remember { mutableStateOf<Long?>(null) }
+        val position = if (active) dragMs ?: status!!.positionAt(now) else 0
+        val duration = if (active) status!!.durationMs else 0
         Text(
             text = "Осталось",
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            text = if (active) formatTime(status!!.remainingAt(now)) else "--:--",
+            text = if (active) formatTime(duration - position) else "--:--",
             fontSize = 64.sp,
             fontWeight = FontWeight.Bold,
         )
-        val progress = if (active && status!!.durationMs > 0) {
-            (position.toFloat() / status.durationMs).coerceIn(0f, 1f)
-        } else {
-            0f
-        }
-        LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+        SeekSlider(
+            positionMs = position,
+            durationMs = duration,
+            onDrag = { dragMs = it },
+            onDragEnd = {
+                dragMs?.let(Remote::seekTo)
+                dragMs = null
+            },
+        )
         Row {
             Text(if (active) formatTime(position) else "")
             Spacer(Modifier.weight(1f))
-            Text(if (active) formatTime(status!!.durationMs) else "")
+            Text(if (active) formatTime(duration) else "")
+        }
+        SeekButtons(enabled = active && duration > 0)
+    }
+}
+
+@Composable
+fun SeekSlider(
+    positionMs: Long,
+    durationMs: Long,
+    onDrag: (Long) -> Unit,
+    onDragEnd: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Slider(
+        value = positionMs.coerceIn(0, maxOf(durationMs, 0)).toFloat(),
+        onValueChange = { onDrag(it.toLong()) },
+        onValueChangeFinished = onDragEnd,
+        valueRange = 0f..maxOf(durationMs, 1).toFloat(),
+        enabled = durationMs > 0,
+        modifier = modifier.fillMaxWidth(),
+    )
+}
+
+private val SEEK_STEPS = listOf(-60_000L to "−1 мин", -10_000L to "−10 с", 10_000L to "+10 с", 60_000L to "+1 мин")
+
+@Composable
+fun SeekButtons(enabled: Boolean, modifier: Modifier = Modifier, onSeek: () -> Unit = {}) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = modifier) {
+        for ((offset, label) in SEEK_STEPS) {
+            FilledTonalButton(
+                onClick = {
+                    Remote.seekBy(offset)
+                    onSeek()
+                },
+                enabled = enabled,
+                contentPadding = PaddingValues(horizontal = 4.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(56.dp),
+            ) {
+                Text(label, maxLines = 1)
+            }
         }
     }
 }
 
 @Composable
-private fun rememberPlaybackClock(playing: Status?): Long {
+fun rememberPlaybackClock(playing: Status?): Long {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val now by produceState(SystemClock.elapsedRealtime(), playing, lifecycle) {
         value = SystemClock.elapsedRealtime()

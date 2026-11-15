@@ -174,6 +174,27 @@ func TestMPCCommandURL(t *testing.T) {
 	}
 }
 
+func TestMPCSeekURL(t *testing.T) {
+	tests := []struct {
+		pos  time.Duration
+		want string
+	}{
+		{0, "00:00:00.000"},
+		{3723456 * time.Millisecond, "01:02:03.456"},
+		{25*time.Hour + 999*time.Microsecond, "25:00:00.000"},
+		{-time.Second, "00:00:00.000"},
+	}
+	for _, tt := range tests {
+		want := "http://localhost:7777/command.html?wm_command=-1&position=" + tt.want
+		if got := mpcSeekURL("http://localhost:7777/variables.html", tt.pos); got != want {
+			t.Errorf("mpcSeekURL(%v) = %q, want %q", tt.pos, got, want)
+		}
+	}
+	if got := mpcSeekURL("", time.Second); got != "" {
+		t.Errorf("пустой адрес: %q", got)
+	}
+}
+
 func TestMPCTogglePlaybackSendsCommand(t *testing.T) {
 	got := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -1962,6 +1983,86 @@ func TestRemoteAPIMPCErrors(t *testing.T) {
 		if rec := callAPI(h, http.MethodPost, path); rec.Code != http.StatusBadGateway {
 			t.Errorf("POST %s при отказе MPC-HC: HTTP %d, want 502", path, rec.Code)
 		}
+	}
+}
+
+func TestRemoteAPISeek(t *testing.T) {
+	positions := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status.json":
+			_, _ = w.Write([]byte(sampleStatusJSON))
+		case "/command.html":
+			if r.URL.Query().Get("wm_command") != "-1" {
+				t.Errorf("команда %q, want -1", r.URL.RawQuery)
+			}
+			positions <- r.URL.Query().Get("position")
+		}
+	}))
+	defer srv.Close()
+	h := (&remoteAPI{mpc: newMPCClient(srv.URL), audio: &fakeSwitcher{}}).handler()
+
+	// В sampleStatusJSON позиция 1:01 из 1:00:00.
+	for _, tt := range []struct{ query, want string }{
+		{"position_ms=600500", "00:10:00.500"},
+		{"position_ms=-5", "00:00:00.000"},
+		{"position_ms=99999999", "01:00:00.000"},
+		{"offset_ms=10000", "00:01:11.000"},
+		{"offset_ms=-30000", "00:00:31.000"},
+		{"offset_ms=-120000", "00:00:00.000"},
+	} {
+		st := decodeStatus(t, callAPI(h, http.MethodPost, "/seek?"+tt.query))
+		if got := <-positions; got != tt.want {
+			t.Errorf("POST /seek?%s: позиция %s, want %s", tt.query, got, tt.want)
+		}
+		if !st.MPC.Online {
+			t.Errorf("POST /seek?%s: в ответе нет состояния MPC-HC: %+v", tt.query, st)
+		}
+	}
+
+	for _, query := range []string{"", "position_ms=1&offset_ms=1", "position_ms=1:00", "offset_ms="} {
+		if rec := callAPI(h, http.MethodPost, "/seek?"+query); rec.Code != http.StatusBadRequest {
+			t.Errorf("POST /seek?%s: HTTP %d, want 400", query, rec.Code)
+		}
+	}
+	if rec := callAPI(h, http.MethodGet, "/seek?position_ms=1"); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /seek: HTTP %d, want 405", rec.Code)
+	}
+	if len(positions) != 0 {
+		t.Error("ошибочный запрос отправил перемотку в MPC-HC")
+	}
+}
+
+func TestRemoteAPISeekErrors(t *testing.T) {
+	h := (&remoteAPI{mpc: newMPCClient(closedServerURL())}).handler()
+	if rec := callAPI(h, http.MethodPost, "/seek?position_ms=1000"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("без MPC-HC: HTTP %d, want 503", rec.Code)
+	}
+
+	noFile := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/command.html" {
+			t.Error("перемотка без открытого файла")
+		}
+		_, _ = w.Write([]byte(`{"file":"","state":0}`))
+	}))
+	defer noFile.Close()
+	h = (&remoteAPI{mpc: newMPCClient(noFile.URL)}).handler()
+	if rec := callAPI(h, http.MethodPost, "/seek?offset_ms=1000"); rec.Code != http.StatusConflict {
+		t.Errorf("без файла: HTTP %d, want 409", rec.Code)
+	}
+
+	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/command.html" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(sampleStatusJSON))
+	}))
+	defer rejected.Close()
+	h = (&remoteAPI{mpc: newMPCClient(rejected.URL)}).handler()
+	rec := callAPI(h, http.MethodPost, "/seek?position_ms=1000")
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "перемотка на 00:00:01.000 отклонена") {
+		t.Errorf("отказ MPC-HC: HTTP %d %s, want 502", rec.Code, rec.Body)
 	}
 }
 

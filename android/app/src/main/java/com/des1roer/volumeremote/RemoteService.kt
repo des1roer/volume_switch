@@ -75,6 +75,8 @@ class RemoteService : Service() {
 
         override fun onSkipToPrevious() = Remote.prev()
 
+        override fun onSeekTo(pos: Long) = Remote.seekTo(pos)
+
         override fun onCustomAction(action: String, extras: Bundle?) {
             when (action) {
                 ACTION_VOLUME_DOWN -> Remote.volume(up = false)
@@ -171,6 +173,9 @@ class RemoteService : Service() {
         var actions = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE
         if (status?.mpcOnline == true) {
             actions = actions or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+        }
+        if (active && status!!.durationMs > 0) {
+            actions = actions or PlaybackState.ACTION_SEEK_TO
         }
         session.setPlaybackState(
             PlaybackState.Builder()

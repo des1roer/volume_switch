@@ -37,6 +37,8 @@ end note
 == Другие команды ==
 note over client, api
   POST /next, /prev — wm_command 920/919 (503, если MPC-HC не запущен)
+  POST /seek?position_ms=N | ?offset_ms=±N — status.json, затем wm_command=-1&position=ЧЧ:ММ:СС.мс
+    (ползунок, кнопки ±10 с/±1 мин, полоса в шторке; 409, если файл не открыт)
   POST /volume/up, /down[?step=N] — системная громкость (на ПК — оверлей громкости)
   POST /mpc/volume/up, /down — wm_command 907/908
   Кнопки громкости телефона в открытом приложении → /volume/up|down

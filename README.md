@@ -19,7 +19,7 @@
 - **F5** показывает/скрывает окно-оверлей поверх всех окон (не забирая фокус), которое опрашивает JSON API веб-интерфейса MPC-HC (`status.json`) и отображает название/прогресс/прошедшее/оставшееся время.
 - Клик средней кнопкой мыши (колесом) по оверлею открывает в проводнике папку с текущим файлом (с выделением самого файла).
 - Клик левой кнопкой по полосе прогресса ставит воспроизведение на паузу/возобновляет его; если MPC-HC не запущен — запускает его (путь берётся из `MPC_EXE`, по умолчанию `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, а если такого файла нет — из `HKCU\Software\MPC-HC\MPC-HC\ExePath`, который MPC-HC пишет сам).
-- Пульт с телефона: необязательный HTTP API в локальной сети (`API_LISTEN`) и Android-приложение «Пульт MPC» (`android/`) — пауза/старт, сколько осталось, следующая/предыдущая серия и системная громкость (см. «Пульт с телефона»).
+- Пульт с телефона: необязательный HTTP API в локальной сети (`API_LISTEN`) и Android-приложение «Пульт MPC» (`android/`) — пауза/старт, сколько осталось, перемотка, следующая/предыдущая серия и системная громкость (см. «Пульт с телефона»).
 - Необязательный файл `.env` для конфигурации; при отсутствии используются переменные окружения, затем флаги.
 
 ## Установка
@@ -131,12 +131,13 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 | `GET /media` | Файл, открытый сейчас в MPC-HC, как есть, с поддержкой HTTP Range — чтобы смотреть его параллельно на планшете. Только текущий файл плеера; `?file=имя` — 409, если в MPC-HC уже другой файл |
 | `POST /playpause` | Пауза/старт, как клик по оверлею; если MPC-HC не запущен — запускает его |
 | `POST /next`, `POST /prev` | Следующий/предыдущий файл в MPC-HC (следующая серия) |
+| `POST /seek?position_ms=N`, `POST /seek?offset_ms=±N` | Перемотка MPC-HC: на N мс от начала файла или на N мс вперёд/назад от текущей позиции (позиция ограничивается длиной файла); 409, если файл не открыт |
 | `POST /volume/up`, `POST /volume/down` | Системная громкость, как F3/F2 (на ПК показывается оверлей); `?step=N` — шаг в процентах |
 | `POST /mpc/volume/up`, `POST /mpc/volume/down` | Громкость самого MPC-HC, шагом из его настроек (по умолчанию 5%) |
 
 Команды отвечают тем же JSON, что и `/status`; ошибки — `{"error": "..."}` с кодом 4xx/5xx.
 
-Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (по настройке «Кнопки громкости управляют ПК» ими же меняется громкость ПК; на планшете по умолчанию выключено), а также «Смотреть на этом устройстве» — тот же фильм на планшете синхронно с MPC-HC. Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
+Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, перемотка (ползунок и кнопки ±10 с/±1 мин), «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (по настройке «Кнопки громкости управляют ПК» ими же меняется громкость ПК; на планшете по умолчанию выключено), а также «Смотреть на этом устройстве» — тот же фильм на планшете синхронно с MPC-HC. Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
 
 ```sh
 cd android
@@ -218,7 +219,7 @@ Written for my own use as a Volume² replacement on Windows 11: its overlay and 
 - **F5** shows/hides an always-on-top overlay window (without stealing focus) that polls the MPC-HC web interface JSON API (`status.json`) and displays the title/progress/elapsed/remaining time.
 - A middle-click (wheel click) on the overlay opens the folder of the current file in Explorer, with the file itself selected.
 - A left click on the progress bar pauses/resumes playback; if MPC-HC is not running, it launches it (the path comes from `MPC_EXE`, by default `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, and if that file doesn't exist — from `HKCU\Software\MPC-HC\MPC-HC\ExePath`, which MPC-HC writes itself).
-- Phone remote: an optional HTTP API on the local network (`API_LISTEN`) and the "Пульт MPC" Android app (`android/`): pause/play, time remaining, next/previous episode and the master volume (see "Phone remote").
+- Phone remote: an optional HTTP API on the local network (`API_LISTEN`) and the "Пульт MPC" Android app (`android/`): pause/play, time remaining, seeking, next/previous episode and the master volume (see "Phone remote").
 - An optional `.env` file for configuration; environment variables and then flags take precedence over it.
 
 ## Installation
@@ -329,12 +330,13 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 | `GET /media` | The file currently open in MPC-HC, as is, with HTTP Range support, to watch it on a tablet at the same time. Only the player's current file; `?file=name` returns 409 if MPC-HC has another file open |
 | `POST /playpause` | Pause/play, like a click on the overlay; launches MPC-HC if it isn't running |
 | `POST /next`, `POST /prev` | Next/previous file in MPC-HC (next episode) |
+| `POST /seek?position_ms=N`, `POST /seek?offset_ms=±N` | Seek in MPC-HC: to N ms from the start of the file, or N ms forward/back from the current position (clamped to the file length); 409 if no file is open |
 | `POST /volume/up`, `POST /volume/down` | Master volume, like F3/F2 (the overlay is shown on the PC); `?step=N` sets the step in percent |
 | `POST /mpc/volume/up`, `POST /mpc/volume/down` | MPC-HC's own volume, by the step from its settings (5% by default) |
 
 Commands respond with the same JSON as `/status`; errors are `{"error": "..."}` with a 4xx/5xx code.
 
-The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, previous/next episode, the MPC-HC volume and the PC volume (with the "Кнопки громкости управляют ПК" setting the device's volume keys change the PC volume too; off by default on tablets), plus "Смотреть на этом устройстве" ("Watch on this device"): the same movie on a tablet, in sync with MPC-HC. The PC address is entered in the app. More in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
+The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, seeking (a slider and ±10 s/±1 min buttons), previous/next episode, the MPC-HC volume and the PC volume (with the "Кнопки громкости управляют ПК" setting the device's volume keys change the PC volume too; off by default on tablets), plus "Смотреть на этом устройстве" ("Watch on this device"): the same movie on a tablet, in sync with MPC-HC. The PC address is entered in the app. More in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
 
 ```sh
 cd android

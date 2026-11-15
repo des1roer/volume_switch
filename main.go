@@ -482,11 +482,37 @@ func mpcCommandURL(baseURL string, command int) string {
 	return mpcEndpoint(baseURL, fmt.Sprintf("command.html?wm_command=%d", command))
 }
 
+// mpcSeekURL строит URL перемотки на позицию pos: у command.html это
+// wm_command=-1 с position=ЧЧ:ММ:СС.мс (так его разбирает сам MPC-HC).
+//
+//	http://localhost:7777/ -> http://localhost:7777/command.html?wm_command=-1&position=01:02:03.456
+func mpcSeekURL(baseURL string, pos time.Duration) string {
+	return mpcEndpoint(baseURL, "command.html?wm_command=-1&position="+mpcPosition(pos))
+}
+
+// mpcPosition записывает позицию в формате параметра position у
+// command.html: ЧЧ:ММ:СС.мс, отрицательная — как ноль.
+func mpcPosition(pos time.Duration) string {
+	ms := max(pos.Milliseconds(), 0)
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", ms/3_600_000, ms/60_000%60, ms/1000%60, ms%1000)
+}
+
 // Command отправляет в web-интерфейс MPC-HC команду с номером command (см.
 // mpcPlayPauseCommand и соседние). Если web-интерфейс не ответил, ошибка
 // оборачивает errMPCOffline.
-func (c *mpcClient) Command(command int) (err error) {
-	cmdURL := mpcCommandURL(c.baseURL, command)
+func (c *mpcClient) Command(command int) error {
+	return c.send(mpcCommandURL(c.baseURL, command), fmt.Sprintf("команда %d", command))
+}
+
+// Seek перематывает MPC-HC на позицию pos от начала файла. Ошибки — как у
+// Command.
+func (c *mpcClient) Seek(pos time.Duration) error {
+	return c.send(mpcSeekURL(c.baseURL, pos), "перемотка на "+mpcPosition(pos))
+}
+
+// send выполняет запрос cmdURL к command.html; what — что это за команда,
+// для ошибок и лога.
+func (c *mpcClient) send(cmdURL, what string) (err error) {
 	if cmdURL == "" {
 		return fmt.Errorf("некорректный адрес web-интерфейса %q", c.baseURL)
 	}
@@ -504,9 +530,9 @@ func (c *mpcClient) Command(command int) (err error) {
 		return fmt.Errorf("чтение ответа: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("команда %d отклонена: HTTP %s", command, resp.Status)
+		return fmt.Errorf("%s отклонена: HTTP %s", what, resp.Status)
 	}
-	log.Printf("mpc command: %d -> %s (%s)", command, cmdURL, resp.Status)
+	log.Printf("mpc command: %s -> %s (%s)", what, cmdURL, resp.Status)
 	return nil
 }
 
@@ -2564,6 +2590,7 @@ const (
 //	GET  /media[?file=имя]           файл, открытый сейчас в MPC-HC, с поддержкой Range — для просмотра на планшете
 //	POST /playpause                  как клик по оверлею: Play/Pause, а если MPC-HC не запущен — запуск
 //	POST /next, /prev                следующий/предыдущий файл в MPC-HC
+//	POST /seek?position_ms=N         перемотка на N мс от начала; ?offset_ms=±N — на N мс от текущей позиции
 //	POST /volume/up, /volume/down    системная громкость, как F3/F2; ?step=N — шаг в процентах
 //	POST /mpc/volume/up, /down       собственная громкость MPC-HC, шагом из его настроек
 //
@@ -2678,6 +2705,7 @@ func (api *remoteAPI) handler() http.Handler {
 	})
 	mux.HandleFunc("POST /next", api.mpcCommand(mpcNextFileCommand))
 	mux.HandleFunc("POST /prev", api.mpcCommand(mpcPrevFileCommand))
+	mux.HandleFunc("POST /seek", api.seek)
 	mux.HandleFunc("POST /volume/up", api.stepVolume(1))
 	mux.HandleFunc("POST /volume/down", api.stepVolume(-1))
 	mux.HandleFunc("POST /mpc/volume/up", api.mpcCommand(mpcVolumeUpCommand))
@@ -2742,15 +2770,64 @@ func (api *remoteAPI) media(w http.ResponseWriter, r *http.Request) {
 func (api *remoteAPI) mpcCommand(command int) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		if err := api.mpc.Command(command); err != nil {
-			status := http.StatusBadGateway
-			if errors.Is(err, errMPCOffline) {
-				status = http.StatusServiceUnavailable
-			}
-			writeError(w, status, err)
+			writeError(w, mpcErrorStatus(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, api.status())
 	}
+}
+
+// mpcErrorStatus — код ответа API на ошибку команды MPC-HC: 503, если плеер
+// не отвечает, 502, если ответил отказом.
+func mpcErrorStatus(err error) int {
+	if errors.Is(err, errMPCOffline) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+// seek перематывает MPC-HC (POST /seek): ?position_ms=N — на позицию N от
+// начала, ?offset_ms=±N — на N вперёд или назад от текущей позиции (её
+// MPC-HC отдаёт свежей, поэтому сдвиг считается здесь, а не на телефоне).
+// Позиция ограничивается длиной файла.
+func (api *remoteAPI) seek(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	position, hasPosition := q["position_ms"]
+	offset, hasOffset := q["offset_ms"]
+	if hasPosition == hasOffset {
+		writeError(w, http.StatusBadRequest, errors.New("нужен ровно один параметр: position_ms или offset_ms"))
+		return
+	}
+	name, raw := "position_ms", position
+	if hasOffset {
+		name, raw = "offset_ms", offset
+	}
+	ms, err := strconv.ParseInt(raw[0], 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("%s=%q: нужно целое число миллисекунд", name, raw[0]))
+		return
+	}
+
+	st, err := api.mpc.State()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	if st.File == "" {
+		writeError(w, http.StatusConflict, errors.New("в MPC-HC не открыт файл"))
+		return
+	}
+	if hasOffset {
+		ms += st.Position
+	}
+	if st.Duration > 0 {
+		ms = min(ms, st.Duration)
+	}
+	if err := api.mpc.Seek(time.Duration(max(ms, 0)) * time.Millisecond); err != nil {
+		writeError(w, mpcErrorStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, api.status())
 }
 
 // stepVolume меняет системную громкость на шаг ?step=N процентов (по

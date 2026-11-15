@@ -50,7 +50,12 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = when (keyCode) {
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = when {
+        !Remote.volumeKeysToPc.value -> super.onKeyDown(keyCode, event)
+        else -> volumeKeyToPc(keyCode, event)
+    }
+
+    private fun volumeKeyToPc(keyCode: Int, event: KeyEvent): Boolean = when (keyCode) {
         KeyEvent.KEYCODE_VOLUME_UP -> {
             Remote.volume(up = true)
             true

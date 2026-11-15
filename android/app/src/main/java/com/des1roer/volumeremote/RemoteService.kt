@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
 import android.media.MediaMetadata
 import android.media.VolumeProvider
 import android.media.session.MediaSession
@@ -91,7 +92,6 @@ class RemoteService : Service() {
         session = MediaSession(this, "VolumeRemote").apply {
             setCallback(callback)
             setSessionActivity(openAppIntent())
-            setPlaybackToRemote(volumeProvider)
             isActive = true
         }
         render(Remote.state.value)
@@ -107,6 +107,20 @@ class RemoteService : Service() {
         )
         Remote.acquire()
         scope.launch { Remote.state.collect { render(it) } }
+        scope.launch {
+            Remote.volumeKeysToPc.collect { toPc ->
+                if (toPc) {
+                    session.setPlaybackToRemote(volumeProvider)
+                } else {
+                    session.setPlaybackToLocal(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                            .build(),
+                    )
+                }
+            }
+        }
         scope.launch {
             while (true) {
                 delay(MINUTE_MS)

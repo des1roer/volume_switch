@@ -19,7 +19,7 @@
 - **F5** показывает/скрывает окно-оверлей поверх всех окон (не забирая фокус), которое опрашивает JSON API веб-интерфейса MPC-HC (`status.json`) и отображает название/прогресс/прошедшее/оставшееся время.
 - Клик средней кнопкой мыши (колесом) по оверлею открывает в проводнике папку с текущим файлом (с выделением самого файла).
 - Клик левой кнопкой по полосе прогресса ставит воспроизведение на паузу/возобновляет его; если MPC-HC не запущен — запускает его (путь берётся из `MPC_EXE`, по умолчанию `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, а если такого файла нет — из `HKCU\Software\MPC-HC\MPC-HC\ExePath`, который MPC-HC пишет сам).
-- Пульт с телефона: необязательный HTTP API в локальной сети (`API_LISTEN`) и Android-приложение «Пульт MPC» (`android/`) — пауза/старт, сколько осталось, перемотка, следующая/предыдущая серия и системная громкость (см. «Пульт с телефона»).
+- Пульт с телефона: необязательный HTTP API в локальной сети (`API_LISTEN`) Android-приложение «Пульт MPC» (`android/`) и пульт для часов Zepp OS (`zepp/`) — пауза/старт, сколько осталось, перемотка, следующая/предыдущая серия и системная громкость (см. «Пульт с телефона»).
 - Необязательный файл `.env` для конфигурации; при отсутствии используются переменные окружения, затем флаги.
 
 ## Установка
@@ -138,7 +138,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 Команды отвечают тем же JSON, что и `/status`; ошибки — `{"error": "..."}` с кодом 4xx/5xx.
 
-Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, перемотка (ползунок и кнопки ±10 с/±1 мин), «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (по настройке «Кнопки громкости управляют ПК» ими же меняется громкость ПК; на планшете по умолчанию выключено), кнопка «Статус-бар на ПК (F5)» — показать/скрыть оверлей прогресса на ПК, а также «Смотреть на этом устройстве» — тот же фильм на планшете синхронно с MPC-HC. Адрес ПК вводится в самом приложении. Подробнее — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
+Android-клиент — каталог `android/` (Kotlin, Jetpack Compose): большая кнопка «Пауза/Старт», крупно — сколько осталось, перемотка (ползунок и кнопки ±10 с/±1 мин), «Предыдущая»/«Следующая» серия, громкость MPC-HC и громкость ПК (по настройке «Кнопки громкости управляют ПК» ими же меняется громкость ПК; на планшете по умолчанию выключено), кнопка «Статус-бар на ПК (F5)» — показать/скрыть оверлей прогресса на ПК, а также «Смотреть на этом устройстве» — тот же фильм на планшете синхронно с MPC-HC. Адрес ПК вводится в самом приложении. Есть и пульт для часов на Zepp OS (Amazfit Balance 3) — каталог `zepp/`, см. [zepp/README.md](zepp/README.md). Подробнее об Android-клиенте — в [android/README.md](android/README.md), схемы взаимодействия телефона и ПК (Mermaid и PlantUML) — в [docs/remote-pairing.md](docs/remote-pairing.md). Сборка и установка:
 
 ```sh
 cd android
@@ -220,7 +220,7 @@ Written for my own use as a Volume² replacement on Windows 11: its overlay and 
 - **F5** shows/hides an always-on-top overlay window (without stealing focus) that polls the MPC-HC web interface JSON API (`status.json`) and displays the title/progress/elapsed/remaining time.
 - A middle-click (wheel click) on the overlay opens the folder of the current file in Explorer, with the file itself selected.
 - A left click on the progress bar pauses/resumes playback; if MPC-HC is not running, it launches it (the path comes from `MPC_EXE`, by default `C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe`, and if that file doesn't exist — from `HKCU\Software\MPC-HC\MPC-HC\ExePath`, which MPC-HC writes itself).
-- Phone remote: an optional HTTP API on the local network (`API_LISTEN`) and the "Пульт MPC" Android app (`android/`): pause/play, time remaining, seeking, next/previous episode and the master volume (see "Phone remote").
+- Phone remote: an optional HTTP API on the local network (`API_LISTEN`) the "Пульт MPC" Android app (`android/`) and a Zepp OS watch remote (`zepp/`): pause/play, time remaining, seeking, next/previous episode and the master volume (see "Phone remote").
 - An optional `.env` file for configuration; environment variables and then flags take precedence over it.
 
 ## Installation
@@ -338,7 +338,7 @@ netsh advfirewall firewall add rule name="volume_switch API" dir=in action=allow
 
 Commands respond with the same JSON as `/status`; errors are `{"error": "..."}` with a 4xx/5xx code.
 
-The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, seeking (a slider and ±10 s/±1 min buttons), previous/next episode, the MPC-HC volume and the PC volume (with the "Кнопки громкости управляют ПК" setting the device's volume keys change the PC volume too; off by default on tablets), a "Статус-бар на ПК (F5)" button that shows/hides the progress overlay on the PC, plus "Смотреть на этом устройстве" ("Watch on this device"): the same movie on a tablet, in sync with MPC-HC. The PC address is entered in the app. More in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
+The Android client lives in `android/` (Kotlin, Jetpack Compose): a large Pause/Play button, the time remaining in large type, seeking (a slider and ±10 s/±1 min buttons), previous/next episode, the MPC-HC volume and the PC volume (with the "Кнопки громкости управляют ПК" setting the device's volume keys change the PC volume too; off by default on tablets), a "Статус-бар на ПК (F5)" button that shows/hides the progress overlay on the PC, plus "Смотреть на этом устройстве" ("Watch on this device"): the same movie on a tablet, in sync with MPC-HC. The PC address is entered in the app. There is also a remote for Zepp OS watches (Amazfit Balance 3) in `zepp/`, see [zepp/README.md](zepp/README.md#english). More about the Android client in [android/README.md](android/README.md#english); diagrams of how the phone and the PC interact (Mermaid and PlantUML, in Russian) are in [docs/remote-pairing.md](docs/remote-pairing.md). Build and install:
 
 ```sh
 cd android

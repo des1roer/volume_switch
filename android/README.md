@@ -53,7 +53,11 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote 
 
 Debug и release подписаны разными ключами: чтобы сменить одну на другую, приложение сначала удаляют (`adb uninstall com.des1roer.volumeremote`). Потеря релизного ключа означает то же самое для следующих обновлений. Debug-сборка — `./gradlew assembleDebug`, APK в `app/build/outputs/apk/debug/`. `adb` лежит в `platform-tools` Android SDK.
 
-Стек: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, динамические цвета), без сторонних HTTP/JSON-библиотек — `HttpURLConnection` и `org.json`.
+Стек: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, динамические цвета), Media3/ExoPlayer 1.5.0, без сторонних HTTP/JSON-библиотек — `HttpURLConnection` и `org.json`.
+
+**Звук AC3/E-AC3 и лицензия.** У многих Android-устройств (например, POCO Pad) нет декодера Dolby Digital/Digital Plus, а в WEB-DL-релизах звук почти всегда такой. Поэтому плеер подключает программный декодер FFmpeg — готовую сборку `org.jellyfin.media3:media3-ffmpeg-decoder` (используется, только если системного декодера нет, `EXTENSION_RENDERER_MODE_ON`). Она распространяется под **GPLv3**, поэтому собранный APK тоже распространяется на условиях GPLv3; исходный код в этом репозитории остаётся под MIT. Версия декодера должна совпадать с версией Media3.
+
+На экране плеера кнопки громкости меняют громкость самого устройства (а не ПК, как на главном экране); если звук в плеере выключен, «громче» его включает.
 
 ## Устройство кода
 
@@ -133,7 +137,11 @@ adb -s <serial> shell cmd package compile -m speed -f com.des1roer.volumeremote 
 
 The debug and release builds are signed with different keys: to switch between them, uninstall the app first (`adb uninstall com.des1roer.volumeremote`). Losing the release key means the same for future updates. Debug build: `./gradlew assembleDebug`, APK in `app/build/outputs/apk/debug/`. `adb` is in the Android SDK's `platform-tools`.
 
-Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, dynamic colors), no third-party HTTP/JSON libraries: `HttpURLConnection` and `org.json`.
+Stack: AGP 8.7.3, Gradle 8.9 (wrapper), Kotlin 2.0.21, Jetpack Compose (Material 3, dynamic colors), Media3/ExoPlayer 1.5.0, no third-party HTTP/JSON libraries: `HttpURLConnection` and `org.json`.
+
+**AC3/E-AC3 audio and licensing.** Many Android devices (e.g. the POCO Pad) have no Dolby Digital/Digital Plus decoder, while WEB-DL releases almost always use it. So the player adds a software FFmpeg decoder, the prebuilt `org.jellyfin.media3:media3-ffmpeg-decoder` (used only when there is no system decoder, `EXTENSION_RENDERER_MODE_ON`). It is licensed under **GPLv3**, so the built APK is distributed under GPLv3 terms as well; the source code in this repository stays MIT. The decoder version must match the Media3 version.
+
+On the player screen the volume keys change the device's own volume (not the PC's, as on the main screen); if the player's sound is off, volume up turns it on.
 
 ## Code layout
 

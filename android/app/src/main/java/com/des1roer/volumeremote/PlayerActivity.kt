@@ -1,8 +1,10 @@
 package com.des1roer.volumeremote
 
 import android.content.Context
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.annotation.OptIn
@@ -61,6 +63,7 @@ class PlayerActivity : ComponentActivity() {
     private var lastSeekAt = 0L
     private var playerError by mutableStateOf<String?>(null)
     private var muted by mutableStateOf(true)
+    private val prefs by lazy { getSharedPreferences("remote", Context.MODE_PRIVATE) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -71,9 +74,11 @@ class PlayerActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
-        val prefs = getSharedPreferences("remote", Context.MODE_PRIVATE)
         muted = prefs.getBoolean("videoMuted", true)
-        player = ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true)).build()
+        val renderers = DefaultRenderersFactory(this)
+            .setEnableDecoderFallback(true)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+        player = ExoPlayer.Builder(this, renderers).build()
         player.volume = if (muted) 0f else 1f
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
@@ -97,11 +102,7 @@ class PlayerActivity : ComponentActivity() {
                     ui = ui,
                     error = playerError,
                     muted = muted,
-                    onToggleMute = {
-                        muted = !muted
-                        player.volume = if (muted) 0f else 1f
-                        prefs.edit().putBoolean("videoMuted", muted).apply()
-                    },
+                    onToggleMute = { applyMuted(!muted) },
                     onClose = ::finish,
                 )
             }
@@ -127,6 +128,24 @@ class PlayerActivity : ComponentActivity() {
         player.pause()
         Remote.release()
         super.onStop()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val direction = when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> AudioManager.ADJUST_RAISE
+            KeyEvent.KEYCODE_VOLUME_DOWN -> AudioManager.ADJUST_LOWER
+            else -> return super.onKeyDown(keyCode, event)
+        }
+        if (muted && direction == AudioManager.ADJUST_RAISE) applyMuted(false)
+        getSystemService(AudioManager::class.java)
+            .adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
+        return true
+    }
+
+    private fun applyMuted(value: Boolean) {
+        muted = value
+        player.volume = if (value) 0f else 1f
+        prefs.edit().putBoolean("videoMuted", value).apply()
     }
 
     override fun onDestroy() {

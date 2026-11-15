@@ -34,6 +34,11 @@ data class Status(
         if (playing) minOf(positionMs + maxOf(now - receivedAt, 0), durationMs) else positionMs
 
     fun remainingAt(now: Long): Long = maxOf(durationMs - positionAt(now), 0)
+
+    fun seekedTo(targetMs: Long, now: Long): Status {
+        val position = targetMs.coerceIn(0, maxOf(durationMs, 0))
+        return copy(positionMs = position, remainingMs = maxOf(durationMs - position, 0), receivedAt = now)
+    }
 }
 
 class ApiException(message: String) : Exception(message)
@@ -48,6 +53,10 @@ class RemoteClient(server: String) {
     suspend fun next(): Status = request("POST", "/next")
 
     suspend fun prev(): Status = request("POST", "/prev")
+
+    suspend fun seekTo(positionMs: Long): Status = request("POST", "/seek?position_ms=$positionMs")
+
+    suspend fun seekBy(offsetMs: Long): Status = request("POST", "/seek?offset_ms=$offsetMs")
 
     suspend fun volume(up: Boolean, step: Int? = null): Status =
         request("POST", (if (up) "/volume/up" else "/volume/down") + (step?.let { "?step=$it" } ?: ""))

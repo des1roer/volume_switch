@@ -74,6 +74,13 @@ object Remote {
 
     fun prev() = command { it.prev() }
 
+    fun seekTo(positionMs: Long) = seek(positionMs) { it.seekTo(positionMs) }
+
+    fun seekBy(offsetMs: Long) {
+        val status = mutableState.value.status ?: return
+        seek(status.positionAt(SystemClock.elapsedRealtime()) + offsetMs) { it.seekBy(offsetMs) }
+    }
+
     fun volume(up: Boolean, step: Int? = null) = command { it.volume(up, step) }
 
     fun mpcVolume(up: Boolean) = command { it.mpcVolume(up) }
@@ -105,7 +112,14 @@ object Remote {
         }
     }
 
-    private fun command(block: suspend (RemoteClient) -> Status) {
+    private fun seek(targetMs: Long, block: suspend (RemoteClient) -> Status) {
+        val ui = mutableState.value
+        val status = ui.status ?: return
+        mutableState.value = ui.copy(status = status.seekedTo(targetMs, SystemClock.elapsedRealtime()))
+        command(onFail = ::reconnect, block = block)
+    }
+
+    private fun command(onFail: () -> Unit = {}, block: suspend (RemoteClient) -> Status) {
         scope.launch {
             val server = mutableState.value.server
             try {
@@ -114,6 +128,7 @@ object Remote {
                 throw e
             } catch (e: Exception) {
                 fail(server, e)
+                onFail()
             }
         }
     }

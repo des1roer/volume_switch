@@ -171,14 +171,15 @@ class PlayerActivity : ComponentActivity() {
             lastSeekAt = now
         }
         player.playWhenReady = status.playing
-        sync()
+        sync(force = true)
     }
 
-    private fun sync() {
+    private fun sync(force: Boolean = false) {
         val status = Remote.state.value.status ?: return
         if (status.file != currentFile || player.playbackState != Player.STATE_READY) return
         val now = SystemClock.elapsedRealtime()
-        when (val action = syncAction(status.positionAt(now), player.currentPosition, status.playing, now, lastSeekAt)) {
+        val seekAllowedSince = if (force) now - SEEK_COOLDOWN_MS else lastSeekAt
+        when (val action = syncAction(status.positionAt(now), player.currentPosition, status.playing, now, seekAllowedSince)) {
             is SyncAction.Seek -> {
                 player.seekTo(action.positionMs)
                 player.setPlaybackSpeed(1f)
@@ -248,12 +249,29 @@ private fun PlayerScreen(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                if (status != null && status.file.isNotEmpty()) {
+                if (status != null && status.mpcOnline && status.file.isNotEmpty()) {
+                    val now = rememberPlaybackClock(status.takeIf { it.playing })
+                    var dragMs by remember { mutableStateOf<Long?>(null) }
+                    val position = dragMs ?: status.positionAt(now)
                     Text(status.file, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(
-                        "Осталось ${formatTime(status.remainingAt(SystemClock.elapsedRealtime()))}",
-                        color = Color.White.copy(alpha = 0.8f),
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(formatTime(position), color = Color.White)
+                        SeekSlider(
+                            positionMs = position,
+                            durationMs = status.durationMs,
+                            onDrag = {
+                                dragMs = it
+                                lastTouch++
+                            },
+                            onDragEnd = {
+                                dragMs?.let(Remote::seekTo)
+                                dragMs = null
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text("−" + formatTime(status.durationMs - position), color = Color.White.copy(alpha = 0.8f))
+                    }
+                    SeekButtons(enabled = status.durationMs > 0, onSeek = { lastTouch++ })
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(onClick = { Remote.playPause(); lastTouch++ }) {

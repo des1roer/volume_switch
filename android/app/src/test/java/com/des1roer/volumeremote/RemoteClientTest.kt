@@ -44,6 +44,26 @@ class RemoteClientTest {
     }
 
     @Test
+    fun seekedTo() {
+        val status = Status(
+            mpcOnline = true, mpcError = null, file = "movie.mkv", state = "playing",
+            positionMs = 61_000, durationMs = 3_600_000, remainingMs = 3_539_000,
+            mpcVolume = 70, mpcMuted = false, volumePercent = 42, muted = false, volumeError = null,
+            receivedAt = 1_000,
+        )
+        val seeked = status.seekedTo(600_000, now = 5_000)
+        assertEquals(600_000, seeked.positionMs)
+        assertEquals(3_000_000, seeked.remainingMs)
+        assertEquals(5_000, seeked.receivedAt)
+        assertEquals(601_000, seeked.positionAt(6_000))
+        assertEquals("movie.mkv", seeked.file)
+
+        assertEquals(0, status.seekedTo(-10_000, now = 5_000).positionMs)
+        assertEquals(3_600_000, status.seekedTo(9_999_999, now = 5_000).positionMs)
+        assertEquals(0, status.seekedTo(9_999_999, now = 5_000).remainingMs)
+    }
+
+    @Test
     fun parseStatusOffline() {
         val status = parseStatus(
             """

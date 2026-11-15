@@ -26,7 +26,7 @@ player -> player : seek на позицию MPC-HC,\nplayWhenReady = MPC-HC иг
 
 loop раз в секунду
   player -> player : syncAction(ожидаемая позиция,\nфактическая)
-  alt расхождение > 1,5 с (не чаще раза в 5 с)
+  alt расхождение > 1,5 с (не чаще раза в 5 с;\nпосле события от ПК — сразу)
     player -> api : seek → новый GET /media с Range
   else расхождение > 150 мс
     player -> player : скорость 0,95× или 1,05×

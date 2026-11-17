@@ -13,6 +13,7 @@ Android-клиент HTTP API пульта [volume_switch](../README.md#пуль
 - Громкость ПК и собственная громкость MPC-HC: кнопки −/+ и текущий уровень (`MUTE` при выключенном звуке).
 - Настройка «Кнопки громкости управляют ПК» (на телефоне по умолчанию включена, на планшете — выключена, `smallestScreenWidthDp ≥ 600`). Включена — кнопки громкости в приложении, в шторке и на экране блокировки меняют громкость ПК (медиасессия объявляет удалённую громкость, `setPlaybackToRemote`). Выключена — они меняют громкость самого устройства (`setPlaybackToLocal`). Кнопки «тише/громче (ПК)» в уведомлении управляют ПК всегда.
 - Медиауведомление (в шторке и на экране блокировки): название файла, сколько осталось (в минутах, обновляется раз в минуту и только при включённом экране), громкость ПК, кнопки пауза/старт, предыдущая/следующая и тише/громче ПК, полоса прогресса, которую можно перетаскивать для перемотки (`ACTION_SEEK_TO`). Им управляет foreground-сервис `RemoteService` с `MediaSession`; громкость сессии объявлена удалённой (`setPlaybackToRemote`) и привязана к громкости ПК.
+- Кнопка «Выйти» справа от оставшегося времени останавливает `RemoteService` (уведомление пропадает) и закрывает приложение; на ПК ничего не отправляется, фильм продолжает играть.
 - Сервис останавливается сам, если MPC-HC 30 минут ничего не воспроизводит; при следующем открытии приложения запускается снова.
 - «Смотреть на этом устройстве» (`PlayerActivity`, Media3/ExoPlayer): тот же файл, что открыт в MPC-HC, проигрывается на планшете или телефоне синхронно с ПК — файл берётся с ПК по `GET /media` без перекодирования, позиция/пауза/серия — из потока `/events`. Расхождение больше 1,5 с исправляется перемоткой, меньшее — скоростью 0,95–1,05× (`syncAction`); после события от ПК (в том числе перемотки в MPC-HC) плеер догоняет сразу, иначе перематывается не чаще раза в 5 с. Ползунок и кнопки перемотки на экране плеера перематывают MPC-HC, а планшет следует за ним. Звук на устройстве по умолчанию выключен (кнопка «Звук на планшете»), экран не гаснет, ориентация — альбомная.
 
@@ -69,7 +70,7 @@ Debug и release подписаны разными ключами: чтобы с
 | `RemoteClient.kt` | HTTP-клиент API (`RemoteClient`), разбор ответа (`parseStatus` → `Status`), `normalizeServer`, `errorMessage`, `formatTime` |
 | `Remote.kt` | Синглтон `Remote`: адрес ПК, `StateFlow<UiState>`, поток `/events` и команды. Поток открыт, пока есть хотя бы один пользователь (`acquire`/`release`): экран и сервис |
 | `RemoteScreen.kt` | Экран на Compose |
-| `MainActivity.kt` | Активити: тема, кнопки громкости телефона, запрос разрешения на уведомления, запуск `RemoteService` |
+| `MainActivity.kt` | Активити: тема, кнопки громкости телефона, запрос разрешения на уведомления, запуск `RemoteService` и выход из приложения |
 | `RemoteService.kt` | Foreground-сервис с `MediaSession` и медиауведомлением |
 | `VolumeRemoteApp.kt` | `Application`: инициализирует `Remote` |
 | `PlayerActivity.kt` | Просмотр фильма на устройстве: ExoPlayer, синхронизация с MPC-HC |
@@ -98,6 +99,7 @@ A client for the [volume_switch](../README.md#phone-remote) phone remote HTTP AP
 - The PC master volume and MPC-HC's own volume: −/+ buttons and the current level (`MUTE` when muted).
 - The "Кнопки громкости управляют ПК" ("Volume keys control the PC") setting: on by default on phones, off on tablets (`smallestScreenWidthDp ≥ 600`). When on, the volume keys in the app, the shade and on the lock screen change the PC volume (the media session declares remote volume, `setPlaybackToRemote`); when off, they change the device's own volume (`setPlaybackToLocal`). The PC volume down/up buttons in the notification always control the PC.
 - A media notification (in the shade and on the lock screen): file name, time remaining (in minutes, updated once a minute and only while the screen is on), PC volume, play/pause, previous/next and PC volume down/up buttons, and a progress bar you can drag to seek (`ACTION_SEEK_TO`). It is run by the `RemoteService` foreground service with a `MediaSession`; the session volume is declared remote (`setPlaybackToRemote`) and tied to the PC volume.
+- The "Выйти" ("Exit") button to the right of the time remaining stops `RemoteService` (the notification goes away) and closes the app; nothing is sent to the PC, so the movie keeps playing.
 - The service stops itself after MPC-HC has been idle for 30 minutes; it starts again the next time the app is opened.
 - "Смотреть на этом устройстве" ("Watch on this device", `PlayerActivity`, Media3/ExoPlayer): the file open in MPC-HC plays on the tablet or phone in sync with the PC. The file comes from the PC via `GET /media` without transcoding; position, pause and episode come from the `/events` stream. Drift over 1.5 s is fixed by seeking, smaller drift by playing at 0.95–1.05× (`syncAction`); after an event from the PC (including a seek in MPC-HC) the player catches up right away, otherwise it seeks at most once every 5 s. The seek slider and buttons on the player screen seek MPC-HC, and the tablet follows it. Sound on the device is off by default (the "Звук на планшете" button), the screen stays on, landscape orientation.
 
@@ -154,7 +156,7 @@ On the player screen the volume keys change the device's own volume (not the PC'
 | `RemoteClient.kt` | The API HTTP client (`RemoteClient`), response parsing (`parseStatus` → `Status`), `normalizeServer`, `errorMessage`, `formatTime` |
 | `Remote.kt` | The `Remote` singleton: PC address, `StateFlow<UiState>`, the `/events` stream and commands. The stream is open while there is at least one user (`acquire`/`release`): the screen and the service |
 | `RemoteScreen.kt` | The Compose screen |
-| `MainActivity.kt` | The activity: theme, phone volume keys, notification permission request, starting `RemoteService` |
+| `MainActivity.kt` | The activity: theme, phone volume keys, notification permission request, starting `RemoteService` and exiting the app |
 | `RemoteService.kt` | The foreground service with the `MediaSession` and the media notification |
 | `VolumeRemoteApp.kt` | The `Application`: initializes `Remote` |
 | `PlayerActivity.kt` | Watching the movie on the device: ExoPlayer, sync with MPC-HC |

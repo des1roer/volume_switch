@@ -31,7 +31,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val ui by Remote.state.collectAsState()
             RemoteTheme {
-                RemoteScreen(ui)
+                RemoteScreen(ui, onExit = ::exit)
             }
         }
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -48,6 +48,11 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         Remote.release()
         super.onStop()
+    }
+
+    private fun exit() {
+        stopService(Intent(this, RemoteService::class.java))
+        finishAndRemoveTask()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = when {

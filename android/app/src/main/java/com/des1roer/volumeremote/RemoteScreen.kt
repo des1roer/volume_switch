@@ -51,7 +51,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 
 @Composable
-fun RemoteScreen(ui: UiState) {
+fun RemoteScreen(ui: UiState, onExit: () -> Unit) {
     val status = ui.status
     Scaffold { padding ->
         Column(
@@ -72,7 +72,7 @@ fun RemoteScreen(ui: UiState) {
                 )
             }
 
-            Playback(status)
+            Playback(status, onExit)
 
             Button(
                 onClick = Remote::playPause,
@@ -193,7 +193,7 @@ private fun ServerField(server: String, onSave: (String) -> Unit) {
 }
 
 @Composable
-private fun Playback(status: Status?) {
+private fun Playback(status: Status?, onExit: () -> Unit) {
     val title = when {
         status == null -> "Подключение…"
         !status.mpcOnline -> "MPC-HC не запущен"
@@ -217,11 +217,20 @@ private fun Playback(status: Status?) {
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Text(
-            text = if (active) formatTime(duration - position) else "--:--",
-            fontSize = 64.sp,
-            fontWeight = FontWeight.Bold,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = if (active) formatTime(duration - position) else "--:--",
+                fontSize = 64.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedButton(
+                onClick = onExit,
+                modifier = Modifier.height(56.dp),
+            ) {
+                Text("Выйти")
+            }
+        }
         SeekSlider(
             positionMs = position,
             durationMs = duration,

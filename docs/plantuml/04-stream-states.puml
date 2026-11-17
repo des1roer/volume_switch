@@ -26,6 +26,9 @@ note right of Streaming
   MainActivity (onStart/onStop)
   и RemoteService (onCreate/onDestroy).
   Сервис сам останавливается,
-  если 30 мин ничего не играет.
+  если 30 мин ничего не играет;
+  кнопка «Выйти» останавливает его
+  и закрывает приложение
+  (на ПК команды не уходят).
 end note
 @enduml
